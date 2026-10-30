@@ -52,5 +52,6 @@ ls -la "$STAGE/jniLibs/arm64-v8a"
 
 [ "${1:-}" = "--no-apk" ] && exit 0
 cd "$ROOT/quest/android"
+[ -f local.properties ] || echo "sdk.dir=$HOME/workspace/android-sdk" > local.properties
 JAVA_HOME=$(ls -d "$HOME"/tools/jdk-17* | head -1) ./gradlew --no-daemon -q --offline assembleRelease
 ls -la app/build/outputs/apk/release/
