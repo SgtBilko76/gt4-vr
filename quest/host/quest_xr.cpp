@@ -1025,7 +1025,7 @@ private:
             }
             m_stereo_applied = false;
         }
-        const bool stereo = ReadFloatProperty("debug.gt4vr.stereo", 0.0f) != 0.0f;
+        const bool stereo = ReadFloatProperty("debug.gt4vr.stereo", 1.0f) != 0.0f;
         const float sep = stereo ? ReadFloatProperty("debug.gt4vr.sep", kStereoSeparation) : 0.0f;
         const float conv = ReadFloatProperty("debug.gt4vr.conv", kStereoConvergence);
         const float show_depth = ReadFloatProperty("debug.gt4vr.showdepth", 0.0f);

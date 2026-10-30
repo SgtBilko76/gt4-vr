@@ -376,9 +376,10 @@ bool start_game(const fs::path &files) {
     setenv("RRV_PCSX2_GS_DATA_DIR", (files / "pcsx2-data").c_str(), 0);
     setenv("RRV_PCSX2_GS_ASPECT", "stretch", 0);
     // GT4 profile of the bridge (PCSX2 GameDB fixes for GT4, field-mode upscaling); scale 2 =
-    // 1280x896 for a 640x448 picture. config.txt RRV_PCSX2_GS_SCALE=N overrides.
+    // scale 3 = 1920x1344 for the 640x448 picture (owner choice 2026-10-30: race 60 fps, a few
+    // skipped fields in heavy scenes). config.txt RRV_PCSX2_GS_SCALE=N overrides.
     setenv("RRV_PCSX2_GS_GAME", "gt4", 0);
-    setenv("RRV_PCSX2_GS_SCALE", "2", 0);
+    setenv("RRV_PCSX2_GS_SCALE", "3", 0);
     fs::create_directories(files / "pcsx2-data");
 
     ps2::g_options.disc_path = disc;
