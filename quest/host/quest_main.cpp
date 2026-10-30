@@ -420,6 +420,10 @@ bool start_game(const fs::path &files) {
     // (RRV_PCSX2_GS_CAS=0 / RRV_PCSX2_GS_ANISO=0 = off).
     setenv("RRV_PCSX2_GS_CAS", "60", 0);
     setenv("RRV_PCSX2_GS_ANISO", "8", 0);
+    // Anti-aliasing (owner 2026-10-30: "3 times PS2 resolution and antialiasing, that works good at
+    // Wipeout"): PCSX2's hardware renderer has no MSAA, FXAA on the presented frame is its edge
+    // smoothing. RRV_PCSX2_GS_FXAA=0 in config.txt turns it off.
+    setenv("RRV_PCSX2_GS_FXAA", "1", 0);
     fs::create_directories(files / "pcsx2-data");
 
     ps2::g_options.disc_path = disc;
