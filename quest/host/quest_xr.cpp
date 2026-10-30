@@ -128,7 +128,8 @@ constexpr float kUnitsPerMeter = 10.0f;
 constexpr float kFovMargin = 1.08f;
 // Immersive race field of view (degrees, square), Wipeout Pure VR's race camera: 110. Live:
 // adb shell setprop debug.gt4vr.fov 90   (0 = the headset's whole view)
-constexpr float kImmersiveFovDeg = 110.0f;
+// Owner choice 2026-10-30: 90 (sharper; no black border visible in the headset).
+constexpr float kImmersiveFovDeg = 90.0f;
 constexpr float kHudHalfWidth = 0.45f; // Wipeout Pure VR: 1.8 m wide at 2 m
 
 // ~77 degrees wide at 1.5 m, like ARMSX2-3D. Live tuning:
