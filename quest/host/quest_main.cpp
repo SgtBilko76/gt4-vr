@@ -168,16 +168,25 @@ AAudioStream *g_audio = nullptr;
 
 std::size_t ring_queued() { return g_ring_write.load() - g_ring_read.load(); }
 
+// Diagnostics for the perf line: loudest sample the game produced / the stream played, callbacks.
+std::atomic<int> g_peak_in{0}, g_peak_out{0};
+std::atomic<std::uint32_t> g_callbacks{0}, g_muted_callbacks{0};
+
 aaudio_data_callback_result_t audio_callback(AAudioStream *, void *, void *data, int32_t frames) {
     auto *out = static_cast<std::int16_t *>(data);
     std::size_t r = g_ring_read.load();
     const std::size_t n = std::min<std::size_t>(g_ring_write.load() - r, static_cast<std::size_t>(frames));
     const bool muted = !gt4::quest::visible();
+    int peak = 0;
     for (std::size_t i = 0; i < n; ++i, ++r) {
         const std::size_t at = (r % kRingFrames) * 2;
         out[i * 2] = muted ? 0 : g_ring[at];
         out[i * 2 + 1] = muted ? 0 : g_ring[at + 1];
+        peak = std::max({peak, std::abs(static_cast<int>(out[i * 2])), std::abs(static_cast<int>(out[i * 2 + 1]))});
     }
+    if (peak > g_peak_out.load(std::memory_order_relaxed)) g_peak_out.store(peak, std::memory_order_relaxed);
+    g_callbacks.fetch_add(1, std::memory_order_relaxed);
+    if (muted) g_muted_callbacks.fetch_add(1, std::memory_order_relaxed);
     std::memset(out + n * 2, 0, (static_cast<std::size_t>(frames) - n) * 4);
     g_ring_read.store(r);
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
@@ -185,6 +194,9 @@ aaudio_data_callback_result_t audio_callback(AAudioStream *, void *, void *data,
 
 void queue_audio(const std::int16_t *samples, std::size_t frames) {
     if (ring_queued() + frames > kRingFrames / 2) return;  // > 500 ms queued: drop
+    int peak = g_peak_in.load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < frames * 2; ++i) peak = std::max(peak, std::abs(static_cast<int>(samples[i])));
+    g_peak_in.store(peak, std::memory_order_relaxed);
     std::size_t w = g_ring_write.load();
     for (std::size_t i = 0; i < frames; ++i, ++w) {
         const std::size_t at = (w % kRingFrames) * 2;
@@ -415,8 +427,11 @@ void perf_loop() {
         const auto now = std::chrono::steady_clock::now();
         const double s = std::chrono::duration<double>(now - last).count();
         const std::uint64_t frames = ps2::frames_run(), fields = ps2::gs::bridge::fields(), interp = ps2::vu1_interpreted_calls();
-        logf("[perf] game %.1f fps, GS fields %.1f/s, audio queued %zu ms, vu1 interpreted %.0f/s", (frames - last_frames) / s,
-             (fields - last_fields) / s, ring_queued() / 48, (interp - last_interp) / s);
+        logf("[perf] game %.1f fps, GS fields %.1f/s, audio queued %zu ms, vu1 interpreted %.0f/s | audio peak game %d played %d, "
+             "callbacks %u (%u muted), stream state %d",
+             (frames - last_frames) / s, (fields - last_fields) / s, ring_queued() / 48, (interp - last_interp) / s, g_peak_in.exchange(0),
+             g_peak_out.exchange(0), g_callbacks.exchange(0), g_muted_callbacks.exchange(0),
+             g_audio ? static_cast<int>(AAudioStream_getState(g_audio)) : -1);
         last_frames = frames;
         last_fields = fields;
         last_interp = interp;
