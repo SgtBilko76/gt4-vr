@@ -150,9 +150,15 @@ constexpr float kHudHalfWidth = 0.45f; // Wipeout Pure VR: 1.8 m wide at 2 m
 //   adb shell setprop debug.gt4vr.screenw 3.0   (metres)
 //   adb shell setprop debug.gt4vr.dist 2.0      (metres)
 //   adb shell setprop debug.gt4vr.curved 0
-// Wipeout-Rewrite-VR's screen (owner direction 2026-10-29): a flat 3.2 m screen 2.5 m away.
-constexpr float kScreenDistanceM = 2.5f;
-constexpr float kScreenWidthM = 3.2f;
+// Owner 2026-10-30: the curved screen a bit closer and 110 degrees wide (was Wipeout-Rewrite-VR's
+// 3.2 m at 2.5 m, 65 degrees). Live: debug.gt4vr.dist (m), debug.gt4vr.screenfov (deg);
+// debug.gt4vr.screenw (m) still overrides the width.
+constexpr float kScreenDistanceM = 2.0f;
+constexpr float kScreenFovDeg = 110.0f;
+// The immersive VR race view is switched off for now (owner 2026-10-30: "Den VR Modus lassen wir
+// erstmal weg"): both stick clicks do nothing. debug.gt4vr.vrallow 1 brings the toggle back.
+constexpr bool kVrModeAllowed = false;
+std::atomic<bool> g_vr_allowed{kVrModeAllowed}; // live: debug.gt4vr.vrallow
 
 float ReadFloatProperty(const char *name, float fallback)
 {
@@ -188,7 +194,8 @@ bool LoadFunction(XrInstance instance, const char *name, Fn &out)
 //   right grip = R2 (shift up)  left grip = L2 (shift down)
 //   left stick = left analog stick (steering, menu pointer)      right stick = d-pad
 //   left / right stick click = L1 / R1                            Menu button = Start (pause)
-//   both stick clicks together = switch the race view (curved screen <-> VR), once per press.
+//   both stick clicks together = switch the race view (curved screen <-> VR), once per press
+//   (off while kVrModeAllowed is false).
 // GT4 reads Cross/Square pressure, so the triggers give analog throttle and brake.
 struct ControllerInput
 {
@@ -234,7 +241,8 @@ public:
         if (in.leftStickClick && in.rightStickClick && !m_stickCombo)
         {
             m_stickCombo = true;
-            gt4::quest::setCurvedView(!gt4::quest::curvedView());
+            if (g_vr_allowed.load(std::memory_order_relaxed))
+                gt4::quest::setCurvedView(!gt4::quest::curvedView());
         }
         else if (!in.leftStickClick && !in.rightStickClick)
         {
@@ -784,9 +792,16 @@ private:
             if (vr_prop == 0 || vr_prop == 1)
                 gt4::quest::setCurvedView(vr_prop == 0);
         }
+        const bool vr_allowed = ReadFloatProperty("debug.gt4vr.vrallow", kVrModeAllowed ? 1.0f : 0.0f) != 0.0f;
+        g_vr_allowed.store(vr_allowed, std::memory_order_relaxed);
+        if (!vr_allowed && vr_prop != 1 && !gt4::quest::curvedView())
+            gt4::quest::setCurvedView(true);
         const bool curved = ReadFloatProperty("debug.gt4vr.curved", 0.0f) != 0.0f || gt4::quest::curvedView();
-        const float width = std::max(0.2f, ReadFloatProperty("debug.gt4vr.screenw", kScreenWidthM));
         const float dist = std::max(0.3f, ReadFloatProperty("debug.gt4vr.dist", kScreenDistanceM));
+        const float screen_fov = std::clamp(ReadFloatProperty("debug.gt4vr.screenfov", kScreenFovDeg), 20.0f, 170.0f);
+        // Chord width for the given angle; the curved layer below turns it back into exactly that angle.
+        const float width = std::max(0.2f, ReadFloatProperty("debug.gt4vr.screenw",
+                                                              2.0f * dist * std::tan(screen_fov * 0.5f * 0.0174533f)));
         if (curved != m_curved || width != m_screen_width_m || dist != m_screen_distance_m)
         {
             m_curved = curved;
@@ -1575,7 +1590,7 @@ private:
     using SetHudLayerFn = void (*)(int, int);
     SetHudLayerFn m_set_hud_layer = nullptr;
     XrPosef m_hud_pose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -kHudDistanceM}};
-    float m_screen_width_m = kScreenWidthM;
+    float m_screen_width_m = 2.0f * kScreenDistanceM * 1.4281f; // tan(55 deg): 110 degrees
     float m_screen_distance_m = kScreenDistanceM;
     int m_tuning_countdown = 0;
 

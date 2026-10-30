@@ -417,8 +417,10 @@ bool start_game(const fs::path &files) {
     // Anisotropic: 2.5x wide, 4x high (1600x1792). VR lacks vertical detail most (448 lines for the
     // whole view); measured 2026-10-30 at the same cost as 3x3 (VR 72 Hz: 108-123 of 600 skipped vs
     // 100-122), 3x4 skipped 139-159, 4x4 190-240. RRV_PCSX2_GS_SCALE_X=3 RRV_PCSX2_GS_SCALE=3 = old.
-    setenv("RRV_PCSX2_GS_SCALE", "4", 0);
-    setenv("RRV_PCSX2_GS_SCALE_X", "2.5", 0);
+    // VR is off for now (owner 2026-10-30), so the curved screen's 3x3 again: the 110 degree screen
+    // needs width (1920 px), and its 16:9 picture shows only 1080 rows of the eye image.
+    // For VR later: RRV_PCSX2_GS_SCALE_X=2.5 RRV_PCSX2_GS_SCALE=4.
+    setenv("RRV_PCSX2_GS_SCALE", "3", 0);
     // Sharpness (owner 2026-10-30: "das Bild ist total unscharf"): AMD CAS on the presented frame
     // and 8x anisotropic texture filtering (far road and walls). config.txt overrides
     // (RRV_PCSX2_GS_CAS=0 / RRV_PCSX2_GS_ANISO=0 = off).
