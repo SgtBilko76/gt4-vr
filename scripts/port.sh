@@ -109,7 +109,10 @@ if windows=$(python3 -I "$here/windows.py" list "$elf") && [ -n "$windows" ]; th
   echo "code windows the game rewrites: $(echo "$windows" | tr '\n' ' ')"
 fi
 
-translate() { "$tools/eerecomp" "$elf" --entries "$game/entries.txt" "${modules[@]}" "${overlays[@]}" --out "$generated" | tail -1; }
+# games/<name>/probes.txt: guest addresses that get a probe() call (host hooks, set_probe_hook).
+probes=()
+[ -f "$game/probes.txt" ] && probes=(--probes "$game/probes.txt")
+translate() { "$tools/eerecomp" "$elf" --entries "$game/entries.txt" "${modules[@]}" "${overlays[@]}" "${probes[@]}" --out "$generated" | tail -1; }
 
 echo "== [3/6] machine code to C++"
 touch "$game/entries.txt"

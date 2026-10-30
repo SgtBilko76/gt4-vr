@@ -111,7 +111,11 @@ using SetPresentAspectFn = void (*)(int);
 //   adb shell setprop debug.gt4vr.upm 100
 //   adb shell setprop debug.gt4vr.stereoscale 1.0   (1 = true scale)
 constexpr float kNearM = 2.5f; // the HUD sits where Wipeout-Rewrite-VR's HUD screen is
-constexpr float kUnitsPerMeter = 14.0f; // measured 2026-10-29: 40/50/65 mph on the start straight
+// GT4 (gt4_camera.cpp): units are metres and the driving view's near plane is 0.1 (P = GL frustum,
+// P22 -1.0001, P32 -0.2, measured on the Nurburgring 2026-10-30), so its Z is about 2^24 * 0.1 / z:
+// for this formula (written for RR5's 2^24 / z) that is 10 "units" per metre. Cross-check: the screen
+// stereo's depth x8192 showed the road ~5 m ahead at ~0.6 (2^24 * 0.1 / 5.3 / 2^32 * 8192 = 0.6).
+constexpr float kUnitsPerMeter = 10.0f;
 
 // Immersive race view (owner direction 2026-10-28, after Wipeout-Rewrite-VR): in a race the game
 // renders with the headset's field of view (plus kFovMargin for head motion between render and

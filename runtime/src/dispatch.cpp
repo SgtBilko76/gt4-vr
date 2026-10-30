@@ -2,6 +2,8 @@
 #include "ps2/system.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <cstdio>
 #include <fstream>
 #include <set>
@@ -192,9 +194,64 @@ void stop(Cpu &c, std::uint32_t pc, const char *what) {
     c.pc = pc | kUnwind;
 }
 
+// Host hooks at guest addresses translated with `eerecomp --probes`: run before the instruction
+// there. Without a hook a probe logs its registers (PS2_PROBE_LOG=1).
+std::vector<std::pair<std::uint32_t, ProbeHook>> g_probe_hooks;
+
+void set_probe_hook(std::uint32_t pc, ProbeHook hook) {
+    for (auto &h : g_probe_hooks)
+        if (h.first == pc) {
+            h.second = std::move(hook);
+            return;
+        }
+    g_probe_hooks.emplace_back(pc, std::move(hook));
+}
+
 void probe(Cpu &c, std::uint32_t pc) {
-    std::fprintf(stderr, "[probe] 0x%08X a0 %08X a1 %08X a2 %08X a3 %08X ra %08X v0 %08X\n", pc, c.r[4].w[0], c.r[5].w[0], c.r[6].w[0],
-                 c.r[7].w[0], c.r[31].w[0], c.r[2].w[0]);
+    for (const auto &h : g_probe_hooks)
+        if (h.first == pc) {
+            if (h.second) h.second(c);
+            return;
+        }
+    static const char *log = std::getenv("PS2_PROBE_LOG");
+    if (!log) return;
+    // PS2_PROBE_LOG=c: calls per probe, printed every 300 frames.
+    if (log[0] == 'c') {
+        struct Count { std::uint32_t first; std::uint64_t second; std::uint32_t third; };
+        static std::vector<Count> counts;
+        static std::uint64_t next = 300;
+        // key: pc and the caller (ra), so callers of one function are told apart
+        const std::uint32_t key = pc;
+        const std::uint32_t ra = c.r[31].w[0];
+        bool found = false;
+        for (auto &e : counts)
+            if (e.first == key && e.third == ra) { ++e.second; found = true; break; }
+        if (!found) counts.push_back({key, 1, ra});
+        if (frame_count() >= next) {
+            next = frame_count() + 300;
+            std::fprintf(stderr, "[probe] f%llu", static_cast<unsigned long long>(frame_count()));
+            for (auto &e : counts) {
+                if (e.second) std::fprintf(stderr, " %06X<%06X:%llu", e.first, e.third, static_cast<unsigned long long>(e.second));
+                e.second = 0;
+            }
+            std::fprintf(stderr, "\n");
+        }
+        return;
+    }
+    std::fprintf(stderr, "[probe] 0x%08X f%llu a0 %08X a1 %08X a2 %08X a3 %08X s0 %08X s1 %08X ra %08X v0 %08X\n", pc,
+                 static_cast<unsigned long long>(frame_count()), c.r[4].w[0], c.r[5].w[0], c.r[6].w[0], c.r[7].w[0], c.r[16].w[0], c.r[17].w[0],
+                 c.r[31].w[0], c.r[2].w[0]);
+    // PS2_PROBE_LOG=2: also the 4x4 float matrix s1 points to (GT4 camera probes).
+    if (log[0] == '2' && c.r[17].w[0] && c.r[17].w[0] < kRamSize) {
+        std::fprintf(stderr, "[probe]   m");
+        for (int i = 0; i < 16; ++i) {
+            const std::uint32_t bits = ld32(c.r[17].w[0] + 4u * i);
+            float f;
+            std::memcpy(&f, &bits, 4);
+            std::fprintf(stderr, " %.4g", f);
+        }
+        std::fprintf(stderr, "\n");
+    }
 }
 
 void breakpoint(Cpu &c, std::uint32_t pc) {

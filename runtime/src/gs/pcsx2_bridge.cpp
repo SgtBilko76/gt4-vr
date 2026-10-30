@@ -140,9 +140,26 @@ void submit(int path, const std::uint8_t *data, std::uint32_t bytes) {
     if (!g_lib.submit(g_bridge, static_cast<std::uint32_t>(path), data, bytes, g_error, kErrorCapacity)) report("submit");
 }
 
+namespace {
+std::atomic<std::int64_t (*)()> g_take_tag{nullptr};
+std::atomic<void (*)(std::int64_t)> g_tag_presented{nullptr};
+}
+
+void set_field_tags(std::int64_t (*take)(), void (*presented)(std::int64_t)) {
+    g_take_tag.store(take);
+    g_tag_presented.store(presented);
+}
+
+std::int64_t take_field_tag() {
+    const auto take = g_take_tag.load(std::memory_order_relaxed);
+    return take ? take() : 0;
+}
+
 void vsync(const Field &field) {
-    if (!g_lib.vsync(g_bridge, field.regs, g_field_index++, field.parity & 1u, g_error, kErrorCapacity)) report("vsync");
+    const bool ok = g_lib.vsync(g_bridge, field.regs, g_field_index++, field.parity & 1u, g_error, kErrorCapacity);
+    if (!ok) report("vsync");
     g_fields.fetch_add(1, std::memory_order_relaxed);
+    if (const auto presented = g_tag_presented.load(std::memory_order_relaxed); ok && presented) presented(field.tag);
 }
 
 void download(const Download &request, std::uint32_t bytes) {

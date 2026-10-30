@@ -1,3 +1,6 @@
+#ifdef PS2_GT4_CAMERA
+#include "../quest/host/gt4_camera.h"
+#endif
 #include "ps2/system.hpp"
 
 #ifdef PS2_WINDOW
@@ -89,6 +92,9 @@ int main(int argc, char **argv) {
 #endif
     register_generated_code();
     register_generated_vu();
+#ifdef PS2_GT4_CAMERA
+    gt4::camera::install(nullptr, nullptr); // ps2run: test pose from PS2_GT4_TEST_* only
+#endif
     const auto emulate = [&]() -> int {
         std::uint32_t entry = 0;
         if (!ps2::load_elf(argv[1], entry)) {

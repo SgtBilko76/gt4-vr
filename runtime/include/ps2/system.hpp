@@ -140,6 +140,11 @@ void set_pad_axis(int axis, std::uint8_t value, int pad = 0);
 void set_pad_pressure(int button, std::uint8_t value, int pad = 0);
 void set_pad_connected(int pad, bool connected);
 std::uint16_t pad_rumble(int pad = 0);
+// Host code run before the guest instruction at `pc` (the address must be translated with
+// `eerecomp --probes <file>`). One hook per address; an empty hook removes it.
+using ProbeHook = std::function<void(Cpu &)>;
+void set_probe_hook(std::uint32_t pc, ProbeHook hook);
+
 void set_audio_sink(std::function<void(const std::int16_t *samples, std::size_t frames)> sink);
 
 }

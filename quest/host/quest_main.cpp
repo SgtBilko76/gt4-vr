@@ -43,6 +43,38 @@
 #include <vector>
 
 void register_generated_code();
+
+#include "gt4_camera.h"
+#include <sys/system_properties.h>
+
+namespace
+{
+// VR race view (gt4_camera.cpp): the head pose of the XR thread turns the race camera, unless the
+// curved screen is chosen (both stick clicks) or debug.gt4vr.headtrack is 0.
+gt4::camera::Head quest_head()
+{
+    static int countdown = 0;
+    static bool enabled = true;
+    if (countdown-- <= 0)
+    {
+        countdown = 60;
+        char value[PROP_VALUE_MAX] = {};
+        enabled = __system_property_get("debug.gt4vr.headtrack", value) <= 0 || std::atoi(value) != 0;
+    }
+    gt4::camera::Head out;
+    if (!enabled || gt4::quest::curvedView())
+        return out;
+    const gt4::quest::HeadPose h = gt4::quest::currentHeadPose();
+    out.qx = h.qx;
+    out.qy = h.qy;
+    out.qz = h.qz;
+    out.qw = h.qw;
+    out.key = h.key;
+    out.tanX = h.renderTanX;
+    out.tanY = h.renderTanY;
+    return out;
+}
+} // namespace
 void register_generated_vu();
 
 namespace {
@@ -395,6 +427,8 @@ bool start_game(const fs::path &files) {
     ps2::set_audio_sink(queue_audio);
     register_generated_code();
     register_generated_vu();
+    gt4::camera::install(quest_head, gt4::quest::noteHeadTrackedFrame);
+    ps2::gs::bridge::set_field_tags(gt4::quest::takeBuiltKey, gt4::quest::notePresentedKey);
 
     std::thread(gs_thread_main).detach();
     while (g_gs_state.load() == 0) usleep(2000);

@@ -22,7 +22,14 @@ struct Field {
     std::uint64_t regs[kPrivRegCount];
     std::uint32_t parity;
     std::uint32_t pad;
+    std::int64_t tag; // host tag of the frame built for this field (set_field_tags), 0 = none
 };
+
+// Host tags that travel with the fields (Quest VR: the head pose a field's camera was built
+// with). `take` runs on the EE thread at vblank, `presented` on the GS thread once that field's
+// vsync went through the bridge.
+void set_field_tags(std::int64_t (*take)(), void (*presented)(std::int64_t));
+std::int64_t take_field_tag();
 
 // Payload of a queue::kDownload item while the bridge renders.
 struct Download {

@@ -1081,7 +1081,7 @@ void vblank(bool start) {
                                  ntsc ? 0x0007f5b61f06f040ull : g_synch1, ntsc ? 0x000000000033a4d8ull : g_synch2,
                                  ntsc ? 0x00c7800601a01801ull : g_syncv, g_dispfb[0], g_display[0], g_dispfb[1], g_display[1], g_extbuf, g_extdata,
                                  g_extwrite, g_bgcolor, g_csr | (g_odd_field ? 0x2000u : 0u), g_imr, g_busdir, g_siglblid},
-                                g_odd_field ? 1u : 0u, 0u};
+                                g_odd_field ? 1u : 0u, 0u, bridge::take_field_tag()};
             static bool logged = false;
             if (!logged && g_smode2) {
                 logged = true;
