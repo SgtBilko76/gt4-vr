@@ -1072,7 +1072,7 @@ void write_privileged(std::uint32_t address, std::uint64_t value) {
 void vblank(bool start) {
     if (start) {
         static std::uint64_t field_no = 0;
-        if (trace_display() && (++field_no % 300u) == 1u)
+        if (trace_display() && (++field_no % 300u) < 9u)
             std::fprintf(stderr, "[gs] field %llu: pmode %llX smode2 %llX dispfb1 %llX display1 %llX dispfb2 %llX display2 %llX\n",
                      (unsigned long long)field_no, (unsigned long long)g_pmode, (unsigned long long)g_smode2,
                      (unsigned long long)g_dispfb[0], (unsigned long long)g_display[0], (unsigned long long)g_dispfb[1],
@@ -1094,8 +1094,16 @@ void vblank(bool start) {
             // 448-line picture as a field, doubling it: only its top half is shown (measured on the
             // Quest 2026-10-30, curved screen and VR). FFMD only means something with INT = 1, so
             // it is cleared there. PS2_GS_KEEP_FFMD=1 sends the game's value.
+            // PS2_GS_SMODE2_RACE=v: send v instead of GT4's race value 2 (test switch; default: the
+            // FFMD bit cleared, i.e. 0). PS2_GS_KEEP_FFMD=1: the game's value unchanged.
+            // Default for GT4's race value 2: 1 (INT 1, FFMD 0 = interlaced frame mode, the menu's
+            // CRTC with whole frames). Measured on the Quest 2026-10-30: 3 = top half doubled (as the
+            // game's 2), 0 with deinterlacing off = full picture but strong flicker (owner), 1 with
+            // PCSX2's automatic deinterlacing = full picture, steady.
             static const bool keep_ffmd = std::getenv("PS2_GS_KEEP_FFMD") != nullptr;
-            const std::uint64_t smode2 = (keep_ffmd || (g_smode2 & 1u)) ? g_smode2 : (g_smode2 & ~2ull);
+            static const char *race_override = std::getenv("PS2_GS_SMODE2_RACE");
+            std::uint64_t smode2 = g_smode2;
+            if (!keep_ffmd && g_smode2 == 2u) smode2 = race_override ? std::strtoull(race_override, nullptr, 0) : 1u;
             bridge::Field field{{g_pmode, ntsc ? 0x0000000740814504ull : g_smode1, smode2, ntsc ? 0x8ull : g_srfsh,
                                  ntsc ? 0x0007f5b61f06f040ull : g_synch1, ntsc ? 0x000000000033a4d8ull : g_synch2,
                                  ntsc ? 0x00c7800601a01801ull : g_syncv, g_dispfb[0], g_display[0], g_dispfb[1], g_display[1], g_extbuf, g_extdata,
