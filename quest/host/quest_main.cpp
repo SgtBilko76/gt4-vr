@@ -414,7 +414,11 @@ bool start_game(const fs::path &files) {
     // scale 3 = 1920x1344 for the 640x448 picture (owner choice 2026-10-30: race 60 fps, a few
     // skipped fields in heavy scenes). config.txt RRV_PCSX2_GS_SCALE=N overrides.
     setenv("RRV_PCSX2_GS_GAME", "gt4", 0);
-    setenv("RRV_PCSX2_GS_SCALE", "3", 0);
+    // Anisotropic: 2.5x wide, 4x high (1600x1792). VR lacks vertical detail most (448 lines for the
+    // whole view); measured 2026-10-30 at the same cost as 3x3 (VR 72 Hz: 108-123 of 600 skipped vs
+    // 100-122), 3x4 skipped 139-159, 4x4 190-240. RRV_PCSX2_GS_SCALE_X=3 RRV_PCSX2_GS_SCALE=3 = old.
+    setenv("RRV_PCSX2_GS_SCALE", "4", 0);
+    setenv("RRV_PCSX2_GS_SCALE_X", "2.5", 0);
     // Sharpness (owner 2026-10-30: "das Bild ist total unscharf"): AMD CAS on the presented frame
     // and 8x anisotropic texture filtering (far road and walls). config.txt overrides
     // (RRV_PCSX2_GS_CAS=0 / RRV_PCSX2_GS_ANISO=0 = off).
@@ -423,7 +427,9 @@ bool start_game(const fs::path &files) {
     // Anti-aliasing (owner 2026-10-30: "3 times PS2 resolution and antialiasing, that works good at
     // Wipeout"): PCSX2's hardware renderer has no MSAA, FXAA on the presented frame is its edge
     // smoothing. RRV_PCSX2_GS_FXAA=0 in config.txt turns it off.
-    setenv("RRV_PCSX2_GS_FXAA", "1", 0);
+    // Measured 2026-10-30 (VR, 72 Hz): FXAA cost ~25 of 600 fields skipped for little visible gain;
+    // owner chose it off. RRV_PCSX2_GS_FXAA=1 turns it back on.
+    setenv("RRV_PCSX2_GS_FXAA", "0", 0);
     fs::create_directories(files / "pcsx2-data");
 
     ps2::g_options.disc_path = disc;

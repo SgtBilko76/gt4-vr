@@ -745,13 +745,13 @@ private:
             for (float rate : rates)
                 if (wanted > 0.0f && std::fabs(rate - wanted) < 1.0f)
                     pick = rate;
-            // Wipeout Pure VR's choice (owner 2026-10-30: "Nimm die Settings von Wipeout Pure VR"):
-            // 60 fps races on a 120 Hz display, every frame shown exactly twice (no 72/60 judder).
-            for (float rate : rates)
-                if (pick == 0.0f && std::fabs(rate - 120.0f) < 1.0f)
-                    pick = rate;
+            // 72 Hz (owner 2026-10-30, after the VR measurements: 90 Hz cost ~25 more skipped fields
+            // per 600, 120 Hz takes the race below 60 fps); 120 next, as Wipeout Pure VR.
             for (float rate : rates)
                 if (pick == 0.0f && std::fabs(rate - 72.0f) < 1.0f)
+                    pick = rate;
+            for (float rate : rates)
+                if (pick == 0.0f && std::fabs(rate - 120.0f) < 1.0f)
                     pick = rate;
             if (pick == 0.0f)
                 pick = *std::max_element(rates.begin(), rates.end());
