@@ -1040,11 +1040,26 @@ void vblank(bool start) {
         g_odd_field = !g_odd_field;
         raise(8);
         if (queue::active()) {
-            // The PCSX2 GS shows each field with the display registers of that moment.
-            bridge::Field field{{g_pmode, g_smode1, g_smode2, g_srfsh, g_synch1, g_synch2, g_syncv, g_dispfb[0], g_display[0], g_dispfb[1],
-                                 g_display[1], g_extbuf, g_extdata, g_extwrite, g_bgcolor, g_csr | (g_odd_field ? 0x2000u : 0u), g_imr, g_busdir,
-                                 g_siglblid},
+            // The PCSX2 GS shows each field with the display registers of that moment. The BIOS's
+            // SetGsCrt programs the CRTC timing block (SMODE1, SRFSH, SYNCH1/2, SYNCV) from a table;
+            // the HLE here never writes it, but PCSX2 needs it: SMODE1.CMOD = 0 reads as VESA, so it
+            // composes the interlaced picture progressively (two stacked half-height bands) and never
+            // toggles CSR.FIELD. Use the NTSC block (PCSX2 cold boot values, as the Ridge Racer V
+            // port does) until the game writes its own.
+            const bool ntsc = !g_smode1 && !ps2::g_options.pal;
+            bridge::Field field{{g_pmode, ntsc ? 0x0000000740814504ull : g_smode1, g_smode2, ntsc ? 0x8ull : g_srfsh,
+                                 ntsc ? 0x0007f5b61f06f040ull : g_synch1, ntsc ? 0x000000000033a4d8ull : g_synch2,
+                                 ntsc ? 0x00c7800601a01801ull : g_syncv, g_dispfb[0], g_display[0], g_dispfb[1], g_display[1], g_extbuf, g_extdata,
+                                 g_extwrite, g_bgcolor, g_csr | (g_odd_field ? 0x2000u : 0u), g_imr, g_busdir, g_siglblid},
                                 g_odd_field ? 1u : 0u, 0u};
+            static bool logged = false;
+            if (!logged && g_smode2) {
+                logged = true;
+                std::fprintf(stderr, "[gs] display: pmode %llX smode1 %llX smode2 %llX dispfb1 %llX display1 %llX dispfb2 %llX display2 %llX\n",
+                             (unsigned long long)g_pmode, (unsigned long long)field.regs[1], (unsigned long long)g_smode2,
+                             (unsigned long long)g_dispfb[0], (unsigned long long)g_display[0], (unsigned long long)g_dispfb[1],
+                             (unsigned long long)g_display[1]);
+            }
             queue::post(queue::kVblank, 0, 0, &field, sizeof field);
         }
 #ifdef PS2_GPU

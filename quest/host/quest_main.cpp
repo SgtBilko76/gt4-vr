@@ -194,7 +194,10 @@ void queue_audio(const std::int16_t *samples, std::size_t frames) {
     g_ring_write.store(w);
 }
 
+void audio_error(AAudioStream *, void *, aaudio_result_t error);
+
 void open_audio() {
+    g_ring_read.store(g_ring_write.load());  // start empty (a reopen drops what the old stream left)
     AAudioStreamBuilder *builder = nullptr;
     if (AAudio_createStreamBuilder(&builder) != AAUDIO_OK) return;
     AAudioStreamBuilder_setSampleRate(builder, 48000);
@@ -203,6 +206,7 @@ void open_audio() {
     AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
     AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
     AAudioStreamBuilder_setDataCallback(builder, audio_callback, nullptr);
+    AAudioStreamBuilder_setErrorCallback(builder, audio_error, nullptr);
     const aaudio_result_t r = AAudioStreamBuilder_openStream(builder, &g_audio);
     AAudioStreamBuilder_delete(builder);
     if (r != AAUDIO_OK) {
@@ -214,12 +218,40 @@ void open_audio() {
     logf("[quest] audio: AAudio 48000 Hz stereo, burst %d", AAudioStream_getFramesPerBurst(g_audio));
 }
 
-// Pace the game on the audio clock: wait while more than ~80 ms is queued.
+// Pace the game on the audio clock: wait while more than ~80 ms is queued. If the stream stops
+// consuming (Horizon OS pauses or disconnects it, e.g. when the headset is taken off and put on),
+// fall back to the frame clock and reopen the stream, instead of waiting 200 ms every field.
+std::atomic<bool> g_audio_reopen{false};
+
+void audio_error(AAudioStream *, void *, aaudio_result_t error) {
+    std::fprintf(stderr, "[quest] audio stream error %s: reopening\n", AAudio_convertResultToText(error));
+    g_audio_reopen = true;
+}
+
 void pace() {
     static auto last = std::chrono::steady_clock::now();
+    static std::size_t last_read = 0;
+    static int stalled = 0;
+    if (g_audio_reopen.exchange(false)) {
+        if (g_audio) AAudioStream_close(g_audio);
+        g_audio = nullptr;
+        open_audio();
+    }
     if (g_audio) {
-        for (int guard = 0; ring_queued() > 48 * 80 && guard < 200; ++guard) usleep(1000);
-        return;
+        const std::size_t read = g_ring_read.load();
+        stalled = read == last_read ? stalled + 1 : 0;
+        last_read = read;
+        if (stalled < 30) {
+            for (int guard = 0; ring_queued() > 48 * 80 && guard < 40; ++guard) usleep(1000);
+            if (ring_queued() <= 48 * 80) {
+                last = std::chrono::steady_clock::now();
+                return;
+            }
+        } else if (stalled == 30) {
+            std::fprintf(stderr, "[quest] audio not consumed for 30 fields (state %d): frame clock, reopening\n",
+                         static_cast<int>(AAudioStream_getState(g_audio)));
+            g_audio_reopen = true;
+        }
     }
     const auto period = std::chrono::microseconds(16683);
     const auto now = std::chrono::steady_clock::now();
