@@ -98,6 +98,20 @@ void after_modelview(ps2::Cpu &c)
 {
     if (g_log >= 2 && g_builds % 300 == 1)
         dump("V", c);
+    // PS2_GT4_CAM_LOG=3: the camera's world position every 30 builds (units calibration by speed).
+    if (g_log == 3 && g_builds % 30 == 1)
+    {
+        const float *c0 = c.vu0.vf[28].f, *c1 = c.vu0.vf[29].f, *c2 = c.vu0.vf[30].f, *t = c.vu0.vf[31].f;
+        // V = [R | t] column-major: position = -R^T t, R rows = (c0[i], c1[i], c2[i]).
+        (void)c0; (void)c1; (void)c2;
+        float p[3]; // p_j = -sum_i R_ij t_i (R orthonormal), R_ij = column j, row i
+        for (int j = 0; j < 3; ++j)
+        {
+            const float *col = c.vu0.vf[28 + j].f;
+            p[j] = -(col[0] * t[0] + col[1] * t[1] + col[2] * t[2]);
+        }
+        std::fprintf(stderr, "[gt4cam] pos f%llu %.3f %.3f %.3f\n", static_cast<unsigned long long>(ps2::frame_count()), p[0], p[1], p[2]);
+    }
     if (g_pose.key == 0)
         return;
     // R from the quaternion in GT4's eye space; V' = R^T * V (xyz of every column).
