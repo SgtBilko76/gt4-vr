@@ -32,6 +32,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -52,17 +53,21 @@ namespace
 // Each half is 1920 x 1440: the immersive race view is nearly square (the headset's field of view,
 // ~112 x 114 degrees), and 1440 lines carry the 672 the GS renders at scale 3 with room to spare.
 // The menu screen keeps its 16:9 shape (kScreenAspect) whatever the pixels are.
-constexpr int32_t kEyeWidthPx = 1920;
-constexpr int32_t kScreenHeightPx = 1440;
+// Default eye size (used until the runtime's recommendation is known, and when it is unusable).
+// InitScreen sizes the eyes like QuakeQuest (owner 2026-10-30: "schau bei QuakeQuest nach den besten
+// Quest Settings"): the runtime's recommended eye resolution x a supersampling factor (QuakeQuest's
+// SS_MULTIPLIER 1.3; config.txt RRV_VR_SS), scaled to the immersive view's field of view.
+constexpr int32_t kEyeWidthDefaultPx = 1920;
+constexpr int32_t kScreenHeightDefaultPx = 1440;
+constexpr float kEyeSupersample = 1.3f;
+constexpr float kHeadsetTan = 1.40f; // Quest 3 eye: tan 1.376 x 1.428 (108 x 110 deg)
 constexpr float kScreenAspect = 16.0f / 9.0f;
-constexpr int32_t kSurfaceWidthPx = 2 * kEyeWidthPx;
 // The HUD layer (owner 2026-10-30: "take our Wipeout Rewrite mod for perfect HUD VR settings"):
 // below the eyes the surface has a 16:9 strip the GS draws the race HUD into, on transparent
 // black (GSStereo::hud_layer). In the immersive race view it is a flat screen of its own in front
 // of the 3D view, Wipeout Rewrite VR's: 3.2 m wide, 2.5 m ahead, fixed in the room.
 constexpr int32_t kHudWidthPx = 1920;
 constexpr int32_t kHudRowsPx = 1080;
-constexpr int32_t kSurfaceHeightPx = kScreenHeightPx + kHudRowsPx;
 constexpr float kHudDistanceM = 2.5f;
 constexpr float kHudWorldWidthM = 3.2f;
 
@@ -568,8 +573,35 @@ private:
         info.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
         // format, sampleCount, faceCount, arraySize and mipCount MUST be 0 for a surface swapchain
         // (the producer owns the buffer format); 1s fail with XR_ERROR_VALIDATION_FAILURE on Quest.
-        info.width = kSurfaceWidthPx;
-        info.height = kSurfaceHeightPx;
+        {
+            // QuakeQuest: recommendedImageRect x SS. Our eye image covers the immersive view's field
+            // of view (kImmersiveFovDeg), not the whole headset view, so it is scaled down to it.
+            uint32_t count = 0;
+            XrViewConfigurationView views[2] = {{XR_TYPE_VIEW_CONFIGURATION_VIEW}, {XR_TYPE_VIEW_CONFIGURATION_VIEW}};
+            if (XR_SUCCEEDED(xrEnumerateViewConfigurationViews(m_instance, m_system, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                                                               2, &count, views)) && count == 2 &&
+                views[0].recommendedImageRectWidth > 0)
+            {
+                float ss = kEyeSupersample;
+                if (const char *v = std::getenv("RRV_VR_SS"))
+                    ss = std::clamp(static_cast<float>(std::atof(v)), 0.5f, 2.0f);
+                const float tan_view = std::tan(kImmersiveFovDeg * 0.5f * 0.0174533f);
+                const float k = ss * std::min(1.0f, tan_view / kHeadsetTan);
+                // Never below the defaults: they already hold the GS picture at scale 3 (1920x1344).
+                m_eye_w = std::clamp(static_cast<int32_t>(views[0].recommendedImageRectWidth * k + 0.5f) & ~7, kEyeWidthDefaultPx, 3072);
+                m_eye_h = std::clamp(static_cast<int32_t>(views[0].recommendedImageRectHeight * k + 0.5f) & ~7, kScreenHeightDefaultPx, 3072);
+                XR_LOG("eye image %dx%d (recommended %ux%u x SS %.2f, at %.0f deg)", m_eye_w, m_eye_h,
+                       views[0].recommendedImageRectWidth, views[0].recommendedImageRectHeight, ss, kImmersiveFovDeg);
+            }
+            if (const char *v = std::getenv("RRV_VR_EYE"))
+            {
+                int w = 0, h = 0;
+                if (std::sscanf(v, "%dx%d", &w, &h) == 2 && w >= 512 && h >= 512 && w <= 4096 && h <= 4096)
+                    m_eye_w = w & ~7, m_eye_h = h & ~7;
+            }
+        }
+        info.width = SurfaceWidth();
+        info.height = SurfaceHeight();
         jobject surface = nullptr;
         const XrResult res = m_create_surface_swapchain(m_session, &info, &m_screen_swapchain, &surface);
         if (XR_FAILED(res) || surface == nullptr)
@@ -658,9 +690,9 @@ private:
             // into a full buffer queue would stall the whole game.
             if (!m_surface_published)
             {
-                gt4::quest::publishSurface({m_screen_window, kSurfaceWidthPx, kSurfaceHeightPx});
+                gt4::quest::publishSurface({m_screen_window, static_cast<uint32_t>(SurfaceWidth()), static_cast<uint32_t>(SurfaceHeight())});
                 m_surface_published = true;
-                XR_LOG("surface %dx%d (two eyes, HUD strip %d rows) handed to the game", kSurfaceWidthPx, kSurfaceHeightPx, kHudRowsPx);
+                XR_LOG("surface %dx%d (two eyes, HUD strip %d rows) handed to the game", SurfaceWidth(), SurfaceHeight(), kHudRowsPx);
             }
             break;
         }
@@ -1217,8 +1249,8 @@ private:
                     view.pose = shown->eyes[eye];
                     view.fov = {-ax, ax, ay, -ay};
                     view.subImage.swapchain = m_screen_swapchain;
-                    view.subImage.imageRect.offset = {static_cast<int32_t>(eye) * kEyeWidthPx, 0};
-                    view.subImage.imageRect.extent = {kEyeWidthPx, kScreenHeightPx};
+                    view.subImage.imageRect.offset = {static_cast<int32_t>(eye) * m_eye_w, 0};
+                    view.subImage.imageRect.extent = {m_eye_w, m_eye_h};
                     view.subImage.imageArrayIndex = 0;
                 }
                 if (m_has_image_layout_ext)
@@ -1236,7 +1268,7 @@ private:
                     hud_quad.space = m_local_space;
                     hud_quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
                     hud_quad.subImage.swapchain = m_screen_swapchain;
-                    hud_quad.subImage.imageRect.offset = {0, kScreenHeightPx};
+                    hud_quad.subImage.imageRect.offset = {0, m_eye_h};
                     hud_quad.subImage.imageRect.extent = {kHudWidthPx, kHudRowsPx};
                     hud_quad.subImage.imageArrayIndex = 0;
                     hud_quad.pose = m_hud_pose;
@@ -1261,8 +1293,8 @@ private:
                     quad.space = m_local_space;
                     quad.eyeVisibility = eye == 0 ? XR_EYE_VISIBILITY_LEFT : XR_EYE_VISIBILITY_RIGHT;
                     quad.subImage.swapchain = m_screen_swapchain;
-                    quad.subImage.imageRect.offset = {static_cast<int32_t>(eye) * kEyeWidthPx, 0};
-                    quad.subImage.imageRect.extent = {kEyeWidthPx, kScreenHeightPx};
+                    quad.subImage.imageRect.offset = {static_cast<int32_t>(eye) * m_eye_w, 0};
+                    quad.subImage.imageRect.extent = {m_eye_w, m_eye_h};
                     quad.pose = pose;
                     quad.size = {width, width * fov.tanHalfY / fov.tanHalfX};
                     layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&quad);
@@ -1276,8 +1308,8 @@ private:
                 {
                     XrSwapchainSubImage sub_image{};
                     sub_image.swapchain = m_screen_swapchain;
-                    sub_image.imageRect.offset = {static_cast<int32_t>(eye) * kEyeWidthPx, 0};
-                    sub_image.imageRect.extent = {kEyeWidthPx, kScreenHeightPx};
+                    sub_image.imageRect.offset = {static_cast<int32_t>(eye) * m_eye_w, 0};
+                    sub_image.imageRect.extent = {m_eye_w, m_eye_h};
                     const XrEyeVisibility visibility = eye == 0 ? XR_EYE_VISIBILITY_LEFT : XR_EYE_VISIBILITY_RIGHT;
                     if (m_curved && m_has_cylinder_ext)
                     {
@@ -1290,7 +1322,7 @@ private:
                         cylinder.pose = m_screen_pose;
                         cylinder.radius = m_screen_distance_m;
                         cylinder.centralAngle = 2.0f * std::atan((m_screen_width_m * 0.5f) / m_screen_distance_m);
-                        cylinder.aspectRatio = static_cast<float>(kEyeWidthPx) / static_cast<float>(kScreenHeightPx);
+                        cylinder.aspectRatio = static_cast<float>(m_eye_w) / static_cast<float>(m_eye_h);
                         layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&cylinder);
                     }
                     else
@@ -1302,7 +1334,7 @@ private:
                         quad.eyeVisibility = visibility;
                         quad.subImage = sub_image;
                         quad.pose = m_flat_screen_pose;
-                        quad.size = {m_screen_width_m, m_screen_width_m * kScreenHeightPx / kEyeWidthPx};
+                        quad.size = {m_screen_width_m, m_screen_width_m * m_eye_h / m_eye_w};
                         layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&quad);
                     }
                 }
@@ -1535,6 +1567,9 @@ private:
     float m_screen_depth_scale = -1.0f;
     int m_vr_prop = -1;
     bool m_hud_panel = false;
+    int32_t m_eye_w = kEyeWidthDefaultPx, m_eye_h = kScreenHeightDefaultPx;
+    int32_t SurfaceWidth() const { return std::max(2 * m_eye_w, kHudWidthPx); }
+    int32_t SurfaceHeight() const { return m_eye_h + kHudRowsPx; }
     bool m_hud_layer_on = true;
     bool m_hud_layer_applied = false;
     using SetHudLayerFn = void (*)(int, int);
