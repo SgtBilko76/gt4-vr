@@ -726,6 +726,14 @@ private:
         if (++m_tuning_countdown < 30)
             return;
         m_tuning_countdown = 0;
+        // Headless testing: debug.gt4vr.vr 1 / 0 selects VR / curved screen like both stick clicks.
+        const int vr_prop = static_cast<int>(ReadFloatProperty("debug.gt4vr.vr", -1.0f));
+        if (vr_prop != m_vr_prop)
+        {
+            m_vr_prop = vr_prop;
+            if (vr_prop == 0 || vr_prop == 1)
+                gt4::quest::setCurvedView(vr_prop == 0);
+        }
         const bool curved = ReadFloatProperty("debug.gt4vr.curved", 0.0f) != 0.0f || gt4::quest::curvedView();
         const float width = std::max(0.2f, ReadFloatProperty("debug.gt4vr.screenw", kScreenWidthM));
         const float dist = std::max(0.3f, ReadFloatProperty("debug.gt4vr.dist", kScreenDistanceM));
@@ -1443,6 +1451,7 @@ private:
     bool m_screen_placed = false;
     bool m_curved = false;
     float m_screen_depth_scale = -1.0f;
+    int m_vr_prop = -1;
     float m_screen_width_m = kScreenWidthM;
     float m_screen_distance_m = kScreenDistanceM;
     int m_tuning_countdown = 0;
