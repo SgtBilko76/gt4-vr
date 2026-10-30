@@ -1071,6 +1071,13 @@ void write_privileged(std::uint32_t address, std::uint64_t value) {
 
 void vblank(bool start) {
     if (start) {
+        static std::uint64_t field_no = 0;
+        if (trace_display() && (++field_no % 300u) == 1u)
+            std::fprintf(stderr, "[gs] field %llu: pmode %llX smode2 %llX dispfb1 %llX display1 %llX dispfb2 %llX display2 %llX\n",
+                     (unsigned long long)field_no, (unsigned long long)g_pmode, (unsigned long long)g_smode2,
+                     (unsigned long long)g_dispfb[0], (unsigned long long)g_display[0], (unsigned long long)g_dispfb[1],
+                     (unsigned long long)g_display[1]);
+
         capture::vblank();
         g_odd_field = !g_odd_field;
         raise(8);
@@ -1082,7 +1089,14 @@ void vblank(bool start) {
             // toggles CSR.FIELD. Use the NTSC block (PCSX2 cold boot values, as the Ridge Racer V
             // port does) until the game writes its own.
             const bool ntsc = !g_smode1 && !ps2::g_options.pal;
-            bridge::Field field{{g_pmode, ntsc ? 0x0000000740814504ull : g_smode1, g_smode2, ntsc ? 0x8ull : g_srfsh,
+            // GT4's race mode writes SMODE2 = 2 (INT 0, FFMD 1) on an interlaced NTSC CRTC with a
+            // full 640x448 frame buffer. PCSX2 takes FFMD for "half frames" and deinterlaces the
+            // 448-line picture as a field, doubling it: only its top half is shown (measured on the
+            // Quest 2026-10-30, curved screen and VR). FFMD only means something with INT = 1, so
+            // it is cleared there. PS2_GS_KEEP_FFMD=1 sends the game's value.
+            static const bool keep_ffmd = std::getenv("PS2_GS_KEEP_FFMD") != nullptr;
+            const std::uint64_t smode2 = (keep_ffmd || (g_smode2 & 1u)) ? g_smode2 : (g_smode2 & ~2ull);
+            bridge::Field field{{g_pmode, ntsc ? 0x0000000740814504ull : g_smode1, smode2, ntsc ? 0x8ull : g_srfsh,
                                  ntsc ? 0x0007f5b61f06f040ull : g_synch1, ntsc ? 0x000000000033a4d8ull : g_synch2,
                                  ntsc ? 0x00c7800601a01801ull : g_syncv, g_dispfb[0], g_display[0], g_dispfb[1], g_display[1], g_extbuf, g_extdata,
                                  g_extwrite, g_bgcolor, g_csr | (g_odd_field ? 0x2000u : 0u), g_imr, g_busdir, g_siglblid},
