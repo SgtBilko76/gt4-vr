@@ -778,6 +778,7 @@ private:
             m_htan_cap = ReadFloatProperty("debug.gt4vr.htan", cap);
         }
         m_hud_half_width = std::clamp(ReadFloatProperty("debug.gt4vr.hudw", kHudHalfWidth), 0.2f, 2.0f);
+        m_hud_panel = ReadFloatProperty("debug.gt4vr.hudpanel", 0.0f) != 0.0f;
         // Headless testing without the user: hold pad buttons (HostPadButton mask, decimal) and
         // add a yaw (degrees, positive = head turned left) to the head the game camera sees.
         const uint32_t hold = static_cast<uint32_t>(ReadFloatProperty("debug.gt4vr.padhold", 0.0f));
@@ -1000,9 +1001,19 @@ private:
             // GT4's 2D layer (HUD, pause menu) is a 16:9 picture (anamorphic 640x448): the bridge
             // shrinks it into a panel m_hud_half_width (tan) wide, like Wipeout Pure VR's HUD
             // rectangle (1.8 m at 2 m). scale = y factor, x = extra x factor.
-            const float half_h = m_hud_half_width * 9.0f / 16.0f;
-            scale = std::min(1.0f, half_h / tan_y);
-            x = std::min(1.0f, m_hud_half_width / tan_x) / std::max(scale, 1e-3f);
+            // Default: the game's own HUD layout (owner 2026-10-30: the shrunk panel looked bad);
+            // scale 1 still gives the HUD one stereo depth. debug.gt4vr.hudpanel 1 = the panel.
+            if (m_hud_panel)
+            {
+                const float half_h = m_hud_half_width * 9.0f / 16.0f;
+                scale = std::min(1.0f, half_h / tan_y);
+                x = std::min(1.0f, m_hud_half_width / tan_x) / std::max(scale, 1e-3f);
+            }
+            else
+            {
+                scale = 1.0f;
+                x = 1.0f;
+            }
         }
         if (std::fabs(scale - m_hud_applied_scale) < 1e-4f && std::fabs(x - m_hud_applied_x) < 1e-4f)
             return;
@@ -1481,6 +1492,7 @@ private:
     bool m_curved = false;
     float m_screen_depth_scale = -1.0f;
     int m_vr_prop = -1;
+    bool m_hud_panel = false;
     float m_screen_width_m = kScreenWidthM;
     float m_screen_distance_m = kScreenDistanceM;
     int m_tuning_countdown = 0;
