@@ -411,8 +411,13 @@ void android_main(android_app *app) {
     std::thread xr([vm, activity] { gt4::quest::runXrThread(vm, activity); });
 
     open_audio();
-    if (!start_game(files)) logf("[quest] game not started: copy core.elf and disc.iso to %s", kDataDir.c_str());
-    else std::thread(perf_loop).detach();
+    // The game starts on its own thread: start_game waits for the XR surface, which needs the
+    // session to become READY, which needs this thread's looper to answer the activity's
+    // lifecycle (native_app_glue blocks onResume until APP_CMD_RESUME is processed here).
+    std::thread([files] {
+        if (!start_game(files)) logf("[quest] game not started: copy core.elf and disc.iso to %s", kDataDir.c_str());
+        else perf_loop();
+    }).detach();
 
     while (!app->destroyRequested) {
         int events = 0;
