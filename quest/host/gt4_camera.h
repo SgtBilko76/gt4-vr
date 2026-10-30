@@ -12,6 +12,7 @@ namespace gt4::camera
 struct Head
 {
     float qx = 0.0f, qy = 0.0f, qz = 0.0f, qw = 1.0f; // OpenXR head rotation (x right, y up, z back)
+    float px = 0.0f, py = 0.0f, pz = 0.0f;            // head position from the centred one (metres)
     int64_t key = 0;                                  // pose time; 0 = not tracked (game camera)
     float tanX = 0.0f, tanY = 0.0f;                   // wanted tan(half fov); 0 = game projection
 };

@@ -497,6 +497,7 @@ struct Batch {
     int ctx = 0;
     std::uint64_t first = 0, count = 0;
     float x0 = 0, y0 = 0, x1 = 0, y1 = 0, u0 = 0, v0 = 0, u1 = 0, v1 = 0;
+    std::uint32_t z0 = 0, z1 = 0;
 };
 
 std::FILE *g_log = nullptr;
@@ -536,7 +537,7 @@ bool active() {
             g_done = true;
             return false;
         }
-        std::fprintf(g_log, "draw\tprims\tfirst\tctx\tprim\tframe\tzbuf\ttex0\ttex1\tclamp\talpha\ttest\tbox\ttexels\n");
+        std::fprintf(g_log, "draw\tprims\tfirst\tctx\tprim\tframe\tzbuf\ttex0\ttex1\tclamp\talpha\ttest\tbox\ttexels\tz\n");
     }
     return true;
 }
@@ -573,11 +574,11 @@ void flush() {
     Batch &b = g_batch;
     if (!b.open) return;
     b.open = false;
-    std::fprintf(g_log, "%llu\t%llu\t%llu\t%d\t%03llX\t%016llX\t%016llX\t%016llX\t%016llX\t%016llX\t%016llX\t%016llX\t%.1f,%.1f-%.1f,%.1f\t%.1f,%.1f-%.1f,%.1f\n",
+    std::fprintf(g_log, "%llu\t%llu\t%llu\t%d\t%03llX\t%016llX\t%016llX\t%016llX\t%016llX\t%016llX\t%016llX\t%016llX\t%.1f,%.1f-%.1f,%.1f\t%.1f,%.1f-%.1f,%.1f\t%06X-%06X\n",
                  static_cast<unsigned long long>(g_draws++), static_cast<unsigned long long>(b.count), static_cast<unsigned long long>(b.first), b.ctx,
                  static_cast<unsigned long long>(b.prim & 0x7FFu), static_cast<unsigned long long>(b.frame), static_cast<unsigned long long>(b.zbuf),
                  static_cast<unsigned long long>(b.tex0), static_cast<unsigned long long>(b.tex1), static_cast<unsigned long long>(b.clamp),
-                 static_cast<unsigned long long>(b.alpha), static_cast<unsigned long long>(b.test), b.x0, b.y0, b.x1, b.y1, b.u0, b.v0, b.u1, b.v1);
+                 static_cast<unsigned long long>(b.alpha), static_cast<unsigned long long>(b.test), b.x0, b.y0, b.x1, b.y1, b.u0, b.v0, b.u1, b.v1, b.z0, b.z1);
     if (g_every) dump_target(b.frame, g_target_rows, "after draw");
 }
 
@@ -613,6 +614,8 @@ void prim(const State &s, int needed) {
         b.first = g_primitives;
         b.x0 = b.y0 = b.u0 = b.v0 = 1e30f;
         b.x1 = b.y1 = b.u1 = b.v1 = -1e30f;
+        b.z0 = 0xFFFFFFFFu;
+        b.z1 = 0;
     }
     ++b.count;
     const float ox = static_cast<float>(x.xyoffset & 0xFFFFu) / 16.0f, oy = static_cast<float>((x.xyoffset >> 32) & 0xFFFFu) / 16.0f;
@@ -624,6 +627,8 @@ void prim(const State &s, int needed) {
         b.y0 = std::min(b.y0, py);
         b.x1 = std::max(b.x1, px);
         b.y1 = std::max(b.y1, py);
+        b.z0 = std::min(b.z0, v.z);
+        b.z1 = std::max(b.z1, v.z);
         float u = static_cast<float>(v.u) / 16.0f, w = static_cast<float>(v.v) / 16.0f;
         if (!(prim & 0x100u)) {
             const float q = v.q == 0.0f ? 1.0f : v.q;

@@ -69,6 +69,9 @@ gt4::camera::Head quest_head()
     out.qy = h.qy;
     out.qz = h.qz;
     out.qw = h.qw;
+    out.px = h.px;
+    out.py = h.py;
+    out.pz = h.pz;
     out.key = h.key;
     out.tanX = h.renderTanX;
     out.tanY = h.renderTanY;

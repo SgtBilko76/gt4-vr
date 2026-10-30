@@ -84,6 +84,8 @@ bool visible();
 struct HeadPose
 {
     float qx = 0.0f, qy = 0.0f, qz = 0.0f, qw = 1.0f;
+    // Head position relative to where the view was centred (metres, same axes as the rotation).
+    float px = 0.0f, py = 0.0f, pz = 0.0f;
     int64_t key = 0; // XR time the pose was predicted for (ns), 0 = none
     // Immersive race view: the field of view (tan of the half angles) the race camera is to
     // render with; 0 = keep the game's own projection (flat screen).

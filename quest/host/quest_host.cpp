@@ -2,9 +2,11 @@
 #include "quest_host.h"
 
 #include <android/native_window.h>
+#include <sys/system_properties.h>
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -165,7 +167,29 @@ void noteHeadTrackedFrame(int64_t key, float tanHalfX, float tanHalfY, bool imme
     ++s_headFrame.serial;
 }
 
-int64_t takeBuiltKey() { return s_builtKey.exchange(0, std::memory_order_relaxed); }
+// GT4 shows a camera two vblanks after the one that follows its build (measured on the PC
+// 2026-10-30: a test yaw built in frame 6400 first shows in the picture of vblank 6403; the tag of
+// a vblank is the camera built in the frame before it). So the tag of this vblank is the key built
+// kBuiltKeyDelay vblanks earlier. Live: debug.gt4vr.keydelay (0..7).
+int64_t takeBuiltKey()
+{
+    constexpr int kBuiltKeyDelay = 2;
+    static int64_t history[8] = {};
+    static unsigned next = 0;
+    static int delay = kBuiltKeyDelay;
+    static int countdown = 0;
+    if (countdown-- <= 0)
+    {
+        countdown = 60;
+        char value[PROP_VALUE_MAX] = {};
+        delay = __system_property_get("debug.gt4vr.keydelay", value) > 0 ? std::atoi(value) : kBuiltKeyDelay;
+        delay = delay < 0 ? 0 : delay > 7 ? 7 : delay;
+    }
+    history[next & 7u] = s_builtKey.exchange(0, std::memory_order_relaxed);
+    const int64_t key = history[(next - static_cast<unsigned>(delay)) & 7u];
+    ++next;
+    return key;
+}
 
 static std::atomic<int (*)()> s_vsyncPresented{nullptr};
 void setVsyncPresentedQuery(int (*query)())

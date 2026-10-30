@@ -46,6 +46,7 @@ std::uint64_t g_builds = 0;
 // Eye space of GT4's view (OpenGL-like: x right, y up, z back), the same axes as OpenXR. The sign
 // per axis is set by PS2_GT4_CAM_SIGNS ("+++" default) until verified in the headset.
 float g_sx = 1.0f, g_sy = 1.0f, g_sz = 1.0f;
+bool g_use_position = true;
 
 void dump(const char *what, const ps2::Cpu &c)
 {
@@ -106,6 +107,16 @@ void after_modelview(ps2::Cpu &c)
         {2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)},
         {2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)},
     };
+    // Head position (as Wipeout Pure renders each eye from its real pose): the camera moves with
+    // the head, V' = R^T * T(-p) * V, i.e. p off the translation column before the rotation. GT4's
+    // units are metres (driving camera near plane 0.1); PS2_GT4_CAM_POS=0 turns it off.
+    if (g_use_position)
+    {
+        float *t = c.vu0.vf[31].f;
+        t[0] -= g_pose.px * g_sx;
+        t[1] -= g_pose.py * g_sy;
+        t[2] -= g_pose.pz * g_sz;
+    }
     for (int k = 0; k < 4; ++k)
     {
         float *f = c.vu0.vf[28 + k].f;
@@ -124,7 +135,17 @@ Head test_head()
     Head h;
     const char *yaw = std::getenv("PS2_GT4_TEST_YAW");
     const char *pitch = std::getenv("PS2_GT4_TEST_PITCH");
-    const float ay = (yaw ? std::strtof(yaw, nullptr) : 0.0f) * 0.0174533f * 0.5f;
+    // PS2_GT4_TEST_FROM=frame: the yaw starts at that frame (pipeline delay measurement).
+    static const char *from = std::getenv("PS2_GT4_TEST_FROM");
+    const bool started = !from || ps2::frame_count() >= std::strtoull(from, nullptr, 10);
+    static bool logged = false;
+    if (from && started && !logged)
+    {
+        logged = true;
+        std::fprintf(stderr, "[gt4cam] test yaw starts in the camera built at frame %llu\n",
+                     static_cast<unsigned long long>(ps2::frame_count()));
+    }
+    const float ay = (yaw && started ? std::strtof(yaw, nullptr) : 0.0f) * 0.0174533f * 0.5f;
     const float ap = (pitch ? std::strtof(pitch, nullptr) : 0.0f) * 0.0174533f * 0.5f;
     // q = yaw about +y, then pitch about +x (OpenXR axes)
     const float cy = std::cos(ay), sy = std::sin(ay), cp = std::cos(ap), sp = std::sin(ap);
@@ -149,6 +170,8 @@ void install(HeadSource head, FrameSink frame)
         g_sy = s[1] == '-' ? -1.0f : 1.0f;
         g_sz = s[2] == '-' ? -1.0f : 1.0f;
     }
+    if (const char *p = std::getenv("PS2_GT4_CAM_POS"))
+        g_use_position = std::atoi(p) != 0;
     g_head = head;
     if (!g_head && (std::getenv("PS2_GT4_TEST_YAW") || std::getenv("PS2_GT4_TEST_PITCH") || std::getenv("PS2_GT4_TEST_TAN")))
         g_head = test_head;

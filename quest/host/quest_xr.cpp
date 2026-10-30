@@ -126,7 +126,7 @@ constexpr float kUnitsPerMeter = 10.0f;
 //   adb shell setprop debug.gt4vr.fovmargin 1.1
 //   adb shell setprop debug.gt4vr.hudw 0.6
 constexpr float kFovMargin = 1.08f;
-constexpr float kHudHalfWidth = 0.64f; // Wipeout-Rewrite-VR: 3.2 m wide at 2.5 m
+constexpr float kHudHalfWidth = 0.45f; // Wipeout Pure VR: 1.8 m wide at 2 m
 
 // ~77 degrees wide at 1.5 m, like ARMSX2-3D. Live tuning:
 //   adb shell setprop debug.gt4vr.screenw 3.0   (metres)
@@ -862,6 +862,15 @@ private:
             XR_LOG("head: yaw %.1f deg (positive = left) tracked=%d", yaw * 57.29578f, m_head_tracked ? 1 : 0);
         }
         gt4::quest::HeadPose head;
+        {
+            const XrVector3f d = {location.pose.position.x - m_screen_pose.position.x,
+                                  location.pose.position.y - m_screen_pose.position.y,
+                                  location.pose.position.z - m_screen_pose.position.z};
+            const XrVector3f p = QuatRotate(QuatConj(m_screen_pose.orientation), d);
+            head.px = p.x;
+            head.py = p.y;
+            head.pz = p.z;
+        }
         head.qx = rel.x;
         head.qy = rel.y;
         head.qz = rel.z;
@@ -972,8 +981,12 @@ private:
         float scale = 0.0f, x = 1.0f;
         if (immersive)
         {
-            scale = std::min(1.0f, m_hud_half_width / ((4.0f / 3.0f) * tan_y));
-            x = (4.0f / 3.0f) * tan_y / tan_x;
+            // GT4's 2D layer (HUD, pause menu) is a 16:9 picture (anamorphic 640x448): the bridge
+            // shrinks it into a panel m_hud_half_width (tan) wide, like Wipeout Pure VR's HUD
+            // rectangle (1.8 m at 2 m). scale = y factor, x = extra x factor.
+            const float half_h = m_hud_half_width * 9.0f / 16.0f;
+            scale = std::min(1.0f, half_h / tan_y);
+            x = std::min(1.0f, m_hud_half_width / tan_x) / std::max(scale, 1e-3f);
         }
         if (std::fabs(scale - m_hud_applied_scale) < 1e-4f && std::fabs(x - m_hud_applied_x) < 1e-4f)
             return;
