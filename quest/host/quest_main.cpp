@@ -415,6 +415,11 @@ bool start_game(const fs::path &files) {
     // skipped fields in heavy scenes). config.txt RRV_PCSX2_GS_SCALE=N overrides.
     setenv("RRV_PCSX2_GS_GAME", "gt4", 0);
     setenv("RRV_PCSX2_GS_SCALE", "3", 0);
+    // Sharpness (owner 2026-10-30: "das Bild ist total unscharf"): AMD CAS on the presented frame
+    // and 8x anisotropic texture filtering (far road and walls). config.txt overrides
+    // (RRV_PCSX2_GS_CAS=0 / RRV_PCSX2_GS_ANISO=0 = off).
+    setenv("RRV_PCSX2_GS_CAS", "60", 0);
+    setenv("RRV_PCSX2_GS_ANISO", "8", 0);
     fs::create_directories(files / "pcsx2-data");
 
     ps2::g_options.disc_path = disc;

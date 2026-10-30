@@ -126,6 +126,9 @@ constexpr float kUnitsPerMeter = 10.0f;
 //   adb shell setprop debug.gt4vr.fovmargin 1.1
 //   adb shell setprop debug.gt4vr.hudw 0.6
 constexpr float kFovMargin = 1.08f;
+// Immersive race field of view (degrees, square), Wipeout Pure VR's race camera: 110. Live:
+// adb shell setprop debug.gt4vr.fov 90   (0 = the headset's whole view)
+constexpr float kImmersiveFovDeg = 110.0f;
 constexpr float kHudHalfWidth = 0.45f; // Wipeout Pure VR: 1.8 m wide at 2 m
 
 // ~77 degrees wide at 1.5 m, like ARMSX2-3D. Live tuning:
@@ -764,8 +767,15 @@ private:
                 PickRefreshRate();
         }
         m_fov_margin = std::clamp(ReadFloatProperty("debug.gt4vr.fovmargin", kFovMargin), 1.0f, 1.6f);
-        m_vtan_cap = ReadFloatProperty("debug.gt4vr.vtan", 0.0f);
-        m_htan_cap = ReadFloatProperty("debug.gt4vr.htan", 0.0f);
+        // Field of view of the immersive race in degrees (debug.gt4vr.fov, live): the game renders
+        // one picture for the whole view, so a narrower view puts more of its pixels per degree
+        // (sharper) and leaves a black edge. 0 = the headset's whole view.
+        {
+            const float fov_deg = ReadFloatProperty("debug.gt4vr.fov", kImmersiveFovDeg);
+            const float cap = fov_deg > 30.0f ? std::tan(fov_deg * 0.5f * 0.0174533f) : 0.0f;
+            m_vtan_cap = ReadFloatProperty("debug.gt4vr.vtan", cap);
+            m_htan_cap = ReadFloatProperty("debug.gt4vr.htan", cap);
+        }
         m_hud_half_width = std::clamp(ReadFloatProperty("debug.gt4vr.hudw", kHudHalfWidth), 0.2f, 2.0f);
         // Headless testing without the user: hold pad buttons (HostPadButton mask, decimal) and
         // add a yaw (degrees, positive = head turned left) to the head the game camera sees.
