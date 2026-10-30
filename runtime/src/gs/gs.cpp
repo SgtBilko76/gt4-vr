@@ -182,6 +182,12 @@ void remember(const DownloadKey &key, const std::uint8_t *data, std::size_t byte
     it->used = ++g_cache_clock;
 }
 
+// Payload of a kDownloadAsync item while the PCSX2 GS renders.
+struct BridgeAsyncDownload {
+    DownloadKey key;
+    bridge::Download request;
+};
+
 void forget(const DownloadKey &key) {
     std::lock_guard lock(g_cache_mutex);
     std::erase_if(g_download_cache, [&](const CachedDownload &c) { return c.key == key; });
@@ -891,11 +897,35 @@ void read_image(std::uint8_t *data, std::uint32_t qwords) {
         return;
     }
     if (bridge::active()) {
-        // The GS memory lives in PCSX2: every transfer is read there, in order.
-        const bridge::Download request{reinterpret_cast<std::uintptr_t>(data), g_shadow.buf, g_shadow.pos, g_shadow.reg};
+        // The GS memory lives in PCSX2: every transfer is read there, in queue order. GT4 reads one
+        // back every field; waiting for it serializes the game with the GS thread (and PCSX2 syncs
+        // the GPU for it, ~4 ms). Like the wgpu path, a transfer seen before is answered from the
+        // cache (the previous read of the same rectangle) and read again in the background.
+        // PS2_PCSX2_DOWNLOAD=sync always waits.
+        static const bool sync = [] {
+            const char *v = std::getenv("PS2_PCSX2_DOWNLOAD");
+            return v && std::strcmp(v, "sync") == 0;
+        }();
+        DownloadKey key = g_shadow;
+        key.qwords = qwords;
+        g_shadow.offset += qwords * 16;
+        const std::size_t bytes = static_cast<std::size_t>(qwords) * 16;
+        if (!sync) {
+            std::lock_guard lock(g_cache_mutex);
+            const auto it = std::find_if(g_download_cache.begin(), g_download_cache.end(), [&](const CachedDownload &c) { return c.key == key; });
+            if (it != g_download_cache.end() && it->data.size() == bytes) {
+                std::memcpy(data, it->data.data(), bytes);
+                it->used = ++g_cache_clock;
+                const BridgeAsyncDownload async{key, bridge::Download{0, key.buf, key.pos, key.reg}};
+                queue::post(queue::kDownloadAsync, qwords, 0, &async, sizeof async);
+                return;
+            }
+        }
+        const bridge::Download request{reinterpret_cast<std::uintptr_t>(data), key.buf, key.pos, key.reg};
         const std::uint32_t seen = g_downloads.load();
         queue::post(queue::kDownload, qwords, 0, &request, sizeof request);
         while (g_downloads.load() == seen) queue::wait(g_downloads, seen);
+        if (!sync) remember(key, data, bytes);
         return;
     }
     DownloadKey key = g_shadow;
@@ -1252,9 +1282,16 @@ bool render_with_bridge(const queue::Header &h, const std::uint8_t *payload, boo
         queue::notify(g_downloads);
         return true;
     }
-    case queue::kDownloadAsync: return true;
-    // kState (save states) still goes the usual way: its GS memory is not PCSX2's yet
-    // (snapshot/restore_local_memory), so a state made or loaded with the bridge lacks the picture.
+    case queue::kDownloadAsync: {
+        BridgeAsyncDownload async;
+        std::memcpy(&async, payload, sizeof async);
+        std::vector<std::uint8_t> fresh(static_cast<std::size_t>(h.arg0) * 16);
+        async.request.target = reinterpret_cast<std::uintptr_t>(fresh.data());
+        bridge::download(async.request, h.arg0 * 16);
+        remember(async.key, fresh.data(), fresh.size());
+        return true;
+    }
+    // kState (save states) goes the usual way; render_state() moves the GS memory in and out of PCSX2.
     default: (void)presented; return false;
     }
 }
@@ -1395,6 +1432,8 @@ void render_state(ps2::state::Stream &s) {
     s.size(g_carried);
     std::vector<std::uint32_t> vram, clut;
     std::uint32_t scale = 1;
+    // With the PCSX2 GS the picture lives in PCSX2: save its local memory, give it the loaded one.
+    if (s.saving() && bridge::active()) bridge::snapshot_memory(g_memory, kMemorySize);
 #ifdef PS2_GPU
     if (s.saving() && gpu_on()) {
         gpu::download(g_memory);
@@ -1405,6 +1444,10 @@ void render_state(ps2::state::Stream &s) {
     s.pod(scale);
     s.vec(vram);
     s.vec(clut);
+    if (s.loading() && bridge::active()) {
+        // States of the wgpu GS download their GPU memory into g_memory before saving, so it is current.
+        if (bridge::restore_memory(g_memory, kMemorySize)) std::fprintf(stderr, "[state] GS memory restored into PCSX2\n");
+    }
 #ifdef PS2_GPU
     if (s.loading() && gpu_on()) {
         if (vram.empty()) {

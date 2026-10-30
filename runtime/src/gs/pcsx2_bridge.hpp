@@ -43,6 +43,9 @@ void submit(int path, const std::uint8_t *data, std::uint32_t bytes);
 void vsync(const Field &field);
 void download(const Download &request, std::uint32_t bytes);
 void reset();
+// Save states: GS local memory (4 MB) into / out of PCSX2.
+bool snapshot_memory(std::uint8_t *dst, std::uint32_t bytes);
+bool restore_memory(const std::uint8_t *src, std::uint32_t bytes);
 
 // Fields presented, and the bridge's own counters, for the host's perf line.
 std::uint64_t fields();

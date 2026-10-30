@@ -22,6 +22,8 @@ using SubmitFn = decltype(&rrv_pcsx2_gs_bridge_submit);
 using VsyncFn = decltype(&rrv_pcsx2_gs_bridge_vsync);
 using ReadLocalFn = decltype(&rrv_pcsx2_gs_bridge_read_local_memory);
 using ResetFn = decltype(&rrv_pcsx2_gs_bridge_reset_gs);
+using SnapshotMemFn = decltype(&rrv_pcsx2_gs_bridge_snapshot_local_memory);
+using RestoreMemFn = decltype(&rrv_pcsx2_gs_bridge_restore_local_memory);
 
 struct Library {
     void *handle = nullptr;
@@ -32,6 +34,8 @@ struct Library {
     VsyncFn vsync = nullptr;
     ReadLocalFn read_local = nullptr;
     ResetFn reset = nullptr;  // optional
+    SnapshotMemFn snapshot_mem = nullptr;
+    RestoreMemFn restore_mem = nullptr;
 } g_lib;
 
 RrvPcsx2GsBridge *g_bridge = nullptr;
@@ -78,6 +82,8 @@ bool open(void *window, std::uint32_t width, std::uint32_t height, std::string &
         !resolve(g_lib.read_local, "rrv_pcsx2_gs_bridge_read_local_memory", error))
         return false;
     g_lib.reset = reinterpret_cast<ResetFn>(dlsym(g_lib.handle, "rrv_pcsx2_gs_bridge_reset_gs"));
+    g_lib.snapshot_mem = reinterpret_cast<SnapshotMemFn>(dlsym(g_lib.handle, "rrv_pcsx2_gs_bridge_snapshot_local_memory"));
+    g_lib.restore_mem = reinterpret_cast<RestoreMemFn>(dlsym(g_lib.handle, "rrv_pcsx2_gs_bridge_restore_local_memory"));
     if (g_lib.version() != RRV_PCSX2_GS_BRIDGE_ABI_VERSION) {
         error = "bridge ABI " + std::to_string(g_lib.version()) + ", expected " + std::to_string(RRV_PCSX2_GS_BRIDGE_ABI_VERSION);
         return false;
@@ -149,6 +155,22 @@ void download(const Download &request, std::uint32_t bytes) {
 
 void reset() {
     if (g_lib.reset && !g_lib.reset(g_bridge, g_error, kErrorCapacity)) report("reset_gs");
+}
+
+bool snapshot_memory(std::uint8_t *dst, std::uint32_t bytes) {
+    if (!g_lib.snapshot_mem || !g_lib.snapshot_mem(g_bridge, dst, bytes, g_error, kErrorCapacity)) {
+        report("snapshot_local_memory");
+        return false;
+    }
+    return true;
+}
+
+bool restore_memory(const std::uint8_t *src, std::uint32_t bytes) {
+    if (!g_lib.restore_mem || !g_lib.restore_mem(g_bridge, src, bytes, g_error, kErrorCapacity)) {
+        report("restore_local_memory");
+        return false;
+    }
+    return true;
 }
 
 std::uint64_t fields() { return g_fields.load(std::memory_order_relaxed); }
