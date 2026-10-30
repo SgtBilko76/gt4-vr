@@ -56,6 +56,15 @@ constexpr int32_t kEyeWidthPx = 1920;
 constexpr int32_t kScreenHeightPx = 1440;
 constexpr float kScreenAspect = 16.0f / 9.0f;
 constexpr int32_t kSurfaceWidthPx = 2 * kEyeWidthPx;
+// The HUD layer (owner 2026-10-30: "take our Wipeout Rewrite mod for perfect HUD VR settings"):
+// below the eyes the surface has a 16:9 strip the GS draws the race HUD into, on transparent
+// black (GSStereo::hud_layer). In the immersive race view it is a flat screen of its own in front
+// of the 3D view, Wipeout Rewrite VR's: 3.2 m wide, 2.5 m ahead, fixed in the room.
+constexpr int32_t kHudWidthPx = 1920;
+constexpr int32_t kHudRowsPx = 1080;
+constexpr int32_t kSurfaceHeightPx = kScreenHeightPx + kHudRowsPx;
+constexpr float kHudDistanceM = 2.5f;
+constexpr float kHudWorldWidthM = 3.2f;
 
 // Depth stereo strength (ARMSX2-3D defaults). separation = horizontal shift in source UV at
 // depth 1; convergence = the depth that lands on the screen plane. Live tuning:
@@ -560,7 +569,7 @@ private:
         // format, sampleCount, faceCount, arraySize and mipCount MUST be 0 for a surface swapchain
         // (the producer owns the buffer format); 1s fail with XR_ERROR_VALIDATION_FAILURE on Quest.
         info.width = kSurfaceWidthPx;
-        info.height = kScreenHeightPx;
+        info.height = kSurfaceHeightPx;
         jobject surface = nullptr;
         const XrResult res = m_create_surface_swapchain(m_session, &info, &m_screen_swapchain, &surface);
         if (XR_FAILED(res) || surface == nullptr)
@@ -649,9 +658,9 @@ private:
             // into a full buffer queue would stall the whole game.
             if (!m_surface_published)
             {
-                gt4::quest::publishSurface({m_screen_window, kSurfaceWidthPx, kScreenHeightPx});
+                gt4::quest::publishSurface({m_screen_window, kSurfaceWidthPx, kSurfaceHeightPx});
                 m_surface_published = true;
-                XR_LOG("surface %dx%d (two eyes) handed to the game", kSurfaceWidthPx, kScreenHeightPx);
+                XR_LOG("surface %dx%d (two eyes, HUD strip %d rows) handed to the game", kSurfaceWidthPx, kSurfaceHeightPx, kHudRowsPx);
             }
             break;
         }
@@ -779,6 +788,7 @@ private:
         }
         m_hud_half_width = std::clamp(ReadFloatProperty("debug.gt4vr.hudw", kHudHalfWidth), 0.2f, 2.0f);
         m_hud_panel = ReadFloatProperty("debug.gt4vr.hudpanel", 0.0f) != 0.0f;
+        m_hud_layer_on = ReadFloatProperty("debug.gt4vr.hudlayer", 1.0f) != 0.0f;
         // Headless testing without the user: hold pad buttons (HostPadButton mask, decimal) and
         // add a yaw (degrees, positive = head turned left) to the head the game camera sees.
         const uint32_t hold = static_cast<uint32_t>(ReadFloatProperty("debug.gt4vr.padhold", 0.0f));
@@ -995,8 +1005,16 @@ private:
     {
         if (!m_set_hud_vr)
             return;
+        // The HUD layer takes the HUD out of the immersive picture; the bridge then leaves it alone.
+        const bool layer = immersive && m_hud_layer_on && m_set_hud_layer;
+        if (m_set_hud_layer && layer != m_hud_layer_applied)
+        {
+            m_hud_layer_applied = layer;
+            m_set_hud_layer(layer ? 1 : 0, kHudRowsPx);
+            XR_LOG("race HUD layer: %s", layer ? "on (own screen, 3.2 m at 2.5 m)" : "off");
+        }
         float scale = 0.0f, x = 1.0f;
-        if (immersive)
+        if (immersive && !layer)
         {
             // GT4's 2D layer (HUD, pause menu) is a 16:9 picture (anamorphic 640x448): the bridge
             // shrinks it into a panel m_hud_half_width (tan) wide, like Wipeout Pure VR's HUD
@@ -1067,6 +1085,11 @@ private:
             m_set_stereo = reinterpret_cast<SetStereoFn>(dlsym(image, "rrv_pcsx2_gs_bridge_android_set_stereo"));
             m_set_stereo_options = reinterpret_cast<SetStereoOptionsFn>(dlsym(image, "rrv_pcsx2_gs_bridge_android_set_stereo_options"));
             m_set_hud_vr = reinterpret_cast<SetHudVrFn>(dlsym(image, "rrv_pcsx2_gs_bridge_android_set_hud_vr"));
+            m_set_hud_layer = reinterpret_cast<SetHudLayerFn>(dlsym(image, "rrv_pcsx2_gs_bridge_android_set_hud_layer"));
+            if (m_set_hud_layer)
+                m_set_hud_layer(0, kHudRowsPx); // the eyes stay above the strip from the first frame on
+            else
+                XR_LOG("bridge has no HUD layer: the eyes fill the whole surface");
             m_set_depth_scale = reinterpret_cast<SetDepthScaleFn>(dlsym(image, "rrv_pcsx2_gs_bridge_android_set_stereo_depth_scale"));
             m_set_present_aspect = reinterpret_cast<SetPresentAspectFn>(dlsym(image, "rrv_pcsx2_gs_bridge_android_set_present_aspect"));
             gt4::quest::setVsyncPresentedQuery(
@@ -1154,7 +1177,8 @@ private:
         // top row first like any Android window, so flip it in the compositor.
         XrCompositionLayerImageLayoutFB image_layout{XR_TYPE_COMPOSITION_LAYER_IMAGE_LAYOUT_FB};
         image_layout.flags = XR_COMPOSITION_LAYER_IMAGE_LAYOUT_VERTICAL_FLIP_BIT_FB;
-        const XrCompositionLayerBaseHeader *layers[2] = {};
+        const XrCompositionLayerBaseHeader *layers[3] = {};
+        XrCompositionLayerQuad hud_quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
         XrCompositionLayerProjectionView proj_views[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
                                                           {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
         XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
@@ -1203,6 +1227,22 @@ private:
                 projection.viewCount = 2;
                 projection.views = proj_views;
                 layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&projection);
+                if (m_hud_layer_applied)
+                {
+                    // The HUD strip as its own screen in front (Wipeout Rewrite VR), alpha-blended.
+                    if (m_has_image_layout_ext)
+                        hud_quad.next = &image_layout;
+                    hud_quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                    hud_quad.space = m_local_space;
+                    hud_quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                    hud_quad.subImage.swapchain = m_screen_swapchain;
+                    hud_quad.subImage.imageRect.offset = {0, kScreenHeightPx};
+                    hud_quad.subImage.imageRect.extent = {kHudWidthPx, kHudRowsPx};
+                    hud_quad.subImage.imageArrayIndex = 0;
+                    hud_quad.pose = m_hud_pose;
+                    hud_quad.size = {kHudWorldWidthM, kHudWorldWidthM * kHudRowsPx / kHudWidthPx};
+                    layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&hud_quad);
+                }
             }
             else if (m_screen_placed && m_head_tracked && !gt4::quest::menuOpen() && fov.tanHalfX > 0.05f &&
                      HeadSampleFor(frame_state.predictedDisplayTime, &tracked_pose))
@@ -1296,6 +1336,8 @@ private:
         m_flat_screen_pose.orientation = yaw_orientation;
         m_flat_screen_pose.position = {head.x - std::sin(yaw) * m_screen_distance_m, head.y,
                                        head.z - std::cos(yaw) * m_screen_distance_m};
+        m_hud_pose.orientation = yaw_orientation;
+        m_hud_pose.position = {head.x - std::sin(yaw) * kHudDistanceM, head.y, head.z - std::cos(yaw) * kHudDistanceM};
         m_screen_placed = true;
     }
 
@@ -1493,6 +1535,11 @@ private:
     float m_screen_depth_scale = -1.0f;
     int m_vr_prop = -1;
     bool m_hud_panel = false;
+    bool m_hud_layer_on = true;
+    bool m_hud_layer_applied = false;
+    using SetHudLayerFn = void (*)(int, int);
+    SetHudLayerFn m_set_hud_layer = nullptr;
+    XrPosef m_hud_pose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -kHudDistanceM}};
     float m_screen_width_m = kScreenWidthM;
     float m_screen_distance_m = kScreenDistanceM;
     int m_tuning_countdown = 0;
