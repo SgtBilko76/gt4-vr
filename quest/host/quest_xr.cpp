@@ -65,6 +65,10 @@ constexpr int32_t kSurfaceWidthPx = 2 * kEyeWidthPx;
 //   adb shell setprop debug.gt4vr.showdepth 1    (diagnostic: draw the depth buffer)
 constexpr float kStereoSeparation = 0.011f;
 constexpr float kStereoConvergence = 0.0f;
+// Depth packing scale for the screen stereo. GT4's race depth packs to almost 0 unscaled; measured on
+// the Nurburgring (2026-10-30, debug.gt4vr.showdepth 1): 4096 dark, 8192 road near ~0.6 and trees
+// mid-grey, 16384 near road saturated, 65536 everything white. Live: debug.gt4vr.depthscale.
+constexpr float kScreenDepthScale = 8192.0f;
 using SetStereoFn = void (*)(int, float, float);
 
 // Head tracking (Stage 2b, quest_headtrack.cpp turns the race camera). The game samples the
@@ -991,7 +995,7 @@ private:
         }
         else
         {
-            m_set_depth_scale(0.0f);
+            m_screen_depth_scale = -1.0f; // ApplyStereo puts the screen depth scale back
             m_stereo_applied = false; // ApplyStereo puts the screen settings back
             ApplyStereo();
         }
@@ -1048,6 +1052,16 @@ private:
                 m_set_stereo_options(1, show_depth, 0);
             }
             return; // UpdateTrueStereo owns the settings in the immersive race
+        }
+        // Depth packing scale on the screen (GSStereo::depth_scale): the packed depth is 8 bits of
+        // clamp(depth * scale); a 24-bit Z reaches only 1/256 of PCSX2's depth range, so without a
+        // scale the whole scene packs to 0 and the picture stays flat. Live: debug.gt4vr.depthscale.
+        const float depth_scale = std::max(0.0f, ReadFloatProperty("debug.gt4vr.depthscale", kScreenDepthScale));
+        if (m_set_depth_scale && depth_scale != m_screen_depth_scale)
+        {
+            m_screen_depth_scale = depth_scale;
+            m_set_depth_scale(depth_scale);
+            XR_LOG("stereo: screen depth scale %.1f", depth_scale);
         }
         if (m_stereo_applied && stereo == m_stereo_on && sep == m_stereo_sep && conv == m_stereo_conv &&
             show_depth == m_stereo_show_depth)
@@ -1424,6 +1438,7 @@ private:
     XrPosef m_flat_screen_pose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -kScreenDistanceM}};
     bool m_screen_placed = false;
     bool m_curved = false;
+    float m_screen_depth_scale = -1.0f;
     float m_screen_width_m = kScreenWidthM;
     float m_screen_distance_m = kScreenDistanceM;
     int m_tuning_countdown = 0;
