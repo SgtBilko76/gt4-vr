@@ -170,7 +170,9 @@ void vblank() {
     if (g_options.on_vblank) g_options.on_vblank();
     iop::sio2::flush_cards();
     if (g_options.trace_iop_modules && g_frames % 25 == 0) std::fprintf(stderr, "[frame] %llu prims %llu\n", static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(gs::primitives_drawn()));
-    if (!g_options.frames_dir.empty() && g_options.frame_every && g_frames % g_options.frame_every == 0) dump_frame();
+    // PS2_FRAMES_FROM=n: dump only from frame n on (consecutive-frame checks without thousands of files).
+    static const std::uint64_t frames_from = [] { const char *v = std::getenv("PS2_FRAMES_FROM"); return v ? std::strtoull(v, nullptr, 10) : 0ull; }();
+    if (!g_options.frames_dir.empty() && g_options.frame_every && g_frames >= frames_from && g_frames % g_options.frame_every == 0) dump_frame();
     hw::vblank_start();
     iop::vblank(true);
     schedule(hw::kEventVblankEnd + 100, now() + hblank_cycles() * 22u, [] { iop::vblank(false); });
