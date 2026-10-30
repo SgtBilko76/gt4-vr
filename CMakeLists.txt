@@ -11,7 +11,7 @@ if(EMSCRIPTEN)
     add_link_options(-msimd128 -mtail-call -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0 -pthread)
 endif()
 
-if(NOT EMSCRIPTEN)
+if(NOT EMSCRIPTEN AND NOT ANDROID)
     add_executable(eerecomp
         recomp/main.cpp
         recomp/r5900.cpp
@@ -29,6 +29,7 @@ if(NOT EMSCRIPTEN)
 endif()
 
 add_library(ps2runtime STATIC
+    runtime/src/gs/pcsx2_bridge.cpp
     runtime/src/memory.cpp
     runtime/src/dispatch.cpp
     runtime/src/system.cpp
@@ -107,6 +108,21 @@ if(PS2_GENERATED)
             -sEXPORTED_RUNTIME_METHODS=callMain,addRunDependency,removeRunDependency,HEAPU8,ENV
             --shell-file ${CMAKE_SOURCE_DIR}/web/shell.html --preload-file ${PS2_WEB_ELF}@/game/core.elf)
         set_target_properties(ps2web PROPERTIES SUFFIX ".html" LINK_DEPENDS ${CMAKE_SOURCE_DIR}/web/shell.html)
+        return()
+    endif()
+
+    if(ANDROID)
+        # Quest host (quest/host): NativeActivity + OpenXR (loader from PS2_OPENXR_DIR), AAudio; the
+        # PCSX2 GS bridge (librrv-pcsx2-gs-bridge.so) is dlopen()ed and renders into the XR surface.
+        enable_language(C)
+        set(PS2_OPENXR_DIR "" CACHE PATH "Folder with include/openxr and lib/arm64-v8a/libopenxr_loader.so")
+        add_library(native_app_glue STATIC ${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c)
+        target_include_directories(native_app_glue PUBLIC ${ANDROID_NDK}/sources/android/native_app_glue)
+        add_library(gt4vr SHARED quest/host/quest_main.cpp quest/host/quest_xr.cpp quest/host/quest_host.cpp)
+        target_include_directories(gt4vr PRIVATE "${PS2_OPENXR_DIR}/include" runtime/src/gs)
+        target_link_libraries(gt4vr PRIVATE ps2game ps2runtime native_app_glue
+            "${PS2_OPENXR_DIR}/lib/${ANDROID_ABI}/libopenxr_loader.so" EGL GLESv3 aaudio android log dl)
+        target_link_options(gt4vr PRIVATE "-uANativeActivity_onCreate")
         return()
     endif()
 

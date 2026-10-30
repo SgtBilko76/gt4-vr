@@ -15,3 +15,10 @@
 __pycache__/
 
 /third_party/wgpu-native/
+
+# Quest build outputs / prebuilt deps
+quest/third_party/openxr/lib/
+quest/android/build/
+quest/android/app/build/
+quest/android/.gradle/
+quest/android/local.properties

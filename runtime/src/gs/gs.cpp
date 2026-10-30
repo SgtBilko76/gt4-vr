@@ -7,6 +7,7 @@
 #ifdef PS2_GPU
 #include "gpu/gpu.hpp"
 #endif
+#include "pcsx2_bridge.hpp"
 
 #include "ps2/state.hpp"
 #include "ps2/system.hpp"
@@ -889,6 +890,14 @@ void read_image(std::uint8_t *data, std::uint32_t qwords) {
         render_read_image(data, qwords);
         return;
     }
+    if (bridge::active()) {
+        // The GS memory lives in PCSX2: every transfer is read there, in order.
+        const bridge::Download request{reinterpret_cast<std::uintptr_t>(data), g_shadow.buf, g_shadow.pos, g_shadow.reg};
+        const std::uint32_t seen = g_downloads.load();
+        queue::post(queue::kDownload, qwords, 0, &request, sizeof request);
+        while (g_downloads.load() == seen) queue::wait(g_downloads, seen);
+        return;
+    }
     DownloadKey key = g_shadow;
     key.qwords = qwords;
     g_shadow.offset += qwords * 16;
@@ -1030,7 +1039,14 @@ void vblank(bool start) {
         capture::vblank();
         g_odd_field = !g_odd_field;
         raise(8);
-        if (queue::active()) queue::post(queue::kVblank, 0, 0, nullptr, 0);
+        if (queue::active()) {
+            // The PCSX2 GS shows each field with the display registers of that moment.
+            bridge::Field field{{g_pmode, g_smode1, g_smode2, g_srfsh, g_synch1, g_synch2, g_syncv, g_dispfb[0], g_display[0], g_dispfb[1],
+                                 g_display[1], g_extbuf, g_extdata, g_extwrite, g_bgcolor, g_csr | (g_odd_field ? 0x2000u : 0u), g_imr, g_busdir,
+                                 g_siglblid},
+                                g_odd_field ? 1u : 0u, 0u};
+            queue::post(queue::kVblank, 0, 0, &field, sizeof field);
+        }
 #ifdef PS2_GPU
         else if (gpu_on()) gpu::flush();
 #endif
@@ -1197,6 +1213,37 @@ void post_present() {
     for (std::uint32_t done = g_presented.load(); g_posted_presents - done > 2; done = g_presented.load()) queue::wait(g_presented, done);
 }
 
+// The render side while the PCSX2 GS draws (pcsx2_bridge.hpp). Returns false for the items the
+// usual path still handles.
+bool render_with_bridge(const queue::Header &h, const std::uint8_t *payload, bool &presented) {
+    switch (h.type) {
+    case queue::kGif: bridge::submit(static_cast<int>(h.arg0), payload, h.arg1 * 16); return true;
+    case queue::kGifReset: return true;  // PCSX2 keeps its own GIF path state
+    case queue::kReset:
+    case queue::kSoftReset: bridge::reset(); return true;
+    case queue::kVblank: {
+        if (h.bytes >= sizeof(bridge::Field)) {
+            bridge::Field field;
+            std::memcpy(&field, payload, sizeof field);
+            bridge::vsync(field);
+        }
+        return true;
+    }
+    case queue::kDownload: {
+        bridge::Download request;
+        std::memcpy(&request, payload, sizeof request);
+        bridge::download(request, h.arg0 * 16);
+        g_downloads.fetch_add(1);
+        queue::notify(g_downloads);
+        return true;
+    }
+    case queue::kDownloadAsync: return true;
+    // kState (save states) still goes the usual way: its GS memory is not PCSX2's yet
+    // (snapshot/restore_local_memory), so a state made or loaded with the bridge lacks the picture.
+    default: (void)presented; return false;
+    }
+}
+
 Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_present, double budget_ms) {
     queue::role() = queue::Role::Render;
     queue::Header h;
@@ -1205,6 +1252,15 @@ Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_prese
     for (std::uint32_t n = 1; queue::render().peek(h, payload); ++n) {
         if (!(n & 7u) && std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() > budget_ms) return Rendered::busy;
         bool presented = false;
+        if (bridge::active() && render_with_bridge(h, payload, presented)) {
+            queue::render().pop(h);
+            if (presented) {
+                g_presented.fetch_add(1);
+                queue::notify(g_presented);
+                return Rendered::presented;
+            }
+            continue;
+        }
         switch (h.type) {
         case queue::kGif: gif::render(static_cast<int>(h.arg0), payload, h.arg1); break;
         case queue::kGifReset: gif::render_reset(); break;

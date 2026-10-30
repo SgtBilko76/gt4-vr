@@ -81,7 +81,10 @@ Image Image::raw(std::uint32_t address, std::vector<std::uint8_t> bytes, std::pa
 }
 
 std::optional<std::uint32_t> Image::word(std::uint32_t address) const {
-    for (const auto &segment : segments_) {
+    // Overlapping segments (e.g. a mod's .plugin inside .data): the loader copies
+    // them in order, so the last segment that covers the address wins.
+    for (auto it = segments_.rbegin(); it != segments_.rend(); ++it) {
+        const auto &segment = *it;
         if (address >= segment.address && address - segment.address + 4 <= segment.bytes.size()) {
             std::uint32_t value;
             std::memcpy(&value, segment.bytes.data() + (address - segment.address), 4);
