@@ -155,9 +155,11 @@ constexpr float kHudHalfWidth = 0.45f; // Wipeout Pure VR: 1.8 m wide at 2 m
 // debug.gt4vr.screenw (m) still overrides the width.
 constexpr float kScreenDistanceM = 2.0f;
 constexpr float kScreenFovDeg = 110.0f;
-// The immersive VR race view is switched off for now (owner 2026-10-30: "Den VR Modus lassen wir
-// erstmal weg"): both stick clicks do nothing. debug.gt4vr.vrallow 1 brings the toggle back.
-constexpr bool kVrModeAllowed = false;
+// VR mode re-enabled (owner: the VR mode and the curved screen should be switchable): both stick
+// clicks toggle the race view, debug.gt4vr.vr 1 / 0 selects VR / curved headless. It had been off
+// for now (owner 2026-10-30, "Den VR Modus lassen wir erstmal weg"); the curved screen stays the
+// default until the owner toggles back.
+constexpr bool kVrModeAllowed = true;
 std::atomic<bool> g_vr_allowed{kVrModeAllowed}; // live: debug.gt4vr.vrallow
 
 float ReadFloatProperty(const char *name, float fallback)

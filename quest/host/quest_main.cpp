@@ -327,6 +327,10 @@ void apply_pad() {
     static std::uint64_t last = ~0ull;
     const std::uint64_t state = (pad.buttons & 0xFFFFu) | (std::uint64_t(lx) << 16) | (std::uint64_t(ly) << 24) | (std::uint64_t(cross) << 32) |
                                 (std::uint64_t(square) << 40);
+    const std::uint16_t motors = ps2::pad_rumble(0);
+    const double strong = (motors >> 8) < 16 ? 0.0 : std::sqrt((motors >> 8) / 255.0);
+    const bool weak = motors & 1u;
+    gt4::quest::setRumble(static_cast<float>(strong), static_cast<float>(weak ? 1.0 : 0.0));
     if (state == last) return;
     last = state;
     ps2::set_pad_pressure(14, cross ? cross : 255, 0);
@@ -417,9 +421,8 @@ bool start_game(const fs::path &files) {
     // Anisotropic: 2.5x wide, 4x high (1600x1792). VR lacks vertical detail most (448 lines for the
     // whole view); measured 2026-10-30 at the same cost as 3x3 (VR 72 Hz: 108-123 of 600 skipped vs
     // 100-122), 3x4 skipped 139-159, 4x4 190-240. RRV_PCSX2_GS_SCALE_X=3 RRV_PCSX2_GS_SCALE=3 = old.
-    // VR is off for now (owner 2026-10-30), so the curved screen's 3x3 again: the 110 degree screen
-    // needs width (1920 px), and its 16:9 picture shows only 1080 rows of the eye image.
-    // For VR later: RRV_PCSX2_GS_SCALE_X=2.5 RRV_PCSX2_GS_SCALE=4.
+    // VR mode re-enabled (owner: VR and curved screen switchable); the curved screen stays the
+    // default until the owner toggles back. For VR later: RRV_PCSX2_GS_SCALE_X=2.5 RRV_PCSX2_GS_SCALE=4.
     setenv("RRV_PCSX2_GS_SCALE", "3", 0);
     // Sharpness (owner 2026-10-30: "das Bild ist total unscharf"): AMD CAS on the presented frame
     // and 8x anisotropic texture filtering (far road and walls). config.txt overrides
