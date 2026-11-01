@@ -37,6 +37,11 @@ for lib in "$BUILD/libgt4vr.so" "$BRIDGE_BUILD/pcsx2-gs-bridge/librrv-pcsx2-gs-b
   "$STRIP" --strip-unneeded -o "$STAGE/jniLibs/arm64-v8a/$(basename "$lib")" "$lib"
 done
 cp -r "$BRIDGE_BUILD/pcsx2-gs-bridge/resources" "$STAGE/assets/gt4vr/resources"
+# Shader pipeline seed (quest/tools/quest_pull_pipelines.sh): built up front on a fresh install.
+if [ -f "$ROOT/quest/assets/rrv_tfx_pipelines.bin" ]; then
+  mkdir -p "$STAGE/assets/gt4vr/pipelines"
+  cp "$ROOT/quest/assets/rrv_tfx_pipelines.bin" "$STAGE/assets/gt4vr/pipelines/"
+fi
 python3 - "$STAGE/assets/gt4vr" <<'EOF'
 import hashlib, pathlib, sys
 root = pathlib.Path(sys.argv[1])

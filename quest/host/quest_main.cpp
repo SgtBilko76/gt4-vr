@@ -460,6 +460,13 @@ bool start_game(const fs::path &files) {
     // Hardware download Unsynchronized (ARMSX2 Quest's choice; owner 2026-11-01) instead of the
     // bridge profile's Disabled. RRV_PCSX2_GS_HWDOWNLOAD=4 = Disabled.
     setenv("RRV_PCSX2_GS_HWDOWNLOAD", "3", 0);
+    // Shader pipelines (owner 2026-11-01: collect / precompile the shaders). The bridge records every
+    // pipeline it builds in its cache and builds the whole list up front at start; the list is
+    // mirrored to /sdcard/GT4VR (the app is not debuggable) so quest/tools/quest_pull_pipelines.sh
+    // can take it into quest/assets, and build_quest.sh ships it as the seed for fresh installs.
+    setenv("RRV_PIPELINE_EXPORT", (kDataDir + "/rrv_tfx_pipelines.bin").c_str(), 0);
+    if (const fs::path seed = files / "pipelines" / "rrv_tfx_pipelines.bin"; fs::exists(seed))
+        setenv("RRV_PIPELINE_SEED", seed.c_str(), 0);
     fs::create_directories(files / "pcsx2-data");
 
     ps2::g_options.disc_path = disc;
