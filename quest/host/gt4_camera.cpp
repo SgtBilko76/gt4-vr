@@ -21,6 +21,8 @@
 #include "gt4_camera.h"
 
 #include "ps2/cpu.hpp"
+#include "ps2/generated.hpp"
+#include "ps2/guest_call.hpp"
 #include "ps2/system.hpp"
 
 #include <cmath>
@@ -43,6 +45,21 @@ float g_tanX = 0.0f, g_tanY = 0.0f;
 int g_log = 0;         // PS2_GT4_CAM_LOG: 1 = changes, 2 = matrices every 300 builds
 std::uint64_t g_builds = 0;
 
+// Per-eye rendering test (Wipeout Rewrite VR's method: the 3D world drawn once per eye). The race
+// scene renderer 0x1EB0F8(a0, a1, a2, a3, t0, f12) is called from 0x1EA43C and 0x1EA900; its
+// arguments come from callee-saved registers there, so right after it returns (probes 0x1EA444 /
+// 0x1EA908) it can be called again with the same arguments. Pass 2 adds an eye offset in the
+// modelview hook. PS2_GT4_EYE2=x (+ PS2_GT4_EYE2_YAW=deg): second pass with the camera moved x m right and turned
+// yaw degrees left (PC test; off by default, the headset build does not set it).
+constexpr std::uint32_t kSceneRenderer = 0x1EB0F8u;
+constexpr std::uint32_t kAfterScene1 = 0x1EA444u;
+constexpr std::uint32_t kAfterScene2 = 0x1EA908u;
+bool g_eye2_on = false;
+float g_eye2_x = 0.0f, g_eye2_yaw = 0.0f;
+int g_pass = 0;              // 0 = the game's own call, 2 = the second (per-eye) pass
+bool g_scene_seen = false;   // the camera hooks ran inside the renderer call that just returned
+std::uint64_t g_eye2_passes = 0, g_eye2_failed = 0;
+
 // Eye space of GT4's view (OpenGL-like: x right, y up, z back), the same axes as OpenXR. The sign
 // per axis is set by PS2_GT4_CAM_SIGNS ("+++" default) until verified in the headset.
 float g_sx = 1.0f, g_sy = 1.0f, g_sz = 1.0f;
@@ -62,6 +79,7 @@ void dump(const char *what, const ps2::Cpu &c)
 void after_projection(ps2::Cpu &c)
 {
     ++g_builds;
+    g_scene_seen = true;
     g_pose = g_head ? g_head() : Head{};
     float *col[4];
     for (int k = 0; k < 4; ++k)
@@ -112,6 +130,24 @@ void after_modelview(ps2::Cpu &c)
         }
         std::fprintf(stderr, "[gt4cam] pos f%llu %.3f %.3f %.3f\n", static_cast<unsigned long long>(ps2::frame_count()), p[0], p[1], p[2]);
     }
+    if (g_pass == 2)
+    {
+        // Second pass: the other eye. V' = R_yaw^T * T(-x) * V in GT4's eye space.
+        float *t = c.vu0.vf[31].f;
+        t[0] -= g_eye2_x * g_sx;
+        if (g_eye2_yaw != 0.0f)
+        {
+            const float a = g_eye2_yaw * 0.0174533f, ca = std::cos(a), sa = std::sin(a);
+            for (int k = 0; k < 4; ++k)
+            {
+                float *f = c.vu0.vf[28 + k].f;
+                const float x0 = f[0], z0 = f[2];
+                // R about +y by a (left), R^T applied: x' = ca x - sa z, z' = sa x + ca z
+                f[0] = ca * x0 - sa * z0;
+                f[2] = sa * x0 + ca * z0;
+            }
+        }
+    }
     if (g_pose.key == 0)
         return;
     // R from the quaternion in GT4's eye space; V' = R^T * V (xyz of every column).
@@ -140,6 +176,59 @@ void after_modelview(ps2::Cpu &c)
     }
     if (g_frame)
         g_frame(g_pose.key, g_tanX, g_tanY, g_immersive);
+}
+
+// After the game's own renderer call returned: run it once more for the second eye.
+void after_scene(ps2::Cpu &c, std::uint32_t return_pc, bool second_caller)
+{
+    const bool seen = g_scene_seen;
+    g_scene_seen = false;
+    if (!g_eye2_on || g_pass != 0 || !seen)
+        return;
+    const ps2::Cpu saved = c;
+    // Arguments exactly as the call site sets them (callee-saved registers, unchanged by the call).
+    if (!second_caller)
+    {   // 0x1EA428..0x1EA440
+        c.r[4].d[0] = c.r[17].d[0];   // a0 = s1
+        c.r[5].d[0] = c.r[29].d[0];   // a1 = sp
+        c.r[6].d[0] = c.r[20].d[0];   // a2 = s4
+        c.r[7].d[0] = c.r[22].d[0];   // a3 = s6
+        c.r[8].sd[0] = -1;            // t0 = -1
+        c.f[12] = c.f[21];            // f12 = f21
+    }
+    else
+    {   // 0x1EA8EC..0x1EA904 (t0 = s5, a1 = s2, a2 = s3, a3 = sp, a0 = s0, f12 = f20)
+        c.r[4].d[0] = c.r[16].d[0];
+        c.r[5].d[0] = c.r[18].d[0];
+        c.r[6].d[0] = c.r[19].d[0];
+        c.r[7].d[0] = c.r[29].d[0];
+        c.r[8].d[0] = c.r[21].d[0];
+        c.f[12] = c.f[20];
+    }
+    c.r[31].sd[0] = static_cast<std::int32_t>(return_pc);
+    g_pass = 2;
+    ps2::guest_call_hold_begin(c);
+    ps2::call(c, kSceneRenderer, 1u);
+    ps2::guest_call_hold_end(c);
+    g_pass = 0;
+    g_scene_seen = false;
+    const std::uint32_t end_pc = c.pc;
+    const bool ok = end_pc == return_pc;
+    const std::int32_t budget = c.budget;
+    c = saved;
+    c.budget = budget;
+    if (ok)
+        ++g_eye2_passes;
+    else
+    {
+        ++g_eye2_failed;
+        std::fprintf(stderr, "[gt4cam] eye 2 pass did not return (pc 0x%08X, want 0x%08X): per-eye pass off\n",
+                     end_pc, return_pc);
+        g_eye2_on = false;
+    }
+    if (g_log >= 1 && (g_eye2_passes % 600) == 1)
+        std::fprintf(stderr, "[gt4cam] eye 2 passes %llu (failed %llu)\n",
+                     static_cast<unsigned long long>(g_eye2_passes), static_cast<unsigned long long>(g_eye2_failed));
 }
 
 // ps2run test pose: PS2_GT4_TEST_YAW / _PITCH (degrees, positive = left / up), PS2_GT4_TEST_TAN
@@ -192,5 +281,16 @@ void install(HeadSource head, FrameSink frame)
     g_frame = frame;
     ps2::set_probe_hook(kAfterProjection, after_projection);
     ps2::set_probe_hook(kAfterModelview, after_modelview);
+    if (const char *e = std::getenv("PS2_GT4_EYE2"); e && e[0] != '\0')
+    {
+        g_eye2_x = std::strtof(e, nullptr);
+        if (const char *y = std::getenv("PS2_GT4_EYE2_YAW"))
+            g_eye2_yaw = std::strtof(y, nullptr);
+        g_eye2_on = true;
+        std::fprintf(stderr, "[gt4cam] per-eye test: second race pass, camera %.3f m right, %.1f deg left\n",
+                     g_eye2_x, g_eye2_yaw);
+    }
+    ps2::set_probe_hook(kAfterScene1, [](ps2::Cpu &c) { after_scene(c, kAfterScene1, false); });
+    ps2::set_probe_hook(kAfterScene2, [](ps2::Cpu &c) { after_scene(c, kAfterScene2, true); });
 }
 } // namespace gt4::camera

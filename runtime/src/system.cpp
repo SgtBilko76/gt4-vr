@@ -13,6 +13,7 @@
 #include "ps2/disc.hpp"
 #include "kernel.hpp"
 #include "ps2/generated.hpp"
+#include "ps2/guest_call.hpp"
 #include "ps2/memory.hpp"
 #include "ps2/state.hpp"
 #include "ps2/state_request.hpp"
@@ -52,6 +53,7 @@ struct Event {
 
 std::uint64_t g_base = 0;
 std::int64_t g_given = 0;
+bool g_guest_call_hold = false; // guest_call_hold_begin/end (ps2/guest_call.hpp)
 std::vector<Event> g_events;
 bool g_halted = false;
 std::string g_halt_reason;
@@ -241,9 +243,35 @@ std::uint64_t scheduled_at(int event) {
 }
 
 bool preempt(Cpu &c) {
+    if (g_guest_call_hold) {
+        // guest_call_hold_begin: run on (guest clock continuous), no events, no unwind.
+        c.budget += kMaxSlice;
+        g_given += kMaxSlice;
+        return false;
+    }
     run_due_events();
     refill(c);
     return g_halted || g_state_request || g_state_operation.load(std::memory_order_relaxed) || kernel::must_unwind();
+}
+
+namespace {
+std::uint64_t g_hold_base = 0;
+std::int64_t g_hold_given = 0;
+std::int32_t g_hold_budget = 0;
+}
+
+void guest_call_hold_begin(Cpu &c) {
+    g_hold_base = g_base;
+    g_hold_given = g_given;
+    g_hold_budget = c.budget;
+    g_guest_call_hold = true;
+}
+
+void guest_call_hold_end(Cpu &c) {
+    g_guest_call_hold = false;
+    g_base = g_hold_base;
+    g_given = g_hold_given;
+    c.budget = g_hold_budget;
 }
 
 void halt(const std::string &reason) {
