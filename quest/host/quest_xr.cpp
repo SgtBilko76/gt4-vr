@@ -162,12 +162,11 @@ constexpr float kScreenWidthM = 5.71f;
 // Live tuning:
 //   adb shell setprop debug.gt4vr.screenu -0.8    (metres, negative = lower than the eyes)
 constexpr float kScreenVerticalOffsetM = 0.0f;
-// VR mode deactivated (owner: the VR mode and the curved screen should be switchable); after the
-// unsharp picture gave no progress we concentrate on the curved screen, which is sharp. Both stick
-// clicks toggle the race view, debug.gt4vr.vr 1 / 0 selects VR / curved headless. It had been off
-// for now (owner 2026-10-30, "Den VR Modus lassen wir erstmal weg"); the curved screen stays the
-// default until the owner toggles back.
-constexpr bool kVrModeAllowed = true;
+// VR mode OFF (owner 2026-11-01, after the per-eye VR tests: "keep the curved screen as the main
+// mode", then "turn off the switch"): both stick clicks no longer switch to the old head-tracked VR
+// race view; the curved HD 3D screen is the only race view. debug.gt4vr.vrallow 1 re-enables the
+// switch for tests, debug.gt4vr.vr 1 / 0 still selects VR / curved headless.
+constexpr bool kVrModeAllowed = false;
 std::atomic<bool> g_vr_allowed{kVrModeAllowed}; // live: debug.gt4vr.vrallow
 
 float ReadFloatProperty(const char *name, float fallback)
