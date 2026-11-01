@@ -1,5 +1,6 @@
 #include "hw.hpp"
 
+#include "dev9.hpp"
 #include "iop.hpp"
 #include "kernel.hpp"
 #include "sio2.hpp"
@@ -113,6 +114,11 @@ void start_dma(unsigned ch) {
         sio2::arm_dma(static_cast<int>(ch), d.madr, d.bcr & 0xFFFFu, d.bcr >> 16);
         return;
     }
+    if (ch == 8 && dev9::present()) {
+        dev9::dma(d.madr, words * 4u, (d.chcr & 1u) != 0);
+        kernel::schedule(kernel::now() + 64 + words / 4, kernel::Job{kernel::kJobDmaDone, ch});
+        return;
+    }
     std::fprintf(stderr, "[iop-dma] channel %u start madr 0x%08X bcr 0x%08X chcr 0x%08X (not emulated)\n", ch, d.madr, d.bcr, d.chcr);
     dma_done(ch);
 }
@@ -128,6 +134,7 @@ void reset() {
     std::memset(g_scratchpad, 0, sizeof g_scratchpad);
     spu2::reset();
     sio2::reset();
+    dev9::reset();
     std::memset(g_ohci, 0, sizeof g_ohci);
 }
 
@@ -211,6 +218,7 @@ void ohci_write(std::uint32_t a, std::uint32_t v) {
 
 std::uint32_t read(std::uint32_t a, unsigned size) {
     if (a >= 0x1F900000u && a < 0x1F900800u) return spu2::read(a, size);
+    if (dev9::owns(a)) return dev9::read(a, size);
     if (a >= 0x1F801600u && a < 0x1F801660u) return ohci_read(a);
     if (a >= 0x1F808200u && a < 0x1F808280u) return sio2::read(a);
     if (a == kIStat) return g_istat;
@@ -239,6 +247,7 @@ std::uint32_t read(std::uint32_t a, unsigned size) {
 
 void write(std::uint32_t a, std::uint32_t v, unsigned size) {
     if (a >= 0x1F900000u && a < 0x1F900800u) { spu2::write(a, v, size); return; }
+    if (dev9::owns(a)) { dev9::write(a, v, size); return; }
     if (a >= 0x1F801600u && a < 0x1F801660u) { ohci_write(a, v); return; }
     if (a >= 0x1F808200u && a < 0x1F808280u) { sio2::write(a, v); return; }
     if (a == kIStat) { g_istat &= v; return; }

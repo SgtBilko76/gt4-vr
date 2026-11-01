@@ -2,6 +2,7 @@
 
 #include "../hw.hpp"
 #include "iop.hpp"
+#include "dev9.hpp"
 #include "io.hpp"
 #include "kernel.hpp"
 #include "ps2/disc.hpp"
@@ -556,8 +557,15 @@ bool fileio_async(std::uint32_t method, std::uint32_t args, std::uint32_t, std::
     case 23: {
         const std::string device = text(12);
         const std::uint32_t cmd = word(12 + 0x800), out = word(12 + 0x808) & (kRamSize - 1);
-        const std::uint32_t result = device.starts_with("cdrom") ? 0u : static_cast<std::uint32_t>(-19);
-        if (cmd == 0x4322u) store<std::uint32_t>(g_ram + out, 0x0Au);
+        std::uint32_t result = device.starts_with("cdrom") ? 0u : static_cast<std::uint32_t>(-19);
+        // dev9x: is the DEV9 driver's device (added by DEV9.IRX, which our HLE fileio does not see).
+        // DDIOC_MODEL 0x4401 = adapter type (1 = expansion bay), DDIOC_OFF 0x4402 = power off.
+        if (device.starts_with("dev9x") && iop::dev9::present()) {
+            if (cmd == 0x4401u) result = 1u;
+            else if (cmd == 0x4402u) result = 0u;
+            else std::fprintf(stderr, "[fileio] devctl %s 0x%X\n", device.c_str(), cmd);
+        }
+        else if (cmd == 0x4322u) store<std::uint32_t>(g_ram + out, 0x0Au);
         else if (cmd == 0x4325u) store<std::uint32_t>(g_ram + out, 2u);
         else if (cmd == 0x4320u) store<std::uint32_t>(g_ram + out, 0u);
         else if (cmd != 0x430Cu) std::fprintf(stderr, "[fileio] devctl %s 0x%X\n", device.c_str(), cmd);

@@ -53,6 +53,8 @@ add_library(ps2runtime STATIC
     runtime/src/iop/hw.cpp
     runtime/src/iop/spu2.cpp
     runtime/src/iop/sio2.cpp
+    runtime/src/iop/dev9.cpp
+    runtime/src/net/link.cpp
     runtime/src/iop/io.cpp
     runtime/src/iop/cdvd.cpp
     runtime/src/iop/sif.cpp
