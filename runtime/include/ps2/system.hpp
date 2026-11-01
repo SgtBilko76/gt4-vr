@@ -144,6 +144,8 @@ std::uint16_t pad_rumble(int pad = 0);
 // `eerecomp --probes <file>`). One hook per address; an empty hook removes it.
 using ProbeHook = std::function<void(Cpu &)>;
 void set_probe_hook(std::uint32_t pc, ProbeHook hook);
+// From a probe hook at a FUNCTION ENTRY: skip that function (return to $ra; set v0 yourself).
+void probe_skip_function();
 
 void set_audio_sink(std::function<void(const std::int16_t *samples, std::size_t frames)> sink);
 

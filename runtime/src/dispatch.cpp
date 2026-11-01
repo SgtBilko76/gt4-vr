@@ -207,14 +207,21 @@ void set_probe_hook(std::uint32_t pc, ProbeHook hook) {
     g_probe_hooks.emplace_back(pc, std::move(hook));
 }
 
-void probe(Cpu &c, std::uint32_t pc) {
+bool g_probe_skip = false;
+
+void probe_skip_function() { g_probe_skip = true; }
+
+bool probe(Cpu &c, std::uint32_t pc) {
     for (const auto &h : g_probe_hooks)
         if (h.first == pc) {
+            g_probe_skip = false;
             if (h.second) h.second(c);
-            return;
+            const bool skip = g_probe_skip;
+            g_probe_skip = false;
+            return skip;
         }
     static const char *log = std::getenv("PS2_PROBE_LOG");
-    if (!log) return;
+    if (!log) return false;
     // PS2_PROBE_LOG=c: calls per probe, printed every 300 frames.
     if (log[0] == 'c') {
         struct Count { std::uint32_t first; std::uint64_t second; std::uint32_t third; };
@@ -236,7 +243,7 @@ void probe(Cpu &c, std::uint32_t pc) {
             }
             std::fprintf(stderr, "\n");
         }
-        return;
+        return false;
     }
     std::fprintf(stderr, "[probe] 0x%08X f%llu a0 %08X a1 %08X a2 %08X a3 %08X s0 %08X s1 %08X ra %08X v0 %08X\n", pc,
                  static_cast<unsigned long long>(frame_count()), c.r[4].w[0], c.r[5].w[0], c.r[6].w[0], c.r[7].w[0], c.r[16].w[0], c.r[17].w[0],
@@ -252,6 +259,7 @@ void probe(Cpu &c, std::uint32_t pc) {
         }
         std::fprintf(stderr, "\n");
     }
+    return false;
 }
 
 void breakpoint(Cpu &c, std::uint32_t pc) {

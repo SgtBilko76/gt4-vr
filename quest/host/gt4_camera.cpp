@@ -23,6 +23,7 @@
 #include "ps2/cpu.hpp"
 #include "ps2/generated.hpp"
 #include "ps2/guest_call.hpp"
+#include "ps2/memory.hpp"
 #include "ps2/system.hpp"
 
 #include <cmath>
@@ -60,6 +61,13 @@ int g_pass = 0;              // 0 = the game's own call, 2 = the second (per-eye
 bool g_scene_seen = false;   // the camera hooks ran inside the renderer call that just returned
 std::uint64_t g_eye2_passes = 0, g_eye2_failed = 0;
 
+// Which parts of the renderer draw what (attribution for a scene-only eye pass): PS2_GT4_SKIP=
+// hex[,hex...] function entries (probes in games/gt4/probes.txt) skipped while the race renderer
+// runs; PS2_GT4_SKIP_PASS=1 (the game's own pass, default), 2 (the second pass) or 3 (both).
+bool g_in_renderer = false;  // between the renderer's camera setup and its return
+int g_skip_pass = 1;
+std::uint64_t g_skipped = 0;
+
 // Eye space of GT4's view (OpenGL-like: x right, y up, z back), the same axes as OpenXR. The sign
 // per axis is set by PS2_GT4_CAM_SIGNS ("+++" default) until verified in the headset.
 float g_sx = 1.0f, g_sy = 1.0f, g_sz = 1.0f;
@@ -80,6 +88,7 @@ void after_projection(ps2::Cpu &c)
 {
     ++g_builds;
     g_scene_seen = true;
+    g_in_renderer = true;
     g_pose = g_head ? g_head() : Head{};
     float *col[4];
     for (int k = 0; k < 4; ++k)
@@ -114,6 +123,26 @@ void after_projection(ps2::Cpu &c)
 
 void after_modelview(ps2::Cpu &c)
 {
+    // PS2_GT4_CAM_LOG=4: once, the virtual call targets of the race renderer 0x1EB0F8 (s1 = renderer,
+    // vtable at s1+0x64; s3 = camera manager, vtable at s3+0; GCC 2.x entries {delta, func} 8 bytes).
+    if (g_log == 4)
+    {
+        static bool printed = false;
+        if (!printed && g_pass == 0)
+        {
+            printed = true;
+            const std::uint32_t s1 = c.r[17].w[0], s3 = c.r[19].w[0];
+            const std::uint32_t vt1 = ps2::ld32(s1 + 0x64u), vt3 = ps2::ld32(s3);
+            std::fprintf(stderr, "[gt4cam] renderer s1 %08X vt %08X, camera s3 %08X vt %08X, s4 %08X\n", s1, vt1, s3, vt3,
+                         c.r[20].w[0]);
+            static const std::uint32_t offs[] = {0xd0, 0x3f8, 0x390, 0x400, 0x398, 0x4a0, 0x3c0, 0x408, 0x3a0, 0x410,
+                                                 0x1e0, 0x4d0, 0x3c8, 0x3d8, 0x3d0, 0x168, 0x3e0, 0x428, 0x430, 0x418};
+            for (const std::uint32_t o : offs)
+                std::fprintf(stderr, "[gt4cam] vt1+%03X -> %08X\n", o, ps2::ld32(vt1 + o + 4u));
+            for (const std::uint32_t o : {0x10u, 0x18u})
+                std::fprintf(stderr, "[gt4cam] vt3+%03X -> %08X\n", o, ps2::ld32(vt3 + o + 4u));
+        }
+    }
     if (g_log >= 2 && g_builds % 300 == 1)
         dump("V", c);
     // PS2_GT4_CAM_LOG=3: the camera's world position every 30 builds (units calibration by speed).
@@ -181,6 +210,7 @@ void after_modelview(ps2::Cpu &c)
 // After the game's own renderer call returned: run it once more for the second eye.
 void after_scene(ps2::Cpu &c, std::uint32_t return_pc, bool second_caller)
 {
+    g_in_renderer = false;
     const bool seen = g_scene_seen;
     g_scene_seen = false;
     if (!g_eye2_on || g_pass != 0 || !seen)
@@ -212,6 +242,7 @@ void after_scene(ps2::Cpu &c, std::uint32_t return_pc, bool second_caller)
     ps2::guest_call_hold_end(c);
     g_pass = 0;
     g_scene_seen = false;
+    g_in_renderer = false;
     const std::uint32_t end_pc = c.pc;
     const bool ok = end_pc == return_pc;
     const std::int32_t budget = c.budget;
@@ -292,5 +323,29 @@ void install(HeadSource head, FrameSink frame)
     }
     ps2::set_probe_hook(kAfterScene1, [](ps2::Cpu &c) { after_scene(c, kAfterScene1, false); });
     ps2::set_probe_hook(kAfterScene2, [](ps2::Cpu &c) { after_scene(c, kAfterScene2, true); });
+    if (const char *p = std::getenv("PS2_GT4_SKIP_PASS"))
+        g_skip_pass = std::atoi(p);
+    if (const char *s = std::getenv("PS2_GT4_SKIP"); s && s[0] != '\0')
+    {
+        for (const char *q = s; *q;)
+        {
+            char *end = nullptr;
+            const std::uint32_t addr = static_cast<std::uint32_t>(std::strtoul(q, &end, 16));
+            if (end == q)
+                break;
+            ps2::set_probe_hook(addr, [addr](ps2::Cpu &c) {
+                const bool pass_on = (g_pass == 0 && (g_skip_pass & 1)) || (g_pass == 2 && (g_skip_pass & 2));
+                if (!g_in_renderer || !pass_on)
+                    return;
+                c.r[2].d[0] = 0; // v0
+                ps2::probe_skip_function();
+                if (++g_skipped % 3000 == 1)
+                    std::fprintf(stderr, "[gt4cam] skipping %06X in the race renderer (%llu skips)\n", addr,
+                                 static_cast<unsigned long long>(g_skipped));
+            });
+            std::fprintf(stderr, "[gt4cam] skip %06X in race renderer pass mask %d\n", addr, g_skip_pass);
+            q = *end == ',' ? end + 1 : end;
+        }
+    }
 }
 } // namespace gt4::camera

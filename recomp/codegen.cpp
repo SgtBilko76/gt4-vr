@@ -213,7 +213,9 @@ private:
                 flush();
                 out_ << label(a) << ":\n";
             }
-            if (options_.probes.count(a)) line(std::format("probe(c, {});", pc(a)));
+            // A probe hook may ask to skip the function (ps2::probe_skip_function, only at function
+            // entries): return to the caller as `jr $ra` would.
+            if (options_.probes.count(a)) line(std::format("if (probe(c, {})) [[unlikely]] {{ c.pc = {}; return; }}", pc(a), w(31)));
             const Insn i = at(a);
             const Flow fl = flow(i.op);
             if (fl == Flow::None) {
