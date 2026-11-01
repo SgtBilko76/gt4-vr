@@ -58,6 +58,7 @@ int main(int argc, char **argv) {
         else if (a == "--trace-threads") ps2::g_options.trace_threads = true;
         else if (a == "--disc" && i + 1 < argc) ps2::g_options.disc_path = argv[++i];
         else if (a == "--memcard" && i + 1 < argc) ps2::g_options.memcard_path = argv[++i];
+        else if (a == "--memcard2" && i + 1 < argc) ps2::g_options.memcard2_path = argv[++i];
         else if (a == "--trace-iop") ps2::g_options.trace_iop_modules = true;
         else if (a == "--trace-iop-hle") ps2::g_options.trace_iop_hle = true;
         else if (a == "--frames-dir" && i + 1 < argc) ps2::g_options.frames_dir = argv[++i];

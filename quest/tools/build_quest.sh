@@ -3,6 +3,8 @@
 # stage it with the PCSX2 GS bridge, its resources and the OpenXR loader, then let Gradle package.
 #
 # usage: quest/tools/build_quest.sh [--no-apk]
+#   GAME=gt4|gt4r gt4 = A-Spec II (online.portroyale.gt4vr, /sdcard/GT4VR, default),
+#                 gt4r = retail USA v2.00 with LAN play (online.portroyale.gt4lan, /sdcard/GT4LAN)
 #   JOBS=N        parallel compile jobs (default 4: generated units take ~1 GB each)
 #   BRIDGE_BUILD  PCSX2 GS bridge build dir (default: the Ridge Racer V port's Android bridge)
 #
@@ -11,7 +13,15 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 NDK=${ANDROID_NDK:-$HOME/workspace/android-ndk-r30}
 SDK_CMAKE=$(ls -d "$HOME"/workspace/android-sdk/cmake/*/bin | tail -1)
-BUILD="$ROOT/build/android-gt4"
+GAME=${GAME:-gt4}
+case "$GAME" in
+  gt4)  variant=(); APP_ID=online.portroyale.gt4vr; APP_LABEL="GT4 VR" ;;
+  gt4r) variant=(-DGT4VR_DATA_DIR=/sdcard/GT4LAN -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="Gran Turismo 4 LAN VR"
+                 -DGT4VR_NET_PRODUCT=SCUS97328 -DGT4VR_CAMERA_HOOKS=OFF)
+        APP_ID=online.portroyale.gt4lan; APP_LABEL="GT4 LAN VR" ;;
+  *) echo "unknown GAME=$GAME" >&2; exit 2 ;;
+esac
+BUILD="$ROOT/build/android-$GAME"
 BRIDGE_BUILD=${BRIDGE_BUILD:-$HOME/Projekte/fukami-wt-bridge/build-android-bridge}
 STAGE="$ROOT/quest/android/build/stage"
 STRIP="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
@@ -21,7 +31,7 @@ STRIP="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
   -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
   -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 -DANDROID_STL=c++_static \
   -DCMAKE_BUILD_TYPE=Release \
-  -DPS2_GENERATED="$ROOT/generated/gt4" \
+  -DPS2_GENERATED="$ROOT/generated/$GAME" "${variant[@]}" \
   -DPS2_OPENXR_DIR="$ROOT/quest/third_party/openxr" > "$BUILD.configure.log" 2>&1 || { tail -30 "$BUILD.configure.log"; exit 1; }
 "$SDK_CMAKE/ninja" -C "$BUILD" -j "${JOBS:-4}" gt4vr
 
@@ -58,5 +68,7 @@ ls -la "$STAGE/jniLibs/arm64-v8a"
 [ "${1:-}" = "--no-apk" ] && exit 0
 cd "$ROOT/quest/android"
 [ -f local.properties ] || echo "sdk.dir=$HOME/workspace/android-sdk" > local.properties
-JAVA_HOME=$(ls -d "$HOME"/tools/jdk-17* | head -1) ./gradlew --no-daemon -q --offline assembleRelease
-ls -la app/build/outputs/apk/release/
+JAVA_HOME=$(ls -d "$HOME"/tools/jdk-17* | head -1) ./gradlew --no-daemon -q --offline assembleRelease -PgtAppId="$APP_ID" -PgtAppLabel="$APP_LABEL"
+mkdir -p "$ROOT/build/apk"
+cp app/build/outputs/apk/release/app-release.apk "$ROOT/build/apk/$GAME.apk"
+ls -la app/build/outputs/apk/release/ "$ROOT/build/apk/$GAME.apk"

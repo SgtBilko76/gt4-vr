@@ -32,4 +32,7 @@ void send(const std::uint8_t *frame, std::size_t size);
 // Next received frame for this PS2, if any.
 bool receive(std::vector<std::uint8_t> &frame);
 
+// Queues a frame for this PS2 as if it came from the network (local DHCP replies).
+void inject(std::vector<std::uint8_t> frame);
+
 }

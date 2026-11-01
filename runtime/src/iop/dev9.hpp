@@ -6,6 +6,10 @@
 #include <cstddef>
 #include <cstdint>
 
+namespace ps2::state {
+class Stream;
+}
+
 namespace ps2::iop::dev9 {
 
 void reset();
@@ -18,5 +22,7 @@ void write(std::uint32_t phys, std::uint32_t value, unsigned size);
 
 // IOP DMA channel 8: `bytes` between IOP RAM at `madr` and the SMAP FIFOs.
 void dma(std::uint32_t madr, std::uint32_t bytes, bool to_device);
+
+void state(ps2::state::Stream &s);
 
 }

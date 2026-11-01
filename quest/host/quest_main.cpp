@@ -84,8 +84,17 @@ namespace {
 
 namespace fs = std::filesystem;
 
-const std::string kDataDir = "/sdcard/GT4VR";
-const std::string kOldDataDir = "/sdcard/GT4";
+#ifndef GT4VR_DATA_DIR
+#define GT4VR_DATA_DIR "/sdcard/GT4VR"
+#define GT4VR_OLD_DATA_DIR "/sdcard/GT4"
+#define GT4VR_TITLE "Gran Turismo 4 VR"
+#define GT4VR_NET_PRODUCT "SCUS97436"
+#define GT4VR_CAMERA_HOOKS 1
+#endif
+// The build's variant (CMakeLists.txt GT4VR_*): A-Spec II = /sdcard/GT4VR, retail v2.00 with LAN
+// play = /sdcard/GT4LAN.
+const std::string kDataDir = GT4VR_DATA_DIR;
+const std::string kOldDataDir = GT4VR_OLD_DATA_DIR;
 
 // ---------------------------------------------------------------- logging
 
@@ -411,9 +420,9 @@ bool start_game(const fs::path &files) {
     fs::create_directories(kDataDir);
     g_elf_path = kDataDir + "/core.elf";
     std::string disc = kDataDir + "/disc.iso";
-    if (!readable(disc) && readable(kOldDataDir + "/disc.iso")) disc = kOldDataDir + "/disc.iso";
+    if (!readable(disc) && !kOldDataDir.empty() && readable(kOldDataDir + "/disc.iso")) disc = kOldDataDir + "/disc.iso";
     const std::string card = kDataDir + "/memcard.ps2";
-    if (!readable(card) && readable(kOldDataDir + "/memcard.ps2")) {
+    if (!readable(card) && !kOldDataDir.empty() && readable(kOldDataDir + "/memcard.ps2")) {
         std::error_code ec;
         fs::copy_file(kOldDataDir + "/memcard.ps2", card, ec);
         logf("[quest] memory card copied from %s: %s", kOldDataDir.c_str(), ec ? ec.message().c_str() : "ok");
@@ -471,7 +480,10 @@ bool start_game(const fs::path &files) {
 
     ps2::g_options.disc_path = disc;
     ps2::g_options.memcard_path = card;
-    ps2::g_options.pal = false;  // A-Spec II is NTSC
+    ps2::g_options.pal = false;  // A-Spec II and the retail USA v2.00 are NTSC
+    // Network play (runtime/src/net/link.hpp): config.txt PS2_NET_SERVER=host turns the PS2 network
+    // adapter on; players of the same product code and group meet on that ad hoc relay server.
+    setenv("PS2_NET_PRODUCT", GT4VR_NET_PRODUCT, 0);
     ps2::g_options.rate_forced = true;
     ps2::g_options.widescreen = config_string("widescreen", "1") == "1";
     ps2::g_options.on_vblank = [] {
@@ -482,7 +494,7 @@ bool start_game(const fs::path &files) {
     ps2::set_audio_sink(queue_audio);
     register_generated_code();
     register_generated_vu();
-    gt4::camera::install(quest_head, gt4::quest::noteHeadTrackedFrame);
+    if (GT4VR_CAMERA_HOOKS) gt4::camera::install(quest_head, gt4::quest::noteHeadTrackedFrame);
     ps2::gs::bridge::set_field_tags(gt4::quest::takeBuiltKey, gt4::quest::notePresentedKey);
 
     std::thread(gs_thread_main).detach();
@@ -537,7 +549,7 @@ void android_main(android_app *app) {
     app->onAppCmd = on_app_cmd;
     mkdir(kDataDir.c_str(), 0775);
     redirect_stderr();
-    logf("[quest] Gran Turismo 4 VR starting");
+    logf("[quest] %s starting (data %s)", GT4VR_TITLE, kDataDir.c_str());
     load_config();
 
     const fs::path files = app->activity->internalDataPath;

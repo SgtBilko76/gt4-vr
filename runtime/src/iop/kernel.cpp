@@ -1,4 +1,5 @@
 #include "kernel.hpp"
+#include "dev9.hpp"
 
 #include "hw.hpp"
 #include "io.hpp"
@@ -706,7 +707,7 @@ std::int32_t link_module(const std::vector<std::uint8_t> &data, const std::strin
         if (!own.empty()) name = own;
     }
     const int id = g_next_module++;
-    g_modules[id] = Module{id, name, base, total, base + entry, base + gp};
+    g_modules[id] = Module{id, name, base, total, base + entry, base + gp, elf.u16(iopmod + 24)};
     g_module_paths[id] = path;
     if (g_trace_modules) std::fprintf(stderr, "[iop] module %d %s at 0x%08X size 0x%X entry 0x%08X\n", id, name.c_str(), base, total, base + entry);
     return id;
@@ -796,6 +797,7 @@ void state(ps2::state::Stream &s) {
         s.pod(m.size);
         s.pod(m.entry);
         s.pod(m.gp);
+        if (s.version() >= 7) s.pod(m.version);
     });
     s.string_map(g_libraries, [&s](std::uint32_t &table) { s.pod(table); });
     s.map(g_used);
@@ -850,6 +852,7 @@ void state(ps2::state::Stream &s) {
     sio2::state(s);
     spu2::state(s);
     io::state(s);
+    if (s.version() >= 7) dev9::state(s);
 }
 
 }

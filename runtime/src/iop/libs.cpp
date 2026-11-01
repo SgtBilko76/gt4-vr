@@ -1066,7 +1066,10 @@ void install_modload() {
         const std::uint32_t p = arg(c, 1);
         std::memset(ram_ptr(p), 0, 0x50);
         std::memcpy(ram_ptr(p), it->second.name.c_str(), std::min<std::size_t>(it->second.name.size(), 55));
-        write32(p + 0x38, static_cast<std::uint32_t>(it->first));
+        // ModuleStatus: name[56], version (u16) at 0x38, flags 0x3A, id 0x3C ... SMAP.IRX refuses
+        // to start unless DEV9's version is 2.4 or later.
+        std::memcpy(ram_ptr(p + 0x38), &it->second.version, 2);
+        write32(p + 0x3C, static_cast<std::uint32_t>(it->first));
         write32(p + 0x40, it->second.entry);
         write32(p + 0x44, it->second.gp);
         write32(p + 0x48, it->second.base);

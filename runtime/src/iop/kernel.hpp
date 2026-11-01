@@ -103,6 +103,7 @@ struct Module {
     int id;
     std::string name;
     std::uint32_t base, size, entry, gp;
+    std::uint16_t version = 0;  // .iopmod header (0x0204 = 2.4), ReferModuleStatus reports it
 };
 const std::map<int, Module> &modules();
 using HleModuleStart = std::function<void()>;

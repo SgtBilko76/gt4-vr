@@ -9,6 +9,7 @@
 #include "kernel.hpp"
 
 #include "../net/link.hpp"
+#include "ps2/state.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -442,6 +443,13 @@ void write(std::uint32_t a, std::uint32_t v, unsigned size) {
     case 2: smap_write16(a, static_cast<std::uint16_t>(v)); break;
     default: smap_write32(a, v); break;
     }
+}
+
+void state(ps2::state::Stream &s) {
+    s.tag("dev9");
+    s.pod(g);
+    s.pod(g_last_tick);
+    s.pod(g_tick_chain);
 }
 
 void dma(std::uint32_t madr, std::uint32_t bytes, bool to_device) {

@@ -10,7 +10,9 @@ android {
     compileSdk 34
 
     defaultConfig {
-        applicationId 'online.portroyale.gt4vr'
+        // quest/tools/build_quest.sh GAME=gt4r: the retail LAN build installs next to A-Spec II.
+        applicationId project.findProperty('gtAppId') ?: 'online.portroyale.gt4vr'
+        manifestPlaceholders = [appLabel: project.findProperty('gtAppLabel') ?: 'GT4 VR']
         minSdk 29
         targetSdk 32
         versionCode 1

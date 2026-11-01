@@ -65,7 +65,7 @@ Pad g_pads[2];
 // which ports the host has a controller in; kept out of save states so loading one does not unplug a pad
 bool g_plugged[2] = {true, false};
 Feel g_feel[2];
-Card g_card;
+Card g_card, g_card2;  // slot 1 (SIO2 port 2) and slot 2 (port 3)
 Dma g_dma[2];
 
 void no_device() { g_stat |= 0xC000u | (0x10000u << (g_index & 15u)); }
@@ -172,17 +172,21 @@ std::uint8_t xor_of(const std::uint8_t *p, std::size_t n) {
     return v;
 }
 
-void load_card() {
-    if (g_card.present || g_options.memcard_path.empty()) return;
-    g_card.data.assign(kCardBytes, 0xFF);
-    std::ifstream in(g_options.memcard_path, std::ios::binary);
-    if (in) in.read(reinterpret_cast<char *>(g_card.data.data()), static_cast<std::streamsize>(kCardBytes));
-    g_card.present = true;
-    std::fprintf(stderr, "[mc] card in slot 1: %s%s\n", g_options.memcard_path.c_str(), in ? "" : " (new, unformatted)");
+void load_card(Card &card, const std::string &path, int slot) {
+    if (card.present || path.empty()) return;
+    card.data.assign(kCardBytes, 0xFF);
+    std::ifstream in(path, std::ios::binary);
+    if (in) in.read(reinterpret_cast<char *>(card.data.data()), static_cast<std::streamsize>(kCardBytes));
+    card.present = true;
+    std::fprintf(stderr, "[mc] card in slot %d: %s%s\n", slot, path.c_str(), in ? "" : " (new, unformatted)");
 }
 
-void memory_card(std::size_t at, std::uint32_t out_size) {
-    Card &c = g_card;
+void load_card() {
+    load_card(g_card, g_options.memcard_path, 1);
+    load_card(g_card2, g_options.memcard2_path, 2);
+}
+
+void memory_card(Card &c, std::size_t at, std::uint32_t out_size) {
     const std::vector<std::uint8_t> in(g_in.begin(), g_in.end());
     if (!c.present || in.size() < 2 || in[0] != 0x81) {
         no_device();
@@ -269,7 +273,8 @@ void process() {
     for (std::uint32_t i = 0; i < out_size; ++i) g_out.push_back(0xFF);
     if (g_index == 0) g_stat = 0x1100u;
     const std::uint32_t device = g_ctrl2[port];
-    if (port == 2) memory_card(at, out_size);
+    if (port == 2) memory_card(g_card, at, out_size);
+    else if (port == 3) memory_card(g_card2, at, out_size);
     else if (device == 0x5FFFFu || device == 0x00030064u || port >= 2) no_device();
     else controller(port, at, out_size);
     static const bool trace = std::getenv("PS2_TRACE_PAD") != nullptr;
@@ -330,18 +335,26 @@ void reset() {
     load_card();
 }
 
-void flush_cards() {
-    Card &c = g_card;
-    if (!c.dirty || ++c.quiet < 50) return;
+namespace {
+
+bool flush_card(Card &c, const std::string &path) {
+    if (!c.present || !c.dirty || ++c.quiet < 50) return false;
     c.dirty = false;
-    std::ofstream out(g_options.memcard_path, std::ios::binary | std::ios::trunc);
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (out) out.write(reinterpret_cast<const char *>(c.data.data()), static_cast<std::streamsize>(c.data.size()));
     if (!out) {
-        std::fprintf(stderr, "[mc] cannot write %s\n", g_options.memcard_path.c_str());
-        return;
+        std::fprintf(stderr, "[mc] cannot write %s\n", path.c_str());
+        return false;
     }
-    out.close();
-    if (g_options.on_memcard_saved) g_options.on_memcard_saved();
+    return true;
+}
+
+}
+
+void flush_cards() {
+    const bool saved = flush_card(g_card, g_options.memcard_path);
+    flush_card(g_card2, g_options.memcard2_path);
+    if (saved && g_options.on_memcard_saved) g_options.on_memcard_saved();
 }
 
 std::uint32_t read(std::uint32_t a) {
@@ -442,6 +455,10 @@ void state(ps2::state::Stream &s) {
     s.pod(g_dma);
     s.size(g_card.address);
     s.pod(g_card.term);
+    if (s.version() >= 7) {
+        s.size(g_card2.address);
+        s.pod(g_card2.term);
+    }
 }
 
 }

@@ -27,7 +27,7 @@
     </queries>
 
     <application
-        android:label="GT4 VR"
+        android:label="${appLabel}"
         android:icon="@mipmap/ic_launcher"
         android:allowBackup="false"
         android:hasCode="false"
@@ -43,7 +43,7 @@
 
         <activity
             android:name="android.app.NativeActivity"
-            android:label="GT4 VR"
+            android:label="${appLabel}"
             android:launchMode="singleTask"
             android:screenOrientation="landscape"
             android:resizeableActivity="false"

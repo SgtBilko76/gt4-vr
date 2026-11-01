@@ -56,6 +56,8 @@ struct Options {
     std::function<void()> on_vblank;
     std::function<void(const std::string &name, const std::uint8_t *code, std::size_t size)> on_vu_program;
     std::string memcard_path;
+    // Optional card in slot 2 (e.g. for the network configuration when slot 1 is full).
+    std::string memcard2_path;
     std::function<void()> on_memcard_saved;
     std::string save_state_path;
     std::uint64_t save_state_frame = 0;

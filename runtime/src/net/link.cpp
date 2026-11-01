@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "link.hpp"
 
+#include "dhcp.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -233,9 +235,19 @@ void start() {
 #endif
 }
 
+void inject(std::vector<std::uint8_t> frame) {
+    std::lock_guard lock(g_rx_mutex);
+    if (g_rx.size() < kRxQueueMax) g_rx.push_back(std::move(frame));
+}
+
 void send(const std::uint8_t *frame, std::size_t size) {
 #ifndef __EMSCRIPTEN__
     if (size < 14) return;
+    // DHCP is answered here, by the adapter itself (dhcp.hpp): the relay has no router behind it.
+    if (std::vector<std::uint8_t> reply; dhcp::handle(frame, size, config().mac, reply)) {
+        inject(std::move(reply));
+        return;
+    }
     std::string out;
     Mac dest;
     std::memcpy(dest.data(), frame, 6);

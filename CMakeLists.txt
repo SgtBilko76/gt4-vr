@@ -55,6 +55,7 @@ add_library(ps2runtime STATIC
     runtime/src/iop/sio2.cpp
     runtime/src/iop/dev9.cpp
     runtime/src/net/link.cpp
+    runtime/src/net/dhcp.cpp
     runtime/src/iop/io.cpp
     runtime/src/iop/cdvd.cpp
     runtime/src/iop/sif.cpp
@@ -126,6 +127,16 @@ if(PS2_GENERATED)
         target_link_libraries(gt4vr PRIVATE ps2game ps2runtime native_app_glue
             "${PS2_OPENXR_DIR}/lib/${ANDROID_ABI}/libopenxr_loader.so" EGL GLESv3 aaudio android log dl)
         target_link_options(gt4vr PRIVATE "-uANativeActivity_onCreate")
+        # Game variant (quest/tools/build_quest.sh GAME=gt4 | gt4r): data folder on the headset, the
+        # product code the ad hoc server groups players by, and the A-Spec II race camera hooks.
+        set(GT4VR_DATA_DIR "/sdcard/GT4VR" CACHE STRING "Data folder on the headset")
+        set(GT4VR_OLD_DATA_DIR "/sdcard/GT4" CACHE STRING "Fallback folder for disc.iso / memcard.ps2")
+        set(GT4VR_TITLE "Gran Turismo 4 VR" CACHE STRING "Name in the log")
+        set(GT4VR_NET_PRODUCT "SCUS97436" CACHE STRING "Ad hoc server product code")
+        option(GT4VR_CAMERA_HOOKS "A-Spec II race camera hooks (VR view)" ON)
+        target_compile_definitions(gt4vr PRIVATE GT4VR_DATA_DIR="${GT4VR_DATA_DIR}"
+            GT4VR_OLD_DATA_DIR="${GT4VR_OLD_DATA_DIR}" GT4VR_TITLE="${GT4VR_TITLE}"
+            GT4VR_NET_PRODUCT="${GT4VR_NET_PRODUCT}" GT4VR_CAMERA_HOOKS=$<BOOL:${GT4VR_CAMERA_HOOKS}>)
         return()
     endif()
 
