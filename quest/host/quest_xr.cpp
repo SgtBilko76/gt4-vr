@@ -153,8 +153,10 @@ constexpr float kHudHalfWidth = 0.45f; // Wipeout Pure VR: 1.8 m wide at 2 m
 // Owner 2026-10-30: the curved screen a bit closer and 110 degrees wide (was Wipeout-Rewrite-VR's
 // 3.2 m at 2.5 m, 65 degrees). Live: debug.gt4vr.dist (m), debug.gt4vr.screenfov (deg);
 // debug.gt4vr.screenw (m) still overrides the width.
-constexpr float kScreenDistanceM = 2.0f; // HD 3D curved screen: a bit closer than Wipeout Rewrite VR's 2.5 m
-constexpr float kScreenFovDeg = 110.0f;
+// Owner 2026-11-01: 5.71 m at 2.0 m (110 deg) put the HUD outside the Quest's ~104 deg view; moved
+// back to 3.0 m at the same width (~87 deg), "looks good".
+constexpr float kScreenDistanceM = 3.0f;
+constexpr float kScreenWidthM = 5.71f;
 // Screen height off the head / eye level, in metres; negative = the screen sits below the eyes
 // (owner: the screen was much too high -> correct the vertical height, put it below eye level).
 // Live tuning:
@@ -806,10 +808,14 @@ private:
             gt4::quest::setCurvedView(true);
         const bool curved = ReadFloatProperty("debug.gt4vr.curved", 0.0f) != 0.0f || gt4::quest::curvedView();
         const float dist = std::max(0.3f, ReadFloatProperty("debug.gt4vr.dist", kScreenDistanceM));
-        const float screen_fov = std::clamp(ReadFloatProperty("debug.gt4vr.screenfov", kScreenFovDeg), 20.0f, 170.0f);
-        // Chord width for the given angle; the curved layer below turns it back into exactly that angle.
-        const float width = std::max(0.2f, ReadFloatProperty("debug.gt4vr.screenw",
-                                                              2.0f * dist * std::tan(screen_fov * 0.5f * 0.0174533f)));
+        // Width: the fixed kScreenWidthM, so moving the screen away keeps its size (owner: farther =
+        // the whole HUD in view). debug.gt4vr.screenfov (deg) sizes it by angle instead (chord width;
+        // the curved layer turns it back into exactly that angle); debug.gt4vr.screenw overrides both.
+        const float screen_fov = ReadFloatProperty("debug.gt4vr.screenfov", 0.0f);
+        const float sized = screen_fov > 0.0f
+                                ? 2.0f * dist * std::tan(std::clamp(screen_fov, 20.0f, 170.0f) * 0.5f * 0.0174533f)
+                                : kScreenWidthM;
+        const float width = std::max(0.2f, ReadFloatProperty("debug.gt4vr.screenw", sized));
         const float screen_vertical_m = std::clamp(ReadFloatProperty("debug.gt4vr.screenu", kScreenVerticalOffsetM), -1.0f, 1.0f);
         if (screen_vertical_m != m_screen_vertical_offset_m)
         {
