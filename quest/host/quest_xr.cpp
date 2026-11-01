@@ -68,8 +68,8 @@ constexpr float kScreenAspect = 16.0f / 9.0f;
 // of the 3D view, Wipeout Rewrite VR's: 3.2 m wide, 2.5 m ahead, fixed in the room.
 constexpr int32_t kHudWidthPx = 1920;
 constexpr int32_t kHudRowsPx = 1080;
-constexpr float kHudDistanceM = 2.5f;
-constexpr float kHudWorldWidthM = 3.2f;
+constexpr float kHudDistanceM = 2.0f; // Wipeout Pure VR: PURE_VR_HUD_DISTANCE=2.0 (Wipeout-Rewrite-VR had 2.5)
+constexpr float kHudWorldWidthM = 1.8f; // Wipeout Pure VR: PURE_VR_HUD_WIDTH=1.8 (Wipeout-Rewrite-VR had 3.2)
 
 // Depth stereo strength (ARMSX2-3D defaults). separation = horizontal shift in source UV at
 // depth 1; convergence = the depth that lands on the screen plane. Live tuning:
@@ -143,7 +143,7 @@ constexpr float kFovMargin = 1.08f;
 // Immersive race field of view (degrees, square), Wipeout Pure VR's race camera: 110. Live:
 // adb shell setprop debug.gt4vr.fov 90   (0 = the headset's whole view)
 // Owner choice 2026-10-30: 90 (sharper; no black border visible in the headset).
-constexpr float kImmersiveFovDeg = 90.0f;
+constexpr float kImmersiveFovDeg = 110.0f; // Owner choice 2026-10-30: 110 (Wipeout Rewrite VR: 65)
 constexpr float kHudHalfWidth = 0.45f; // Wipeout Pure VR: 1.8 m wide at 2 m
 
 // ~77 degrees wide at 1.5 m, like ARMSX2-3D. Live tuning:
@@ -153,9 +153,15 @@ constexpr float kHudHalfWidth = 0.45f; // Wipeout Pure VR: 1.8 m wide at 2 m
 // Owner 2026-10-30: the curved screen a bit closer and 110 degrees wide (was Wipeout-Rewrite-VR's
 // 3.2 m at 2.5 m, 65 degrees). Live: debug.gt4vr.dist (m), debug.gt4vr.screenfov (deg);
 // debug.gt4vr.screenw (m) still overrides the width.
-constexpr float kScreenDistanceM = 2.0f;
+constexpr float kScreenDistanceM = 2.0f; // HD 3D curved screen: a bit closer than Wipeout Rewrite VR's 2.5 m
 constexpr float kScreenFovDeg = 110.0f;
-// VR mode re-enabled (owner: the VR mode and the curved screen should be switchable): both stick
+// Screen height off the head / eye level, in metres; negative = the screen sits below the eyes
+// (owner: the screen was much too high -> correct the vertical height, put it below eye level).
+// Live tuning:
+//   adb shell setprop debug.gt4vr.screenu -0.8    (metres, negative = lower than the eyes)
+constexpr float kScreenVerticalOffsetM = 0.0f;
+// VR mode deactivated (owner: the VR mode and the curved screen should be switchable); after the
+// unsharp picture gave no progress we concentrate on the curved screen, which is sharp. Both stick
 // clicks toggle the race view, debug.gt4vr.vr 1 / 0 selects VR / curved headless. It had been off
 // for now (owner 2026-10-30, "Den VR Modus lassen wir erstmal weg"); the curved screen stays the
 // default until the owner toggles back.
@@ -804,6 +810,12 @@ private:
         // Chord width for the given angle; the curved layer below turns it back into exactly that angle.
         const float width = std::max(0.2f, ReadFloatProperty("debug.gt4vr.screenw",
                                                               2.0f * dist * std::tan(screen_fov * 0.5f * 0.0174533f)));
+        const float screen_vertical_m = std::clamp(ReadFloatProperty("debug.gt4vr.screenu", kScreenVerticalOffsetM), -1.0f, 1.0f);
+        if (screen_vertical_m != m_screen_vertical_offset_m)
+        {
+            m_screen_vertical_offset_m = screen_vertical_m;
+            m_screen_placed = false; // re-place on the next frame
+        }
         if (curved != m_curved || width != m_screen_width_m || dist != m_screen_distance_m)
         {
             m_curved = curved;
@@ -1380,13 +1392,14 @@ private:
         const float yaw = std::atan2(-fx, -fz);
         const XrVector3f &head = location.pose.position;
         const XrQuaternionf yaw_orientation{0.0f, std::sin(yaw * 0.5f), 0.0f, std::cos(yaw * 0.5f)};
+        const float screen_y = head.y + m_screen_vertical_offset_m;
         m_screen_pose.orientation = yaw_orientation;
-        m_screen_pose.position = head;
+        m_screen_pose.position = {head.x, screen_y, head.z};
         m_flat_screen_pose.orientation = yaw_orientation;
-        m_flat_screen_pose.position = {head.x - std::sin(yaw) * m_screen_distance_m, head.y,
+        m_flat_screen_pose.position = {head.x - std::sin(yaw) * m_screen_distance_m, screen_y,
                                        head.z - std::cos(yaw) * m_screen_distance_m};
         m_hud_pose.orientation = yaw_orientation;
-        m_hud_pose.position = {head.x - std::sin(yaw) * kHudDistanceM, head.y, head.z - std::cos(yaw) * kHudDistanceM};
+        m_hud_pose.position = {head.x - std::sin(yaw) * kHudDistanceM, screen_y, head.z - std::cos(yaw) * kHudDistanceM};
         m_screen_placed = true;
     }
 
@@ -1594,6 +1607,7 @@ private:
     XrPosef m_hud_pose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -kHudDistanceM}};
     float m_screen_width_m = 2.0f * kScreenDistanceM * 1.4281f; // tan(55 deg): 110 degrees
     float m_screen_distance_m = kScreenDistanceM;
+    float m_screen_vertical_offset_m = kScreenVerticalOffsetM;
     int m_tuning_countdown = 0;
 
     float m_haptic_amplitude[2] = {0.0f, 0.0f};

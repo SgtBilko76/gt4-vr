@@ -275,6 +275,20 @@ void audio_error(AAudioStream *, void *, aaudio_result_t error) {
     g_audio_reopen = true;
 }
 
+// How much sound the game may queue ahead before it waits, in ms. Under heavy load the race drops
+// below 60 fps for a few seconds and makes less sound than plays; the queue covers that dip, and the
+// game refills it once the load passes. 80 ms ran dry in short dips (crackling, owner 2026-11-01);
+// 200 ms covers ~10 s at 58 fps. config.txt RRV_AUDIO_BUFFER_MS=40..450 overrides.
+std::size_t audio_target_frames() {
+    static const std::size_t frames = [] {
+        long ms = 200;
+        if (const char *v = std::getenv("RRV_AUDIO_BUFFER_MS")) ms = std::clamp(std::atol(v), 40L, 450L);
+        logf("[quest] audio buffer %ld ms", ms);
+        return static_cast<std::size_t>(48 * ms);
+    }();
+    return frames;
+}
+
 void pace() {
     static auto last = std::chrono::steady_clock::now();
     static std::size_t last_read = 0;
@@ -289,8 +303,9 @@ void pace() {
         stalled = read == last_read ? stalled + 1 : 0;
         last_read = read;
         if (stalled < 30) {
-            for (int guard = 0; ring_queued() > 48 * 80 && guard < 40; ++guard) usleep(1000);
-            if (ring_queued() <= 48 * 80) {
+            const std::size_t target = audio_target_frames();
+            for (int guard = 0; ring_queued() > target && guard < 40; ++guard) usleep(1000);
+            if (ring_queued() <= target) {
                 last = std::chrono::steady_clock::now();
                 return;
             }
@@ -427,14 +442,24 @@ bool start_game(const fs::path &files) {
     // Sharpness (owner 2026-10-30: "das Bild ist total unscharf"): AMD CAS on the presented frame
     // and 8x anisotropic texture filtering (far road and walls). config.txt overrides
     // (RRV_PCSX2_GS_CAS=0 / RRV_PCSX2_GS_ANISO=0 = off).
-    setenv("RRV_PCSX2_GS_CAS", "60", 0);
+    // Owner 2026-11-01 at 3x3 after the eye-sized CAS fix: 60 too soft, 70/80 too sharp -> 50.
+    setenv("RRV_PCSX2_GS_CAS", "50", 0);
     setenv("RRV_PCSX2_GS_ANISO", "8", 0);
     // Anti-aliasing (owner 2026-10-30: "3 times PS2 resolution and antialiasing, that works good at
     // Wipeout"): PCSX2's hardware renderer has no MSAA, FXAA on the presented frame is its edge
     // smoothing. RRV_PCSX2_GS_FXAA=0 in config.txt turns it off.
     // Measured 2026-10-30 (VR, 72 Hz): FXAA cost ~25 of 600 fields skipped for little visible gain;
     // owner chose it off. RRV_PCSX2_GS_FXAA=1 turns it back on.
-    setenv("RRV_PCSX2_GS_FXAA", "0", 0);
+    // Owner now: picture unsharp again -> turn anti-aliasing back on to optimise the sharpness.
+    setenv("RRV_PCSX2_GS_FXAA", "1", 0);
+    // Flicker with a light source in view (owner 2026-11-01 video): the bridge's field skipping
+    // dropped whole fields when the GS fell behind, GT4's brightness / glare post-processing passes
+    // included, so the picture pulsed 3-4 times a second. Off, the flicker is gone (owner tested);
+    // the eye-sized CAS keeps the race at 60 fps without it. RRV_PCSX2_GS_FRAMESKIP=1 = old.
+    setenv("RRV_PCSX2_GS_FRAMESKIP", "0", 0);
+    // Hardware download Unsynchronized (ARMSX2 Quest's choice; owner 2026-11-01) instead of the
+    // bridge profile's Disabled. RRV_PCSX2_GS_HWDOWNLOAD=4 = Disabled.
+    setenv("RRV_PCSX2_GS_HWDOWNLOAD", "3", 0);
     fs::create_directories(files / "pcsx2-data");
 
     ps2::g_options.disc_path = disc;
