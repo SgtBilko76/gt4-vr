@@ -50,6 +50,11 @@ namespace {
 
 constexpr std::uint32_t kRaceSpecPtr = 0x00622F4Cu;
 constexpr std::uint32_t kConductorVptr = 0x10140u;
+// LAN settings object (Options > LAN Settings), a heap object at a fixed place in this build
+// (same address in every PC state, boot to race): vptr 0x687CD0 at +0, console name at +4
+// (64 bytes), Host at +0x98 (1 = Yes), No. of Players at +0xA0. Found by diffing a host state
+// (Host Yes, 2 players) against a client and a default one.
+constexpr std::uint32_t kLanSettings = 0x00A46C04u, kLanSettingsVtable = 0x00687CD0u;
 
 std::uint32_t rd32(std::uint32_t a) {
     a &= ps2::kRamSize - 1;
@@ -112,6 +117,22 @@ std::string mode_of(std::uint32_t conductor, const std::string &race_label) {
 
 int g_force_car = -1;
 
+// The last race setup seen (course + player's car): a LAN race fills RaceSpec on the grid and
+// clears it when the race starts, so the room listing keeps the track from the grid.
+std::mutex g_seen_mutex;
+std::string g_seen_course, g_seen_car;
+
+void remember(const std::string &course, const std::string &car) {
+    if (course.empty()) return;
+    std::lock_guard<std::mutex> lock(g_seen_mutex);
+    g_seen_course = course;
+    if (!car.empty()) g_seen_car = car;
+}
+
+// Steady-clock second of the last line crossing of ANY car (race running, also in LAN races where
+// the player's car index isn't known).
+std::atomic<long long> g_race_activity{-1000};
+
 Race read_race(std::uint32_t conductor) {
     Race r;
     const std::uint32_t spec = rd32(kRaceSpecPtr);
@@ -132,7 +153,12 @@ Race read_race(std::uint32_t conductor) {
     if (r.player.empty())
         if (const char *p = std::getenv("PS2_PLAYER_NAME")) r.player = p;
     r.mode = mode_of(conductor, r.race_label);
+    remember(r.course_label, r.car_label);
     return r;
+}
+
+long long now_s() {
+    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 // ------------------------------------------------------------------ JSON and sending
@@ -241,9 +267,6 @@ std::uint32_t g_last_lap = 0, g_last_ms = 0;
 std::set<std::string> g_reported;
 // Last status report (steady-clock seconds; EE thread and heartbeat thread).
 std::atomic<long long> g_last_status{-1000};
-long long now_s() {
-    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-}
 
 std::string new_race_id() {
     return g_device + "-" + std::to_string(static_cast<long long>(std::time(nullptr))) + "-" + std::to_string(++g_race_no);
@@ -275,6 +298,24 @@ void send_status(const Race &r, int lap, bool force) {
     enqueue(body + "}", false);
 }
 
+struct LanSettings {
+    bool valid = false, host = false;
+    int players = 0;
+    std::string console;
+};
+
+LanSettings lan_settings() {
+    LanSettings s;
+    if (rd32(kLanSettings) != kLanSettingsVtable) return s;
+    const std::uint32_t players = rd32(kLanSettings + 0xA0), host = rd32(kLanSettings + 0x98);
+    if (players < 1 || players > 6 || host > 1) return s;
+    s.valid = true;
+    s.host = host == 1;
+    s.players = static_cast<int>(players);
+    s.console = rdstr(kLanSettings + 4, 64);
+    return s;
+}
+
 // While in a room: "lobby" status every 10 s unless a race status went out in that time, so the
 // server keeps the room listed (it drops statuses after 30 s).
 void heartbeat() {
@@ -286,9 +327,18 @@ void heartbeat() {
         g_last_status = now_s();
         std::string player, track, car;
         current(player, track, car);
-        std::string body = "{\"v\":1,\"type\":\"status\",\"state\":\"lobby\",\"device\":" + json_str(g_device) +
-                           ",\"player\":" + json_str(player.empty() ? g_device : player) + fields + "}";
-        enqueue(body, false);
+        // A line crossing in the last 20 s = a race is running (LAN races included).
+        const bool racing = now_s() - g_race_activity.load() < 20;
+        std::string body = std::string("{\"v\":1,\"type\":\"status\",\"state\":") + (racing ? "\"race\"" : "\"lobby\"") +
+                           ",\"device\":" + json_str(g_device) + ",\"player\":" + json_str(player.empty() ? g_device : player) +
+                           fields;
+        {
+            std::lock_guard<std::mutex> lock(g_seen_mutex);
+            if (!g_seen_course.empty()) body += ",\"track\":" + json_str(course_name(g_seen_course));
+        }
+        if (const LanSettings lan = lan_settings(); lan.valid && room().host)
+            body += ",\"max_players\":" + std::to_string(lan.players);
+        enqueue(body + "}", false);
     }
 }
 
@@ -396,15 +446,17 @@ void current(std::string &player, std::string &track, std::string &car) {
     player = rdstr(spec + 0x350, 32);
     const std::string course = rdstr(spec + 0x04, 64);
     if (!course.empty()) track = course_name(course);
+    std::string label;
     const std::uint32_t n = rd32(spec + 0xC4);
     for (std::uint32_t i = 0; i < n && i < 32; ++i) {
         const std::uint32_t e = spec + 0xC8 + i * 0x68;
         if (rd32(e + 0x04) == 1) {
-            const std::string label = rdstr(e + 0x18, 64);
+            label = rdstr(e + 0x18, 64);
             if (!label.empty()) car = car_name(label);
             break;
         }
     }
+    remember(course, label);
     if (player.empty())
         if (const char *p = std::getenv("PS2_PLAYER_NAME")) player = p;
 }
@@ -457,6 +509,7 @@ void install() {
     for (const Probe &p : kProbes) {
         ps2::set_probe_hook(p.pc, [&p](ps2::Cpu &c) {
             if (g_log) log_hit(p.name, c);
+            g_race_activity = now_s();
             switch (p.kind) {
             case Kind::Start: on_start(c); break;
             case Kind::Checkpoint: on_checkpoint(c); break;

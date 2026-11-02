@@ -361,9 +361,9 @@ struct RaceRow {
 std::vector<RaceRow> race_rows(const Data &d, const gt4::results::Room &cur) {
     std::vector<RaceRow> rows;
     if (cur.id.empty())
-        rows.push_back({{"+  Create a race", "", "", "", ""}, "", false});
+        rows.push_back({{"+  Create a race", "", "", "", "", ""}, "", false});
     else
-        rows.push_back({{std::string("x  Leave race ") + cur.id, "", "", "", ""}, "", true});
+        rows.push_back({{std::string("x  Leave race ") + cur.id, "", "", "", "", ""}, "", true});
     if (d.rooms.type == json::Value::Array)
         for (const json::Value &v : d.rooms.arr) {
             const std::string id = str(v.get("room"));
@@ -372,9 +372,13 @@ std::vector<RaceRow> race_rows(const Data &d, const gt4::results::Room &cur) {
             std::string players;
             if (const json::Value *p = v.get("players"); p && p->type == json::Value::Array)
                 for (const json::Value &name : p->arr) players += (players.empty() ? "" : ", ") + str(&name);
-            const std::string state = str(v.get("state")) == "racing" ? "racing" : "waiting";
-            rows.push_back({{str(v.get("host")), id, std::to_string(n) + (n == 1 ? " player" : " players"), players, state},
-                            id, id == cur.id});
+            const long long max = num(v.get("max_players"));
+            std::string state = str(v.get("state")) == "racing" ? "racing" : "waiting";
+            if (state == "waiting" && max > 0 && n >= max) state = "full";
+            std::string track = str(v.get("track"));
+            if (track.empty()) track = "-";
+            const std::string count = max > 0 ? std::to_string(n) + " / " + std::to_string(max) : std::to_string(n);
+            rows.push_back({{str(v.get("host")), id, track, count, players, state}, id, id == cur.id});
         }
     return rows;
 }
@@ -424,15 +428,17 @@ void draw(std::vector<std::uint8_t> &px, const Data &d, const Context &ctx) {
             cv.text("You are in the open lobby: Multi-LAN Race finds everyone who is not in a race.", 40, 192, 22, kDim, kWidth - 80);
             cv.text("Create a race, or pick one below and press A to join it.", 40, 218, 22, kDim, kWidth - 80);
         } else if (cur.host) {
-            cv.text("Your race " + cur.id + " is open. In GT4: Options > LAN Settings > Host: Yes,", 40, 192, 22, kGold, kWidth - 80);
-            cv.text("then Arcade > Multi-LAN Race > Connect, and start when the others are there.", 40, 218, 22, kGold, kWidth - 80);
+            cv.text("Your race " + cur.id + " is open. In GT4: Options > LAN Settings > Host: Yes, No. of Players = seats,", 40,
+                    192, 22, kGold, kWidth - 80);
+            cv.text("then Arcade > Multi-LAN Race > Connect. The race starts when all seats are taken.", 40, 218, 22, kGold,
+                    kWidth - 80);
         } else {
             cv.text("You joined race " + cur.id + ". In GT4: Options > LAN Settings > Host: No,", 40, 192, 22, kGold, kWidth - 80);
             cv.text("then Arcade > Multi-LAN Race > Connect and wait for the host to start.", 40, 218, 22, kGold, kWidth - 80);
         }
         constexpr int kRacesTop = kTableTop + 34;
-        table(cv, {{"Host", 50, 220, 0}, {"Race", 280, 140, 0}, {"Players", 430, 150, 0}, {"Who", 590, 470, 0},
-                   {"Status", 1070, 170, 1}},
+        table(cv, {{"Host", 50, 180, 0}, {"Race", 240, 130, 0}, {"Track", 380, 330, 0}, {"Players", 720, 110, 0},
+                   {"Who", 840, 260, 0}, {"Status", 1110, 130, 1}},
               rows, mine, g_scroll[kRaces], "", g_sel, kRacesTop);
         if (rr.size() == 1)
             cv.text("No open races right now", 40, kRacesTop + kRowH + 60, 28, kDim, kWidth - 80, 2);
