@@ -37,6 +37,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -486,6 +487,27 @@ bool start_game(const fs::path &files) {
     // Network play (runtime/src/net/link.hpp): config.txt PS2_NET_SERVER=host turns the PS2 network
     // adapter on; players of the same product code and group meet on that ad hoc relay server.
     setenv("PS2_NET_PRODUCT", GT4VR_NET_PRODUCT, 0);
+    // Every headset reports "localhost" as its host name, so the link's defaults (nickname = host
+    // name, MAC = hash of it) would give two headsets the same MAC and they would never see each
+    // other. Each install draws a random 24-bit id once (net-id.txt) instead: nickname Quest-<id>
+    // and MAC 00:04:1f:<id>. config.txt PS2_NET_NAME / PS2_NET_MAC still override both.
+    {
+        const std::string id_path = kDataDir + "/net-id.txt";
+        std::string id;
+        std::ifstream(id_path) >> id;
+        if (id.size() != 6 || id.find_first_not_of("0123456789abcdef") != std::string::npos) {
+            std::random_device rd;
+            char buf[8];
+            std::snprintf(buf, sizeof buf, "%06x", static_cast<unsigned>(rd()) & 0xFFFFFFu);
+            id = buf;
+            std::ofstream(id_path) << id << "\n";
+        }
+        const std::string name = "Quest-" + id;
+        const std::string mac = "00:04:1f:" + id.substr(0, 2) + ":" + id.substr(2, 2) + ":" + id.substr(4, 2);
+        setenv("PS2_NET_NAME", name.c_str(), 0);
+        setenv("PS2_NET_MAC", mac.c_str(), 0);
+        logf("[quest] network id %s (%s, MAC %s)", id.c_str(), getenv("PS2_NET_NAME"), getenv("PS2_NET_MAC"));
+    }
     ps2::g_options.rate_forced = true;
     ps2::g_options.widescreen = config_string("widescreen", "1") == "1";
     ps2::g_options.on_vblank = [] {
