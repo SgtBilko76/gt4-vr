@@ -208,6 +208,57 @@ bool extract_assets(AAssetManager *assets, const fs::path &files) {
     return true;
 }
 
+// HD texture packs (owner 2026-11-02, private build): assets/textures/ holds PCSX2 replacement packs as
+// <serial>/replacements/...; textures-manifest.txt lists the files, textures-stamp.txt changes with them.
+// They are copied to files/textures once (several GB, streamed in 1 MB chunks) and again only when the
+// stamp changes, so an app update without new textures doesn't copy anything.
+bool extract_textures(AAssetManager *assets, const fs::path &files) {
+    const std::string stamp = read_asset(assets, "textures-stamp.txt");
+    if (stamp.empty()) return false;
+    std::error_code ec;
+    const fs::path dir = files / "textures";
+    {
+        std::ifstream have(files / "textures-stamp.txt");
+        std::string old;
+        std::getline(have, old);
+        if (old == stamp && fs::exists(dir, ec)) return true;
+    }
+    fs::remove(files / "textures-stamp.txt", ec);
+    fs::remove_all(dir, ec);
+    const auto start = std::chrono::steady_clock::now();
+    std::istringstream manifest(read_asset(assets, "textures-manifest.txt"));
+    std::vector<char> buf(1 << 20);
+    std::size_t count = 0, failed = 0;
+    unsigned long long bytes = 0;
+    for (std::string rel; std::getline(manifest, rel);) {
+        if (rel.empty()) continue;
+        AAsset *a = AAssetManager_open(assets, ("textures/" + rel).c_str(), AASSET_MODE_STREAMING);
+        if (!a) {
+            ++failed;
+            continue;
+        }
+        const fs::path out = dir / rel;
+        fs::create_directories(out.parent_path(), ec);
+        std::ofstream o(out, std::ios::binary);
+        for (int n; (n = AAsset_read(a, buf.data(), buf.size())) > 0;) {
+            o.write(buf.data(), n);
+            bytes += static_cast<unsigned>(n);
+        }
+        AAsset_close(a);
+        if (!o) ++failed;
+        if (++count % 5000 == 0) logf("[quest] textures: %zu files copied ...", count);
+    }
+    if (failed) {
+        logf("[quest] textures: %zu files failed (disk full?), will retry next start", failed);
+        return false;
+    }
+    std::ofstream(files / "textures-stamp.txt") << stamp << "\n";
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    logf("[quest] textures: %zu files, %.0f MB copied in %.0f s (stamp %s)", count, bytes / 1048576.0, secs,
+         stamp.c_str());
+    return true;
+}
+
 // ---------------------------------------------------------------- audio (AAudio ring)
 
 constexpr std::size_t kRingFrames = 48000;  // 1 s of stereo s16
@@ -642,7 +693,14 @@ void android_main(android_app *app) {
     // The game starts on its own thread: start_game waits for the XR surface, which needs the
     // session to become READY, which needs this thread's looper to answer the activity's
     // lifecycle (native_app_glue blocks onResume until APP_CMD_RESUME is processed here).
-    std::thread([files] {
+    AAssetManager *assets = app->activity->assetManager;
+    std::thread([files, assets] {
+        // A-Spec II: the HD texture packs from the APK, on this thread: the first copy takes minutes and
+        // must not block the looper (config.txt RRV_PCSX2_GS_TEXTURE_DIR=off turns them off).
+        if (std::strcmp(GT4VR_NET_PRODUCT, "SCUS97436") == 0 && extract_textures(assets, files)) {
+            setenv("RRV_PCSX2_GS_TEXTURE_DIR", (files / "textures").c_str(), 0);
+            setenv("RRV_PCSX2_GS_TEXTURE_SERIAL", "SCUS-97436", 0);
+        }
         if (!start_game(files)) logf("[quest] game not started: copy core.elf and disc.iso to %s", kDataDir.c_str());
         else perf_loop();
     }).detach();

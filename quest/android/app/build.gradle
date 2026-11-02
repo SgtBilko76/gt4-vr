@@ -12,7 +12,7 @@ android {
     defaultConfig {
         // quest/tools/build_quest.sh GAME=gt4r: the retail LAN build installs next to A-Spec II.
         applicationId project.findProperty('gtAppId') ?: 'online.portroyale.gt4vr'
-        manifestPlaceholders = [appLabel: project.findProperty('gtAppLabel') ?: 'GT4 VR']
+        manifestPlaceholders = [appLabel: project.findProperty('gtAppLabel') ?: 'GT4 Spec II HD 3D']
         minSdk 29
         targetSdk 32
         // Private A-Spec II release 0.1.0-beta (owner 2026-11-02): no public download.
@@ -26,6 +26,11 @@ android {
             jniLibs.srcDirs = [rootProject.file("build/stage/jniLibs")]
             assets.srcDirs = [rootProject.file("build/stage/assets")]
         }
+    }
+
+    // PNG/DDS are already compressed: stored as-is. The ASTC .ktx packs deflate well (flat blocks).
+    androidResources {
+        noCompress 'png', 'dds'
     }
 
     buildTypes {

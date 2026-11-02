@@ -16,7 +16,7 @@ NDK=${ANDROID_NDK:-$HOME/workspace/android-ndk-r30}
 SDK_CMAKE=$(ls -d "$HOME"/workspace/android-sdk/cmake/*/bin | tail -1)
 GAME=${GAME:-gt4}
 case "$GAME" in
-  gt4)  variant=(-DGT4VR_ONLINE=OFF); APP_ID=online.portroyale.gt4vr; APP_LABEL="GT4 VR" ;;
+  gt4)  variant=(-DGT4VR_ONLINE=OFF); APP_ID=online.portroyale.gt4vr; APP_LABEL="GT4 Spec II HD 3D" ;;
   gt4r) variant=(-DGT4VR_DATA_DIR=/sdcard/GT4Online -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="GT4 Online"
                  -DGT4VR_NET_PRODUCT=SCUS97328 -DGT4VR_CAMERA_HOOKS=OFF -DGT4VR_ONLINE=ON)
         APP_ID=online.portroyale.gt4online; APP_LABEL="GT4 Online" ;;
@@ -57,6 +57,28 @@ fi
 if [ -f "$ROOT/quest/assets/shader-cache/vulkan_shaders.idx" ]; then
   mkdir -p "$STAGE/assets/gt4vr/shader-cache"
   cp "$ROOT"/quest/assets/shader-cache/vulkan_* "$STAGE/assets/gt4vr/shader-cache/"
+fi
+# HD texture packs (A-Spec II only, private build): TEXTURES=<dir> with <serial>/replacements/... (default
+# quest/assets/textures, symlinks allowed), staged as assets/textures + its own manifest/stamp; stamp =
+# file names + sizes, so the headset copies them again only when the packs change. TEXTURES=none skips.
+TEXTURES=${TEXTURES:-$ROOT/quest/assets/textures}
+if [ "$GAME" = gt4 ] && [ "$TEXTURES" != none ] && [ -d "$TEXTURES" ]; then
+  mkdir -p "$STAGE/assets"
+  cp -rL "$TEXTURES" "$STAGE/assets/textures"
+  python3 - "$STAGE/assets" <<'EOF'
+import hashlib, pathlib, sys
+assets = pathlib.Path(sys.argv[1]); root = assets / "textures"
+files = sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file())
+digest = hashlib.sha256()
+total = 0
+for rel in files:
+    size = (root / rel).stat().st_size
+    total += size
+    digest.update(rel.encode() + b"\0" + str(size).encode() + b"\n")
+(assets / "textures-manifest.txt").write_text("\n".join(files) + "\n")
+(assets / "textures-stamp.txt").write_text(digest.hexdigest()[:16])
+print(f"textures: {len(files)} files, {total / 2**30:.2f} GB, stamp {digest.hexdigest()[:16]}")
+EOF
 fi
 python3 - "$STAGE/assets/gt4vr" <<'EOF'
 import hashlib, pathlib, sys
