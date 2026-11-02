@@ -112,6 +112,28 @@ void dump_frame() {
 }
 
 void apply_presses() {
+    // Live input for headless runs: PS2_PRESS_FILE=path. Every 10 frames the file is read if it exists
+    // (one "button[+button][:frames]" per line, held from the next frame on) and then deleted.
+    static const char *live = std::getenv("PS2_PRESS_FILE");
+    if (live && g_frames % 10 == 0) {
+        if (std::FILE *f = std::fopen(live, "r")) {
+            char line[128];
+            std::uint64_t at = g_frames + 1;
+            while (std::fgets(line, sizeof line, f)) {
+                std::string s(line);
+                while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) s.pop_back();
+                if (s.empty()) continue;
+                Press press;
+                if (parse_press(std::to_string(at) + ":" + s, press)) {
+                    g_options.presses.push_back(press);
+                    at += press.frames + 6;  // the next line after this one is released
+                    std::fprintf(stderr, "[input] %s at frame %llu\n", s.c_str(), static_cast<unsigned long long>(press.frame));
+                }
+            }
+            std::fclose(f);
+            std::remove(live);
+        }
+    }
     // Once the last press is over the pad is left alone, so the web page's live input works after a scripted start.
     std::uint64_t last = 0;
     for (const Press &p : g_options.presses) last = std::max<std::uint64_t>(last, p.frame + p.frames);

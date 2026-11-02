@@ -374,6 +374,7 @@ void on_lap(ps2::Cpu &c) {
     const std::uint32_t ms = c.r[8].w[0];
     const Race r = read_race(c.r[4].w[0]);
     if (car != r.player_car) return;
+    if (r.mode == "license") return;  // license tests: no leaderboard times (owner 2026-11-02)
     if (lap == g_last_lap && ms == g_last_ms) return;  // a mode's override and the base both ran
     g_last_lap = lap;
     g_last_ms = ms;
@@ -420,6 +421,7 @@ struct Probe {
 };
 
 // Function entries. Each race mode's override is listed too: an override may not call the base.
+// License tests are left out on purpose (owner 2026-11-02: no license times on the leaderboard).
 constexpr Probe kProbes[] = {
     {0x00357B90u, "DynamicsConductor::ProcessLap0ControlLine", Kind::Start},
     {0x00347928u, "SinglePlayer::ProcessLap0ControlLine", Kind::Start},
@@ -427,12 +429,10 @@ constexpr Probe kProbes[] = {
     {0x00357B10u, "DynamicsConductor::ProcessCheckPoint", Kind::Checkpoint},
     {0x003F5028u, "FreePractice::ProcessCheckPoint", Kind::Checkpoint},
     {0x003F5780u, "FreeRun::ProcessCheckPoint", Kind::Checkpoint},
-    {0x003F63A0u, "License::ProcessCheckPoint", Kind::Checkpoint},
     {0x00357B98u, "DynamicsConductor::ProcessControlLine", Kind::Lap},
     {0x00347230u, "Battle2P::ProcessControlLine", Kind::Lap},
     {0x003F5150u, "FreePractice::ProcessControlLine", Kind::Lap},
     {0x003F5B80u, "FreeRun::ProcessControlLine", Kind::Lap},
-    {0x003F6588u, "License::ProcessControlLine", Kind::Lap},
     {0x003F6C28u, "MachineTest::ProcessControlLine", Kind::Lap},
 };
 
