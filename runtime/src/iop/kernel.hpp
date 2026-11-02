@@ -122,6 +122,13 @@ void install_sif();
 void install_cdvdfsv();
 void install_cdvd();
 void install_io();
+void install_io_stubs();
+// PS2_IOP_TRACE_LIBS=inet,netcnf: calls into those guest libraries are logged with their results.
+bool traced_library(const std::string &library);
+std::uint32_t g_libraries_table(const std::string &library);  // export table of a guest library, 0 if none
+std::uint32_t trace_import(const std::string &library, std::uint32_t index);
+// HLE id of a wrapper for an import from a guest library (tracing, inet receive retry), 0 = link directly.
+std::uint32_t wrap_import(const std::string &library, std::uint32_t index);
 
 void trace_hle(const char *library, const char *function, const Cpu &c);
 extern bool g_trace_hle;

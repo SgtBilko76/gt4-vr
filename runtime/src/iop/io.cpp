@@ -1,4 +1,5 @@
 #include "io.hpp"
+#include "dev9.hpp"
 #include "kernel.hpp"
 
 #include "ps2/disc.hpp"
@@ -7,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <map>
 
@@ -172,7 +174,11 @@ enum Op : std::uint32_t {
     kOpDopen, kOpDclose, kOpDread, kOpGetstat, kOpChstat, kOpRename, kOpChdir, kOpSync,
     kOpMount, kOpUmount, kOpLseek64, kOpDevctl,
 };
-enum Kind : std::uint32_t { kKeep, kNewFd, kDropFd, kTempFile };
+enum Kind : std::uint32_t { kKeep, kNewFd, kDropFd, kTempFile, kTraceCall, kInetRecv };
+constexpr std::int32_t kInetNoConnection = -508;  // sceINETE_CONNECTION_DOES_NOT_EXIST
+constexpr std::uint32_t kInetRecvRetries = 2000;   // 1 ms each
+
+std::vector<std::string> g_trace_names;
 
 std::uint32_t g_io_return = 0;
 
@@ -244,11 +250,30 @@ void io_return(Cpu &c) {
         std::fprintf(stderr, "[io] driver call returned with nothing pending\n");
         return;
     }
+    const std::int32_t result = static_cast<std::int32_t>(c.r[2]);
+    // libnetb's receive thread starts receiving before the EE has asked INET to open the socket. On
+    // a PS2 the open lands within microseconds; here the EE's next RPC can take far longer, and each
+    // failed receive puts an error entry into the EE's 36-slot ring: dozens of them lap it and the
+    // game never reads a packet again. Wait 1 ms and receive again instead, as a socket that is
+    // opened a moment later would have made it.
+    if (it->second.back().kind == kInetRecv && result == kInetNoConnection && it->second.back().retries < kInetRecvRetries) {
+        io::Pending &p = it->second.back();
+        if (p.retries++ == 0) std::fprintf(stderr, "[inet] receive before the socket was opened: waiting\n");
+        for (int i = 0; i < 4; ++i) c.r[4 + i] = p.args[i];
+        c.r[31] = g_io_return;
+        c.pc = p.target;
+        c.npc = p.target + 4;
+        block(c, kWaitDelay, 0);
+        schedule(now() + usec_to_cycles(1000), Job{kJobDelayWake, static_cast<std::uint32_t>(t->id)});
+        return;
+    }
     const io::Pending p = it->second.back();
     it->second.pop_back();
     if (it->second.empty()) io::g_pending.erase(it);
-    const std::int32_t result = static_cast<std::int32_t>(c.r[2]);
-    if (g_trace_hle) std::fprintf(stderr, "[io] driver call (kind %u, fd %d) -> %d\n", p.kind, p.fd, result);
+    if (p.kind == kTraceCall)
+        std::fprintf(stderr, "[iop-call] %s#%d -> %d (0x%X) thread %d\n",
+                     p.file < g_trace_names.size() ? g_trace_names[p.file].c_str() : "?", p.fd, result, c.r[2], t->id);
+    else if (g_trace_hle) std::fprintf(stderr, "[io] driver call (kind %u, fd %d) -> %d\n", p.kind, p.fd, result);
     switch (p.kind) {
     case kNewFd:
         if (result < 0) {
@@ -318,9 +343,53 @@ bool by_fd(Cpu &c, std::uint32_t op, Kind kind, std::uint32_t a1, std::uint32_t 
 
 }
 
+bool traced_library(const std::string &library) {
+    static const std::string list = [] { const char *v = std::getenv("PS2_IOP_TRACE_LIBS"); return v ? "," + std::string(v) + "," : std::string(); }();
+    return !list.empty() && list.find("," + library + ",") != std::string::npos;
+}
+
+std::uint32_t trace_import(const std::string &library, std::uint32_t index) {
+    return register_hle("trace:" + library, index, [library, index](Cpu &c) {
+        const std::uint32_t target = ram32(g_libraries_table(library) + 20 + index * 4);
+        Thread *t = current();
+        std::fprintf(stderr, "[iop-call] %s#%u(%08X, %08X, %08X, %08X) from 0x%08X thread %d\n", library.c_str(), index,
+                     c.r[4], c.r[5], c.r[6], c.r[7], c.r[31], t ? t->id : -1);
+        if (t && g_io_return) {
+            auto name = std::find(g_trace_names.begin(), g_trace_names.end(), library);
+            if (name == g_trace_names.end()) name = g_trace_names.insert(g_trace_names.end(), library);
+            io::g_pending[t->id].push_back(io::Pending{c.r[31], static_cast<std::uint32_t>(name - g_trace_names.begin()),
+                                                       static_cast<std::int32_t>(index), kTraceCall, 0});
+            c.r[31] = g_io_return;
+        }
+        c.pc = target;
+        c.npc = target + 4;
+    });
+}
+
+// sceInetRecvFrom (inet #12) gets the retry above whenever the network adapter is present.
+std::uint32_t wrap_import(const std::string &library, std::uint32_t index) {
+    if (traced_library(library)) return trace_import(library, index);
+    if (library != "inet" || index != 12 || !dev9::present()) return 0;
+    return register_hle("retry:inet", index, [](Cpu &c) {
+        const std::uint32_t target = ram32(g_libraries_table("inet") + 20 + 12 * 4);
+        Thread *t = current();
+        if (t && g_io_return) {
+            io::Pending p{c.r[31], 0, 12, kInetRecv, 0};
+            for (int i = 0; i < 4; ++i) p.args[i] = c.r[4 + i];
+            p.target = target;
+            io::g_pending[t->id].push_back(p);
+            c.r[31] = g_io_return;
+        }
+        c.pc = target;
+        c.npc = target + 4;
+    });
+}
+
+// Created after every other boot stub (kernel.cpp boot): states before version 7 keep their layout.
+void install_io_stubs() { g_io_return = hle_stub(io_return); }
+
 void install_io() {
     io::reset();
-    g_io_return = hle_stub(io_return);
     register_hle_library("ioman", 0x0104);
     def("ioman", 4, "open", [](Cpu &c) {
         if (by_name(c, kOpOpen, kNewFd, arg(c, 1), arg(c, 1), 0)) return;

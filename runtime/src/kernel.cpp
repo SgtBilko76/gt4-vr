@@ -499,7 +499,10 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
     case 0x06: case 0x07: halt("program asked to run another executable"); break;
     case 0x10: add_handler(c, g_intc_handlers); break;
     case 0x11: remove_handler(c, g_intc_handlers); break;
-    case 0x12: add_handler(c, g_dmac_handlers); break;
+    case 0x12:
+        std::fprintf(stderr, "[ee] AddDmacHandler channel %u handler 0x%08X\n", arg(c, 0), arg(c, 1));
+        add_handler(c, g_dmac_handlers);
+        break;
     case 0x13: remove_handler(c, g_dmac_handlers); break;
     case 0x14: case 0x1A: ret(c, hw::intc_set_mask(arg(c, 0), true) ? 1 : 0); break;
     case 0x15: case 0x1B: ret(c, hw::intc_set_mask(arg(c, 0), false) ? 1 : 0); break;

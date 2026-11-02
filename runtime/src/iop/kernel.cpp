@@ -57,6 +57,10 @@ struct Interrupt {
 std::vector<HleEntry> g_hle;
 std::map<std::pair<std::string, std::uint32_t>, std::uint32_t> g_hle_ids;
 std::vector<std::pair<std::uint32_t, std::uint32_t>> g_hle_stubs;
+// Stubs from here on were added with state version 7 (created last at boot, so the earlier ones keep
+// their v6 addresses); a v6 state owns that memory, so its relink must not write them.
+std::size_t g_v7_stubs = 0;
+bool g_relink_v6 = false;
 std::map<std::string, std::uint32_t> g_hle_versions;
 std::map<std::string, std::uint32_t> g_libraries;
 std::map<std::string, HleModuleStart> g_hle_modules;
@@ -138,7 +142,10 @@ void link_imports(std::uint32_t base, std::uint32_t size) {
             const std::uint32_t w0 = ram32(stub), w1 = ram32(stub + 4);
             if (w0 != 0x03E00008u || (w1 & 0xFFFF0000u) != 0x24000000u) break;
             const std::uint32_t index = w1 & 0xFFFFu;
-            if (guest != g_libraries.end()) {
+            const std::uint32_t wrapper = guest != g_libraries.end() ? wrap_import(library, index) : 0u;
+            if (wrapper) {
+                set_ram32(stub, (kHleOpcode << 26) | wrapper);
+            } else if (guest != g_libraries.end()) {
                 const std::uint32_t target = ram32(guest->second + 20 + index * 4);
                 set_ram32(stub, 0x08000000u | ((target >> 2) & 0x03FFFFFFu));
                 set_ram32(stub + 4, 0);
@@ -160,13 +167,31 @@ void relink_hle_imports() {
             const std::string library(raw);
             for (std::uint32_t stub = a + 20; stub + 8 <= m.base + m.size; stub += 8) {
                 const std::uint32_t w0 = ram32(stub), w1 = ram32(stub + 4);
-                if ((w0 >> 26) == 2u && w1 == 0) continue;
+                if ((w0 >> 26) == 2u && w1 == 0) {
+                    // Linked to a guest library: trace it if asked (index found from the jump target).
+                    const auto guest = g_libraries.find(library);
+                    if (guest != g_libraries.end()) {
+                        const std::uint32_t target = (stub & 0xF0000000u) | ((w0 & 0x03FFFFFFu) << 2);
+                        for (std::uint32_t i = 0; i < 256 && ram32(guest->second + 20 + i * 4); ++i) {
+                            if (ram32(guest->second + 20 + i * 4) != target) continue;
+                            if (const std::uint32_t wrapper = wrap_import(library, i)) {
+                                set_ram32(stub, (kHleOpcode << 26) | wrapper);
+                                set_ram32(stub + 4, 0x24000000u | i);
+                            }
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 if ((w0 >> 26) != kHleOpcode || (w1 & 0xFFFF0000u) != 0x24000000u) break;
                 set_ram32(stub, (kHleOpcode << 26) | hle_id_for(library, w1 & 0xFFFFu));
             }
         }
     }
-    for (const auto &[at, id] : g_hle_stubs) set_ram32(at, (kHleOpcode << 26) | id);
+    for (std::size_t i = 0; i < g_hle_stubs.size(); ++i) {
+        if (g_relink_v6 && i >= g_v7_stubs) break;
+        set_ram32(g_hle_stubs[i].first, (kHleOpcode << 26) | g_hle_stubs[i].second);
+    }
 }
 
 struct Elf {
@@ -483,6 +508,11 @@ bool library_exists(const std::string &name) { return g_libraries.count(name) ||
 
 const std::map<int, Module> &modules() { return g_modules; }
 
+std::uint32_t g_libraries_table(const std::string &library) {
+    const auto it = g_libraries.find(library);
+    return it == g_libraries.end() ? 0u : it->second;
+}
+
 void register_hle_module(const std::string &name, HleModuleStart start) { g_hle_modules[name] = std::move(start); }
 
 void register_interrupt(unsigned line, std::uint32_t handler, std::uint32_t arg, std::uint32_t mode) {
@@ -553,6 +583,8 @@ void boot() {
     install_io();
     install_cdvd();
     install_sif();
+    g_v7_stubs = g_hle_stubs.size();
+    install_io_stubs();
 }
 
 }
@@ -833,7 +865,11 @@ void state(ps2::state::Stream &s) {
     s.pod(g_nested_done);
     s.pod(g_return_stub);
     s.pod(g_exit_stub);
-    if (s.loading()) relink_hle_imports();
+    if (s.loading()) {
+        g_relink_v6 = s.version() < 7;
+        relink_hle_imports();
+        g_relink_v6 = false;
+    }
 }
 
 }

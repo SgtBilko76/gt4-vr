@@ -32,6 +32,8 @@ struct Pending {
     std::int32_t fd = -1;
     std::uint32_t kind = 0;
     std::uint32_t stack = 0;  // bytes the call took off sp for stack arguments
+    std::uint32_t args[4] = {};  // wrapped guest calls that may be re-issued (inet receive retry)
+    std::uint32_t target = 0, retries = 0;
 };
 extern std::map<std::string, std::uint32_t> g_drivers;
 extern std::map<int, DriverFile> g_driver_files;

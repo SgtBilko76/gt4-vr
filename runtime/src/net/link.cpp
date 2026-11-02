@@ -3,6 +3,7 @@
 
 #include "dhcp.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -102,6 +103,39 @@ int g_relay = -1;
 std::atomic<bool> g_started{false};
 std::atomic<std::uint64_t> g_sent{0}, g_received{0};
 
+// PS2_NET_TRACE=1: one line per frame (direction, ARP / IPv4 protocol, addresses and ports).
+const bool g_trace = [] { const char *v = std::getenv("PS2_NET_TRACE"); return v && *v == '1'; }();
+
+void trace_frame(const char *dir, const std::uint8_t *f, std::size_t n) {
+    if (!g_trace || n < 14) return;
+    const unsigned type = (f[12] << 8) | f[13];
+    char what[320];
+    if (type == 0x0806 && n >= 42) {
+        std::snprintf(what, sizeof what, "ARP op %u %u.%u.%u.%u -> %u.%u.%u.%u", (f[20] << 8) | f[21], f[28], f[29], f[30], f[31],
+                      f[38], f[39], f[40], f[41]);
+    } else if (type == 0x0800 && n >= 34) {
+        const std::uint8_t *ip = f + 14;
+        const std::size_t ihl = (ip[0] & 15u) * 4u;
+        unsigned sp = 0, dp = 0;
+        if ((ip[9] == 6 || ip[9] == 17) && n >= 14 + ihl + 4) {
+            sp = (ip[ihl] << 8) | ip[ihl + 1];
+            dp = (ip[ihl + 2] << 8) | ip[ihl + 3];
+        }
+        int at = std::snprintf(what, sizeof what, "IP proto %u %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u len %u", ip[9], ip[12], ip[13], ip[14],
+                               ip[15], sp, ip[16], ip[17], ip[18], ip[19], dp, (ip[2] << 8) | ip[3]);
+        if (ip[9] == 17) {  // UDP payload, up to 24 bytes
+            const std::size_t from = 14 + ihl + 8, len = (ip[2] << 8) | ip[3];
+            const std::size_t end = std::min<std::size_t>({n, 14 + len, from + 24});
+            at += std::snprintf(what + at, sizeof what - static_cast<std::size_t>(at), " |");
+            for (std::size_t i = from; i < end && at < static_cast<int>(sizeof what) - 4; ++i)
+                at += std::snprintf(what + at, sizeof what - static_cast<std::size_t>(at), " %02x", f[i]);
+        }
+    } else {
+        std::snprintf(what, sizeof what, "type 0x%04X", type);
+    }
+    std::fprintf(stderr, "[net] %s %zu bytes, dst %02x:%02x:%02x:%02x:%02x:%02x: %s\n", dir, n, f[0], f[1], f[2], f[3], f[4], f[5], what);
+}
+
 #ifndef __EMSCRIPTEN__
 int dial(const std::string &host, const std::string &port) {
     addrinfo hints{};
@@ -190,6 +224,7 @@ void run() {
                     if (size > 65536) { ok = false; break; }
                     if (in.size() - off - kPdpHeader < size) break;
                     std::vector<std::uint8_t> frame(h + kPdpHeader, h + kPdpHeader + size);
+                    trace_frame("in ", frame.data(), frame.size());
                     off += kPdpHeader + size;
                     ++g_received;
                     std::lock_guard lock(g_rx_mutex);
@@ -201,6 +236,13 @@ void run() {
             if (now - last_ping > std::chrono::seconds(5)) {
                 last_ping = now;
                 if (!send_all(ctl, std::string(1, static_cast<char>(kCtlPing)))) break;
+                static std::uint64_t shown_sent = 0, shown_received = 0;
+                if (g_sent != shown_sent || g_received != shown_received) {
+                    shown_sent = g_sent;
+                    shown_received = g_received;
+                    std::fprintf(stderr, "[net] frames sent %llu, received %llu\n", static_cast<unsigned long long>(shown_sent),
+                                 static_cast<unsigned long long>(shown_received));
+                }
             }
         }
         {
@@ -243,6 +285,7 @@ void inject(std::vector<std::uint8_t> frame) {
 void send(const std::uint8_t *frame, std::size_t size) {
 #ifndef __EMSCRIPTEN__
     if (size < 14) return;
+    trace_frame("out", frame, size);
     // DHCP is answered here, by the adapter itself (dhcp.hpp): the relay has no router behind it.
     if (std::vector<std::uint8_t> reply; dhcp::handle(frame, size, config().mac, reply)) {
         inject(std::move(reply));

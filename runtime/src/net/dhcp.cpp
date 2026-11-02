@@ -8,8 +8,9 @@ namespace ps2::net::dhcp {
 
 namespace {
 
-constexpr std::uint32_t kServer = (10u << 24) | (76u << 16) | 1u;  // 10.76.0.1
-constexpr std::uint32_t kMask = 0xFFFF0000u;
+// A home-LAN /24 like the setups GT4's LAN mode was made for: 192.168.76.0/24, server .1.
+constexpr std::uint32_t kServer = (192u << 24) | (168u << 16) | (76u << 8) | 1u;
+constexpr std::uint32_t kMask = 0xFFFFFF00u;
 constexpr std::uint32_t kLease = 86400;
 constexpr std::size_t kEth = 14, kIp = 20, kUdp = 8, kBootp = 236;
 constexpr std::uint8_t kDiscover = 1, kOffer = 2, kRequest = 3, kAck = 5;
@@ -34,8 +35,8 @@ std::uint16_t ip_checksum(const std::uint8_t *p, std::size_t n) {
 }
 
 std::uint32_t address_for(const Mac &mac) {
-    std::uint32_t host = (static_cast<std::uint32_t>(mac[4]) << 8) | mac[5];
-    if (host < 2 || host == 0xFFFF) host = 2 + mac[3];
+    // .2 .. .254 from the MAC (players should check their name differs if two ever collide).
+    const std::uint32_t host = 2u + (static_cast<std::uint32_t>(mac[3] ^ mac[4] ^ mac[5]) % 253u);
     return (kServer & kMask) | host;
 }
 
