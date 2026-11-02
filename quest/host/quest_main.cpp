@@ -480,6 +480,8 @@ bool start_game(const fs::path &files) {
 
     ps2::g_options.disc_path = disc;
     ps2::g_options.memcard_path = card;
+    // Slot 2 card: GT4's network configuration (BWNETCNF) goes there, card 1 being full of the game save.
+    ps2::g_options.memcard2_path = kDataDir + "/memcard2.ps2";
     ps2::g_options.pal = false;  // A-Spec II and the retail USA v2.00 are NTSC
     // Network play (runtime/src/net/link.hpp): config.txt PS2_NET_SERVER=host turns the PS2 network
     // adapter on; players of the same product code and group meet on that ad hoc relay server.
