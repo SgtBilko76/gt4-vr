@@ -46,8 +46,10 @@
 void register_generated_code();
 
 #include "gt4_camera.h"
+#if GT4VR_ONLINE
 #include "gt4_results.h"
 #include "online_panel.h"
+#endif
 #include <sys/system_properties.h>
 
 namespace
@@ -555,9 +557,10 @@ bool start_game(const fs::path &files) {
     register_generated_code();
     register_generated_vu();
     if (GT4VR_CAMERA_HOOKS) gt4::camera::install(quest_head, gt4::quest::noteHeadTrackedFrame);
+#if GT4VR_ONLINE
     // GT4 Online (retail): own laps go to the leaderboard (gt4.portroyale.online) and to laps.txt.
-    // config.txt PS2_RESULTS_SERVER=off turns the reports off.
-    if (std::strcmp(GT4VR_NET_PRODUCT, "SCUS97328") == 0) {
+    // config.txt PS2_RESULTS_SERVER=off turns the reports off. Not built into the Spec II app.
+    {
         setenv("PS2_RESULTS_SERVER", "217.154.211.69:27314", 0);
         setenv("PS2_RESULTS_LOG", (kDataDir + "/laps.txt").c_str(), 0);
         gt4::results::install();
@@ -570,6 +573,7 @@ bool start_game(const fs::path &files) {
                 return c;
             });
     }
+#endif
     ps2::gs::bridge::set_field_tags(gt4::quest::takeBuiltKey, gt4::quest::notePresentedKey);
 
     std::thread(gs_thread_main).detach();

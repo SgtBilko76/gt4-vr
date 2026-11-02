@@ -134,6 +134,22 @@ void apply_presses() {
             std::remove(live);
         }
     }
+    // Crash hunting: PS2_STATE_EVERY=seconds saves a state that often, alternating <PS2_STATE_PREFIX>-a/-b.state,
+    // so a state from shortly before a crash is left behind (config.txt on the Quest; off by default).
+    static const char *every = std::getenv("PS2_STATE_EVERY");
+    static const std::uint64_t every_fields = every ? std::strtoull(every, nullptr, 10) * 60 : 0;
+    if (every_fields && g_frames > 0 && g_frames % every_fields == 0) {
+        static std::string paths[2];
+        static unsigned turn = 0;
+        const char *prefix = std::getenv("PS2_STATE_PREFIX");
+        paths[turn] = std::string(prefix ? prefix : "auto") + (turn ? "-b.state" : "-a.state");
+        if (request_state_operation(false, paths[turn].c_str(), [](bool, bool ok) {
+                std::fprintf(stderr, "[state] auto save %s\n", ok ? "ok" : "FAILED");
+            }))
+            std::fprintf(stderr, "[state] auto save at frame %llu -> %s\n", static_cast<unsigned long long>(g_frames),
+                         paths[turn].c_str());
+        turn ^= 1;
+    }
     // Once the last press is over the pad is left alone, so the web page's live input works after a scripted start.
     std::uint64_t last = 0;
     for (const Press &p : g_options.presses) last = std::max<std::uint64_t>(last, p.frame + p.frames);

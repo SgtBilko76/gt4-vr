@@ -5,6 +5,7 @@
 # usage: quest/tools/build_quest.sh [--no-apk]
 #   GAME=gt4|gt4r gt4 = A-Spec II (online.portroyale.gt4vr, /sdcard/GT4VR, default),
 #                 gt4r = retail USA v2.00 with LAN play (online.portroyale.gt4online "GT4 Online", /sdcard/GT4Online)
+#   VERSION_NAME  versionName (default 0.1.0-beta), VERSION_CODE versionCode (default 2)
 #   JOBS=N        parallel compile jobs (default 4: generated units take ~1 GB each)
 #   BRIDGE_BUILD  PCSX2 GS bridge build dir (default: the Ridge Racer V port's Android bridge)
 #
@@ -15,9 +16,9 @@ NDK=${ANDROID_NDK:-$HOME/workspace/android-ndk-r30}
 SDK_CMAKE=$(ls -d "$HOME"/workspace/android-sdk/cmake/*/bin | tail -1)
 GAME=${GAME:-gt4}
 case "$GAME" in
-  gt4)  variant=(); APP_ID=online.portroyale.gt4vr; APP_LABEL="GT4 VR" ;;
+  gt4)  variant=(-DGT4VR_ONLINE=OFF); APP_ID=online.portroyale.gt4vr; APP_LABEL="GT4 VR" ;;
   gt4r) variant=(-DGT4VR_DATA_DIR=/sdcard/GT4Online -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="GT4 Online"
-                 -DGT4VR_NET_PRODUCT=SCUS97328 -DGT4VR_CAMERA_HOOKS=OFF)
+                 -DGT4VR_NET_PRODUCT=SCUS97328 -DGT4VR_CAMERA_HOOKS=OFF -DGT4VR_ONLINE=ON)
         APP_ID=online.portroyale.gt4online; APP_LABEL="GT4 Online" ;;
   *) echo "unknown GAME=$GAME" >&2; exit 2 ;;
 esac
@@ -73,7 +74,8 @@ ls -la "$STAGE/jniLibs/arm64-v8a"
 [ "${1:-}" = "--no-apk" ] && exit 0
 cd "$ROOT/quest/android"
 [ -f local.properties ] || echo "sdk.dir=$HOME/workspace/android-sdk" > local.properties
-JAVA_HOME=$(ls -d "$HOME"/tools/jdk-17* | head -1) ./gradlew --no-daemon -q --offline assembleRelease -PgtAppId="$APP_ID" -PgtAppLabel="$APP_LABEL"
+JAVA_HOME=$(ls -d "$HOME"/tools/jdk-17* | head -1) ./gradlew --no-daemon -q --offline assembleRelease -PgtAppId="$APP_ID" -PgtAppLabel="$APP_LABEL" \
+  -PgtVersionName="${VERSION_NAME:-0.1.0-beta}" -PgtVersionCode="${VERSION_CODE:-2}"
 mkdir -p "$ROOT/build/apk"
 cp app/build/outputs/apk/release/app-release.apk "$ROOT/build/apk/$GAME.apk"
 ls -la app/build/outputs/apk/release/ "$ROOT/build/apk/$GAME.apk"

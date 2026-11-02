@@ -252,11 +252,11 @@ public:
         if (in.leftStickClick && in.rightStickClick && !m_stickCombo)
         {
             m_stickCombo = true;
-            // GT4 Online: the online menu (owner 2026-11-02). The VR view switch only when VR mode
-            // is allowed again (debug.gt4vr.vrallow) or the build has no online menu.
-            if (g_vr_allowed.load(std::memory_order_relaxed) || !gt4::panel::available())
+            // GT4 Online: the online menu (owner 2026-11-02). The VR view switch only when VR mode is
+            // allowed again (debug.gt4vr.vrallow); otherwise (Spec II release) the combo does nothing.
+            if (g_vr_allowed.load(std::memory_order_relaxed))
                 gt4::quest::setCurvedView(!gt4::quest::curvedView());
-            else
+            else if (gt4::panel::available())
                 gt4::panel::toggle();
         }
         else if (!in.leftStickClick && !in.rightStickClick)

@@ -122,7 +122,14 @@ if(PS2_GENERATED)
         set(PS2_OPENXR_DIR "" CACHE PATH "Folder with include/openxr and lib/arm64-v8a/libopenxr_loader.so")
         add_library(native_app_glue STATIC ${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c)
         target_include_directories(native_app_glue PUBLIC ${ANDROID_NDK}/sources/android/native_app_glue)
-        add_library(gt4vr SHARED quest/host/quest_main.cpp quest/host/quest_xr.cpp quest/host/quest_host.cpp quest/host/gt4_camera.cpp quest/host/gt4_results.cpp quest/host/online_panel.cpp)
+        # GT4 Online's leaderboard / lap reports / online menu: only in the retail LAN app (GAME=gt4r).
+        option(GT4VR_ONLINE "GT4 Online: lap results + VR online menu" OFF)
+        if(GT4VR_ONLINE)
+            set(GT4VR_ONLINE_SOURCES quest/host/gt4_results.cpp quest/host/online_panel.cpp)
+        else()
+            set(GT4VR_ONLINE_SOURCES quest/host/online_off.cpp)
+        endif()
+        add_library(gt4vr SHARED quest/host/quest_main.cpp quest/host/quest_xr.cpp quest/host/quest_host.cpp quest/host/gt4_camera.cpp ${GT4VR_ONLINE_SOURCES})
         target_include_directories(gt4vr PRIVATE "${PS2_OPENXR_DIR}/include" runtime/src/gs)
         target_link_libraries(gt4vr PRIVATE ps2game ps2runtime native_app_glue
             "${PS2_OPENXR_DIR}/lib/${ANDROID_ABI}/libopenxr_loader.so" EGL GLESv3 aaudio android log dl)
@@ -136,7 +143,8 @@ if(PS2_GENERATED)
         option(GT4VR_CAMERA_HOOKS "A-Spec II race camera hooks (VR view)" ON)
         target_compile_definitions(gt4vr PRIVATE GT4VR_DATA_DIR="${GT4VR_DATA_DIR}"
             GT4VR_OLD_DATA_DIR="${GT4VR_OLD_DATA_DIR}" GT4VR_TITLE="${GT4VR_TITLE}"
-            GT4VR_NET_PRODUCT="${GT4VR_NET_PRODUCT}" GT4VR_CAMERA_HOOKS=$<BOOL:${GT4VR_CAMERA_HOOKS}>)
+            GT4VR_NET_PRODUCT="${GT4VR_NET_PRODUCT}" GT4VR_CAMERA_HOOKS=$<BOOL:${GT4VR_CAMERA_HOOKS}>
+            GT4VR_ONLINE=$<BOOL:${GT4VR_ONLINE}>)
         return()
     endif()
 
