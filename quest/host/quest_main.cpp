@@ -522,7 +522,9 @@ bool start_game(const fs::path &files) {
     // 100-122), 3x4 skipped 139-159, 4x4 190-240. RRV_PCSX2_GS_SCALE_X=3 RRV_PCSX2_GS_SCALE=3 = old.
     // VR mode re-enabled (owner: VR and curved screen switchable); the curved screen stays the
     // default until the owner toggles back. For VR later: RRV_PCSX2_GS_SCALE_X=2.5 RRV_PCSX2_GS_SCALE=4.
-    setenv("RRV_PCSX2_GS_SCALE", "3", 0);
+    // Owner 2026-11-02 (release): 2.5x (1600x1120) - 3x ran at ~51 fps on Costa di Amalfi with
+    // crackling sound (GPU ~95% already on the Nurburgring). RRV_PCSX2_GS_SCALE=3 = old.
+    setenv("RRV_PCSX2_GS_SCALE", "2.5", 0);
     // Sharpness (owner 2026-10-30: "das Bild ist total unscharf"): AMD CAS on the presented frame
     // and 8x anisotropic texture filtering (far road and walls). config.txt overrides
     // (RRV_PCSX2_GS_CAS=0 / RRV_PCSX2_GS_ANISO=0 = off).
@@ -535,7 +537,8 @@ bool start_game(const fs::path &files) {
     // Measured 2026-10-30 (VR, 72 Hz): FXAA cost ~25 of 600 fields skipped for little visible gain;
     // owner chose it off. RRV_PCSX2_GS_FXAA=1 turns it back on.
     // Owner now: picture unsharp again -> turn anti-aliasing back on to optimise the sharpness.
-    setenv("RRV_PCSX2_GS_FXAA", "1", 0);
+    // Owner 2026-11-02 (release): off again for GPU headroom on heavy tracks (with 2.5x).
+    setenv("RRV_PCSX2_GS_FXAA", "0", 0);
     // Flicker with a light source in view (owner 2026-11-01 video): the bridge's field skipping
     // dropped whole fields when the GS fell behind, GT4's brightness / glare post-processing passes
     // included, so the picture pulsed 3-4 times a second. Off, the flicker is gone (owner tested);
