@@ -14,12 +14,15 @@ struct Value {
     double num = 0;
     std::string str;
     std::vector<Value> arr;
-    std::vector<std::pair<std::string, Value>> obj;
+    // Object members as two parallel vectors: std::vector<std::pair<std::string, Value>> needs a
+    // complete Value, which clang + libstdc++ 15 reject here (vector<Value> alone is fine).
+    std::vector<std::string> keys;
+    std::vector<Value> vals;
 
     // Last occurrence wins for duplicate keys.
     const Value* get(const std::string& key) const {
-        for (auto it = obj.rbegin(); it != obj.rend(); ++it)
-            if (it->first == key) return &it->second;
+        for (size_t i = keys.size(); i-- > 0;)
+            if (keys[i] == key) return &vals[i];
         return nullptr;
     }
 };
@@ -79,7 +82,8 @@ private:
             ws();
             Value child;
             if (!value(child, depth + 1)) return false;
-            v.obj.emplace_back(std::move(key), std::move(child));
+            v.keys.push_back(std::move(key));
+            v.vals.push_back(std::move(child));
             ws();
             if (p_ >= e_) return false;
             if (*p_ == ',') { ++p_; continue; }

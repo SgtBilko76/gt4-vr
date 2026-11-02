@@ -16,6 +16,7 @@
 #include "gt4_results.h"
 
 #include "ps2/memory.hpp"
+#include "ps2/net.hpp"
 #include "ps2/system.hpp"
 
 #include <netdb.h>
@@ -24,6 +25,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -236,10 +239,23 @@ std::uint32_t g_last_lap = 0, g_last_ms = 0;
 // 2026-11-02: New York lap 1 2'02.804 reported again at the replay); two real laps never match
 // to the millisecond.
 std::set<std::string> g_reported;
-std::chrono::steady_clock::time_point g_last_status{};
+// Last status report (steady-clock seconds; EE thread and heartbeat thread).
+std::atomic<long long> g_last_status{-1000};
+long long now_s() {
+    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 std::string new_race_id() {
     return g_device + "-" + std::to_string(static_cast<long long>(std::time(nullptr))) + "-" + std::to_string(++g_race_no);
+}
+
+std::mutex g_room_mutex;
+Room g_room;
+
+std::string room_fields() {
+    std::lock_guard<std::mutex> lock(g_room_mutex);
+    if (g_room.id.empty()) return {};
+    return ",\"room\":" + json_str(g_room.id) + ",\"host\":" + (g_room.host ? "true" : "false");
 }
 
 std::string base_fields(const Race &r) {
@@ -251,12 +267,39 @@ std::string base_fields(const Race &r) {
 }
 
 void send_status(const Race &r, int lap, bool force) {
-    const auto now = std::chrono::steady_clock::now();
-    if (!force && now - g_last_status < std::chrono::seconds(5)) return;
+    const long long now = now_s();
+    if (!force && now - g_last_status.load() < 5) return;
     g_last_status = now;
-    std::string body = "{" + base_fields(r) + ",\"type\":\"status\",\"state\":\"race\"";
+    std::string body = "{" + base_fields(r) + ",\"type\":\"status\",\"state\":\"race\"" + room_fields();
     if (lap > 0) body += ",\"lap\":" + std::to_string(lap);
     enqueue(body + "}", false);
+}
+
+// While in a room: "lobby" status every 10 s unless a race status went out in that time, so the
+// server keeps the room listed (it drops statuses after 30 s).
+void heartbeat() {
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        const std::string fields = room_fields();
+        if (fields.empty()) continue;
+        if (now_s() - g_last_status.load() < 10) continue;
+        g_last_status = now_s();
+        std::string player, track, car;
+        current(player, track, car);
+        std::string body = "{\"v\":1,\"type\":\"status\",\"state\":\"lobby\",\"device\":" + json_str(g_device) +
+                           ",\"player\":" + json_str(player.empty() ? g_device : player) + fields + "}";
+        enqueue(body, false);
+    }
+}
+
+void set_room(Room room) {
+    {
+        std::lock_guard<std::mutex> lock(g_room_mutex);
+        g_room = room;
+    }
+    ps2::net::set_group(room.id);
+    g_last_status = -1000;  // report the change right away
+    std::fprintf(stderr, "[results] room %s%s\n", room.id.empty() ? "(none)" : room.id.c_str(), room.host ? " (host)" : "");
 }
 
 void on_start(ps2::Cpu &c) {
@@ -366,6 +409,30 @@ void current(std::string &player, std::string &track, std::string &car) {
         if (const char *p = std::getenv("PS2_PLAYER_NAME")) player = p;
 }
 
+Room room() {
+    std::lock_guard<std::mutex> lock(g_room_mutex);
+    return g_room;
+}
+
+void createRoom() {
+    // R + the headset's 6-digit network id (net-id.txt, PS2_NET_NAME Quest-xxxxxx): unique per headset.
+    std::string id = g_device;
+    if (id.rfind("Quest-", 0) == 0) id = id.substr(6);
+    std::string clean;
+    for (char ch : id)
+        if (std::isalnum(static_cast<unsigned char>(ch))) clean += ch;
+    if (clean.size() > 6) clean = clean.substr(clean.size() - 6);
+    if (clean.empty()) clean = std::to_string(std::time(nullptr) % 1000000);
+    set_room({"R" + clean, true});
+}
+
+void joinRoom(const std::string &id) {
+    if (id.empty()) return leaveRoom();
+    set_room({id.substr(0, 8), false});
+}
+
+void leaveRoom() { set_room({}); }
+
 void install() {
     if (const char *v = std::getenv("PS2_GT4_LAPLOG")) g_log = std::atoi(v);
     if (const char *v = std::getenv("PS2_GT4_RESULTS_CAR")) g_force_car = std::atoi(v);
@@ -378,6 +445,13 @@ void install() {
             g_host.resize(colon);
         }
         std::thread(sender).detach();
+        std::thread(heartbeat).detach();
+        // Tests (and a fixed room per config.txt): PS2_ROOM=create opens this headset's race,
+        // PS2_ROOM=<id> joins one.
+        if (const char *room = std::getenv("PS2_ROOM"); room && *room) {
+            if (std::strcmp(room, "create") == 0) createRoom();
+            else joinRoom(room);
+        }
         std::fprintf(stderr, "[results] reporting laps to %s:%s as %s\n", g_host.c_str(), g_port.c_str(), g_device.c_str());
     }
     for (const Probe &p : kProbes) {

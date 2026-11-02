@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "link.hpp"
 
+#include "ps2/net.hpp"
+
 #include "dhcp.hpp"
 
 #include <algorithm>
@@ -102,6 +104,17 @@ std::mutex g_tx_mutex;
 int g_relay = -1;
 std::atomic<bool> g_started{false};
 std::atomic<std::uint64_t> g_sent{0}, g_received{0};
+// The group the relay puts this adapter in (set_group: GT4 Online's race rooms). Only players in the
+// same group see each other. A change reconnects with the new group.
+std::mutex g_group_mutex;
+std::string g_group;
+bool g_group_set = false;
+std::atomic<bool> g_regroup{false};
+
+std::string current_group() {
+    std::lock_guard lock(g_group_mutex);
+    return g_group_set ? g_group : config().group;
+}
 
 // PS2_NET_TRACE=1: one line per frame (direction, ARP / IPv4 protocol, addresses and ports).
 const bool g_trace = [] { const char *v = std::getenv("PS2_NET_TRACE"); return v && *v == '1'; }();
@@ -188,7 +201,9 @@ void run() {
         put_fixed(login, c.name.substr(0, kNicknameLength - 1), kNicknameLength);
         put_fixed(login, c.product, kProductLength);
         login.push_back(static_cast<char>(kCtlConnect));
-        put_fixed(login, c.group, kGroupLength);
+        const std::string group = current_group();
+        g_regroup = false;
+        put_fixed(login, group, kGroupLength);
         std::string init;
         put32(init, 0);  // datagram socket
         put_mac(init, c.mac);
@@ -202,12 +217,13 @@ void run() {
         }
         std::fprintf(stderr, "[net] %s to %s:%s as %s (%02x:%02x:%02x:%02x:%02x:%02x), group %s\n",
                      ok ? "connected" : "login failed", c.host.c_str(), c.ctl_port.c_str(), c.name.c_str(), c.mac[0],
-                     c.mac[1], c.mac[2], c.mac[3], c.mac[4], c.mac[5], c.group.c_str());
+                     c.mac[1], c.mac[2], c.mac[3], c.mac[4], c.mac[5], group.c_str());
         std::string in;
         auto last_ping = std::chrono::steady_clock::now();
         while (ok) {
+            if (g_regroup.load()) break;
             pollfd fds[2] = {{ctl, POLLIN, 0}, {relay, POLLIN, 0}};
-            if (poll(fds, 2, 1000) < 0) break;
+            if (poll(fds, 2, 250) < 0) break;
             char buf[16384];
             if (fds[0].revents) {
                 // Join/leave notices and pings: the adapter needs none of them.
@@ -251,6 +267,11 @@ void run() {
         }
         close(ctl);
         close(relay);
+        if (g_regroup.load()) {
+            std::lock_guard lock(g_rx_mutex);
+            g_rx.clear();  // frames from the old group
+            continue;
+        }
         std::fprintf(stderr, "[net] connection to the ad hoc server lost (sent %llu, received %llu frames), reconnecting\n",
                      static_cast<unsigned long long>(g_sent.load()), static_cast<unsigned long long>(g_received.load()));
         std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -269,6 +290,26 @@ bool enabled() {
 }
 
 Mac mac() { return config().mac; }
+
+void set_group(const std::string &group) {
+    const std::string g = (group.empty() ? config().group : group).substr(0, kGroupLength);
+    {
+        std::lock_guard lock(g_group_mutex);
+        if (g_group_set && g == g_group) return;
+        if (!g_group_set && g == config().group) {
+            g_group = g;
+            g_group_set = true;
+            return;
+        }
+        g_group = g;
+        g_group_set = true;
+    }
+    std::fprintf(stderr, "[net] switching to group %s\n", g.c_str());
+    g_regroup = true;
+}
+
+std::string group() { return current_group(); }
+std::string default_group() { return config().group; }
 
 void start() {
 #ifndef __EMSCRIPTEN__

@@ -268,6 +268,8 @@ public:
         // it, and the game gets a released pad (pause GT4 first if a race is running).
         const bool panel_b = in.b && !m_panelB;
         m_panelB = in.b;
+        const bool was_a = m_panelA;
+        m_panelA = in.a;
         if (gt4::panel::isOpen())
         {
             const int dx = (right && !m_panelDir[3]) - (left && !m_panelDir[2]);
@@ -276,6 +278,8 @@ public:
                 gt4::panel::input(dx, dy);
             if (panel_b)
                 gt4::panel::setOpen(false);
+            if (in.a && !was_a)
+                gt4::panel::select();
             m_panelDir[0] = up, m_panelDir[1] = down, m_panelDir[2] = left, m_panelDir[3] = right;
             m_panelHeld = true;
             gt4::quest::Pad idle;
@@ -286,7 +290,7 @@ public:
         // press doesn't reach the game.
         if (m_panelHeld)
         {
-            if (in.b || up || down || left || right)
+            if (in.a || in.b || up || down || left || right)
             {
                 gt4::quest::Pad idle;
                 idle.connected = true;
@@ -329,7 +333,7 @@ private:
     bool m_rt = false, m_lt = false, m_lg = false, m_rg = false;
     bool m_stickCombo = false;
     bool m_rs[4] = {};
-    bool m_panelB = false, m_panelHeld = false;
+    bool m_panelA = false, m_panelB = false, m_panelHeld = false;
     bool m_panelDir[4] = {};
 };
 
@@ -842,7 +846,7 @@ private:
             if (vr_prop == 0 || vr_prop == 1)
                 gt4::quest::setCurvedView(vr_prop == 0);
         }
-        // Headless testing: debug.gt4vr.panel 1 / 0 opens / closes the online menu, 2..5 picks tab 1..4.
+        // Headless testing: debug.gt4vr.panel 1 / 0 opens / closes the online menu, 2..6 picks tab 1..5.
         const int panel_prop = static_cast<int>(ReadFloatProperty("debug.gt4vr.panel", -1.0f));
         if (panel_prop != m_panel_prop)
         {

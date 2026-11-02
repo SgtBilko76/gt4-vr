@@ -1,15 +1,26 @@
 // PC preview of GT4 Online's VR online menu (quest/host/online_panel.cpp) with live server data.
 // build: g++ -std=c++17 -O1 -pthread -o panel_preview quest/tools/panel_preview.cpp quest/host/online_panel.cpp
-// usage: panel_preview FONT OUT_PREFIX [SERVER] [PLAYER] [TRACK]   -> OUT_PREFIX-<tab>.ppm for all 4 tabs
+// usage: panel_preview FONT OUT_PREFIX [SERVER] [PLAYER] [TRACK] [create]  -> OUT_PREFIX-<tab>.ppm for all 5 tabs
+#include "../host/gt4_results.h"
 #include "../host/online_panel.h"
 
 #include <chrono>
 #include <cstdio>
 #include <string>
 #include <thread>
+#include <unistd.h>
 
 static std::string g_player, g_track;
 static gt4::panel::Context context() { return {g_player, g_track, ""}; }
+
+// Room state without the network link (the preview has no relay connection).
+static gt4::results::Room g_room;
+namespace gt4::results {
+Room room() { return g_room; }
+void createRoom() { g_room = {"Rpreview", true}; }
+void joinRoom(const std::string &id) { g_room = {id, false}; }
+void leaveRoom() { g_room = {}; }
+}
 
 int main(int argc, char **argv) {
     if (argc < 3) {
@@ -19,10 +30,15 @@ int main(int argc, char **argv) {
     g_player = argc > 4 ? argv[4] : "";
     g_track = argc > 5 ? argv[5] : "";
     if (!gt4::panel::start(argc > 3 ? argv[3] : "", argv[1], context)) return 1;
+    if (argc > 6) {
+        const std::string room = argv[6];
+        if (room == "create") gt4::results::createRoom();
+        else gt4::results::joinRoom(room);
+    }
     gt4::panel::setOpen(true);
     std::this_thread::sleep_for(std::chrono::seconds(4));
     std::vector<std::uint8_t> rgba;
-    for (int tab = 0; tab < 4; ++tab) {
+    for (int tab = 0; tab < 5; ++tab) {
         if (tab) gt4::panel::input(1, 0);
         gt4::panel::render(rgba);
         const std::string path = std::string(argv[2]) + "-" + std::to_string(tab) + ".ppm";
@@ -32,5 +48,7 @@ int main(int argc, char **argv) {
         std::fclose(f);
         std::printf("%s\n", path.c_str());
     }
-    return 0;
+    // The panel's fetch thread keeps running: leave without destroying the globals it uses.
+    std::fflush(stdout);
+    _exit(0);
 }

@@ -11,6 +11,7 @@
 //   PS2_PLAYER_NAME     player name if the GT4 save name can't be read
 //   PS2_GT4_LAPLOG=1    log every line crossing of every car
 //   PS2_GT4_RESULTS_CAR=n  treat car n as the player's (PC tests with an AI car)
+//   PS2_ROOM=create|<id>   start in a race room (tests; normally chosen in the online menu)
 #include <string>
 
 namespace gt4::results {
@@ -21,5 +22,17 @@ void install();
 // What the game has set up right now (read from its race setup; empty in menus without a race):
 // the GT4 save name, the track and car display names.
 void current(std::string &player, std::string &track, std::string &car);
+
+// Race rooms (GT4 Online's online menu): a room is its own relay group, so only its players find
+// each other in Multi-LAN Race. While in a room, a status heartbeat every 10 s lists it on the
+// server (api/rooms); the host's room id is "R" + the headset's network id.
+struct Room {
+    std::string id;   // "" = no room (the shared group everyone is in)
+    bool host = false;
+};
+Room room();
+void createRoom();
+void joinRoom(const std::string &id);
+void leaveRoom();
 
 }

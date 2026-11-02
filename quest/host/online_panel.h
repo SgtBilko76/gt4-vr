@@ -31,7 +31,9 @@ void toggle();
 
 // Controller input while open: dx = -1/+1 previous/next tab, dy = -1/+1 scroll up/down.
 void input(int dx, int dy);
-void setTab(int tab);  // 0 Live, 1 Leaderboard, 2 Track, 3 Recent
+void setTab(int tab);  // 0 Races, 1 Live, 2 Leaderboard, 3 Track, 4 Recent
+// A: on the Races tab, create / leave a race or join the selected one.
+void select();
 
 // Draws the panel into rgba (kWidth * kHeight, R G B A bytes, top row first) when something
 // changed since the last call (data, tab, scroll, open). Returns false when nothing changed.

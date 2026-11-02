@@ -3,6 +3,7 @@
 #include "online_panel.h"
 
 #include "gt4_json.hpp"
+#include "gt4_results.h"
 
 #define STB_TRUETYPE_IMPLEMENTATION
 #define STBTT_STATIC
@@ -104,20 +105,21 @@ long long num(const json::Value *v, long long fallback = -1) {
 struct Data {
     bool reached = false;  // last fetch got through
     std::time_t fetched = 0;
-    json::Value live, leaderboard, recent, tracks, track;
+    json::Value live, leaderboard, recent, tracks, track, rooms;
     std::string track_name;  // the track `track` belongs to
 };
 
 std::mutex g_mutex;
 std::condition_variable g_wake;
 Data g_data;
-std::atomic<bool> g_open{false}, g_available{false}, g_dirty{true};
+std::atomic<bool> g_open{false}, g_available{false}, g_dirty{true}, g_refresh{false};
 ContextFn g_context = nullptr;
 int g_tab = 0;
 int g_scroll[8] = {};
+int g_sel = 0;  // selected row on the Races tab
 
-enum Tab { kLive, kLeaderboard, kTrack, kRecent, kTabCount };
-const char *const kTabNames[kTabCount] = {"Live", "Leaderboard", "Track", "Recent"};
+enum Tab { kRaces, kLive, kLeaderboard, kTrack, kRecent, kTabCount };
+const char *const kTabNames[kTabCount] = {"Races", "Live", "Leaderboard", "Track", "Recent"};
 
 void fetch_loop() {
     std::chrono::steady_clock::time_point last_all{};
@@ -135,6 +137,7 @@ void fetch_loop() {
         }
         const auto now = std::chrono::steady_clock::now();
         bool reached = get_json("/api/live", d.live);
+        if (reached) get_json("/api/rooms", d.rooms);
         if (reached && (now - last_all > std::chrono::seconds(15) || d.leaderboard.type == json::Value::Null)) {
             reached = get_json("/api/leaderboard", d.leaderboard) && get_json("/api/recent", d.recent) &&
                       get_json("/api/tracks", d.tracks);
@@ -156,7 +159,11 @@ void fetch_loop() {
         g_dirty = true;
         // While open: Live every 5 s (the wait above), the rest every 15 s.
         std::unique_lock<std::mutex> lock(g_mutex);
-        g_wake.wait_for(lock, std::chrono::seconds(5), [] { return !g_open.load(); });
+        g_wake.wait_for(lock, std::chrono::seconds(5), [] { return !g_open.load() || g_refresh.load(); });
+        if (g_refresh.exchange(false)) {
+            lock.unlock();
+            std::this_thread::sleep_for(std::chrono::milliseconds(2500));  // the room's first heartbeat
+        }
     }
 }
 
@@ -206,6 +213,7 @@ std::vector<std::uint32_t> utf8(const std::string &s) {
 using Color = std::uint32_t;  // 0xRRGGBB
 constexpr Color kBg = 0x12151C, kHeader = 0x1B2030, kRowAlt = 0x181C26, kLine = 0x2A3042;
 constexpr Color kText = 0xE8ECF4, kDim = 0x8A93A8, kAccent = 0xE63946, kGold = 0xFFC857, kGreen = 0x5BD38A;
+constexpr Color kSelected = 0x2B3550;
 
 struct Canvas {
     std::vector<std::uint8_t> &px;
@@ -302,27 +310,73 @@ struct Column {
 constexpr int kRowH = 46, kTableTop = 244, kRows = 10, kBody = 28;
 
 // A table: header row, then the rows (vector of cell strings), the player's rows in gold.
+// A row whose cells after the first are all empty is one wide cell (the Races tab's action row).
 void table(Canvas &cv, const std::vector<Column> &cols, const std::vector<std::vector<std::string>> &rows,
-           const std::vector<bool> &own, int &scroll, const char *empty) {
-    for (const Column &c : cols) cv.text(c.title, c.x, kTableTop - 14, 22, kDim, c.w, c.align);
-    cv.rect(40, kTableTop - 4, kWidth - 80, 2, kLine);
+           const std::vector<bool> &own, int &scroll, const char *empty, int selected = -1, int top = kTableTop) {
+    const int fit = std::min(kRows, (kHeight - 56 - 50 - top) / kRowH);
+    for (const Column &c : cols) cv.text(c.title, c.x, top - 14, 22, kDim, c.w, c.align);
+    cv.rect(40, top - 4, kWidth - 80, 2, kLine);
     if (rows.empty()) {
-        cv.text(empty, 40, kTableTop + 90, 32, kDim, kWidth - 80, 2);
+        cv.text(empty, 40, top + 90, 32, kDim, kWidth - 80, 2);
         return;
     }
-    scroll = std::clamp(scroll, 0, std::max(0, static_cast<int>(rows.size()) - kRows));
-    for (int i = 0; i < kRows && scroll + i < static_cast<int>(rows.size()); ++i) {
-        const int r = scroll + i, y = kTableTop + i * kRowH;
-        if (i % 2) cv.rect(40, y, kWidth - 80, kRowH, kRowAlt);
+    if (selected >= 0) scroll = std::clamp(scroll, selected - fit + 1, selected);
+    scroll = std::clamp(scroll, 0, std::max(0, static_cast<int>(rows.size()) - fit));
+    for (int i = 0; i < fit && scroll + i < static_cast<int>(rows.size()); ++i) {
+        const int r = scroll + i, y = top + i * kRowH;
+        bool wide = rows[r].size() > 1;
+        for (std::size_t k = 1; k < rows[r].size(); ++k) wide = wide && rows[r][k].empty();
+        if (wide) {
+            if (r == selected) {
+                cv.rect(40, y, kWidth - 80, kRowH, kSelected);
+                cv.rect(40, y, 6, kRowH, kAccent);
+            }
+            cv.text(rows[r][0], cols[0].x, y + 32, kBody, own[r] ? kGold : kText, kWidth - 100);
+            continue;
+        }
+        if (r == selected) {
+            cv.rect(40, y, kWidth - 80, kRowH, kSelected);
+            cv.rect(40, y, 6, kRowH, kAccent);
+        } else if (i % 2) {
+            cv.rect(40, y, kWidth - 80, kRowH, kRowAlt);
+        }
         const Color c = own[r] ? kGold : kText;
         for (std::size_t k = 0; k < cols.size() && k < rows[r].size(); ++k)
             cv.text(rows[r][k], cols[k].x, y + 32, kBody, k == 0 && !own[r] ? kDim : c, cols[k].w, cols[k].align);
     }
-    if (static_cast<int>(rows.size()) > kRows) {
+    if (static_cast<int>(rows.size()) > fit) {
         char b[48];
-        std::snprintf(b, sizeof b, "%d-%d of %zu", scroll + 1, std::min(scroll + kRows, static_cast<int>(rows.size())), rows.size());
-        cv.text(b, kWidth - 340, kTableTop + kRows * kRowH + 30, 22, kDim, 300, 1);
+        std::snprintf(b, sizeof b, "%d-%d of %zu", scroll + 1, std::min(scroll + fit, static_cast<int>(rows.size())), rows.size());
+        cv.text(b, kWidth - 340, top + fit * kRowH + 30, 22, kDim, 300, 1);
     }
+}
+
+// The Races tab: row 0 creates (or leaves) a race, the others are the open races to join.
+struct RaceRow {
+    std::vector<std::string> cells;
+    std::string join;  // room id to join; "" for row 0
+    bool own = false;
+};
+
+std::vector<RaceRow> race_rows(const Data &d, const gt4::results::Room &cur) {
+    std::vector<RaceRow> rows;
+    if (cur.id.empty())
+        rows.push_back({{"+  Create a race", "", "", "", ""}, "", false});
+    else
+        rows.push_back({{std::string("x  Leave race ") + cur.id, "", "", "", ""}, "", true});
+    if (d.rooms.type == json::Value::Array)
+        for (const json::Value &v : d.rooms.arr) {
+            const std::string id = str(v.get("room"));
+            if (id.empty()) continue;
+            const long long n = num(v.get("count"), 1);
+            std::string players;
+            if (const json::Value *p = v.get("players"); p && p->type == json::Value::Array)
+                for (const json::Value &name : p->arr) players += (players.empty() ? "" : ", ") + str(&name);
+            const std::string state = str(v.get("state")) == "racing" ? "racing" : "waiting";
+            rows.push_back({{str(v.get("host")), id, std::to_string(n) + (n == 1 ? " player" : " players"), players, state},
+                            id, id == cur.id});
+        }
+    return rows;
 }
 
 void draw(std::vector<std::uint8_t> &px, const Data &d, const Context &ctx) {
@@ -358,6 +412,32 @@ void draw(std::vector<std::uint8_t> &px, const Data &d, const Context &ctx) {
     std::vector<std::vector<std::string>> rows;
     std::vector<bool> mine;
     switch (g_tab) {
+    case kRaces: {
+        const gt4::results::Room cur = gt4::results::room();
+        const std::vector<RaceRow> rr = race_rows(d, cur);
+        g_sel = std::clamp(g_sel, 0, static_cast<int>(rr.size()) - 1);
+        for (const RaceRow &row : rr) {
+            rows.push_back(row.cells);
+            mine.push_back(row.own);
+        }
+        if (cur.id.empty()) {
+            cv.text("You are in the open lobby: Multi-LAN Race finds everyone who is not in a race.", 40, 192, 22, kDim, kWidth - 80);
+            cv.text("Create a race, or pick one below and press A to join it.", 40, 218, 22, kDim, kWidth - 80);
+        } else if (cur.host) {
+            cv.text("Your race " + cur.id + " is open. In GT4: Options > LAN Settings > Host: Yes,", 40, 192, 22, kGold, kWidth - 80);
+            cv.text("then Arcade > Multi-LAN Race > Connect, and start when the others are there.", 40, 218, 22, kGold, kWidth - 80);
+        } else {
+            cv.text("You joined race " + cur.id + ". In GT4: Options > LAN Settings > Host: No,", 40, 192, 22, kGold, kWidth - 80);
+            cv.text("then Arcade > Multi-LAN Race > Connect and wait for the host to start.", 40, 218, 22, kGold, kWidth - 80);
+        }
+        constexpr int kRacesTop = kTableTop + 34;
+        table(cv, {{"Host", 50, 220, 0}, {"Race", 280, 140, 0}, {"Players", 430, 150, 0}, {"Who", 590, 470, 0},
+                   {"Status", 1070, 170, 1}},
+              rows, mine, g_scroll[kRaces], "", g_sel, kRacesTop);
+        if (rr.size() == 1)
+            cv.text("No open races right now", 40, kRacesTop + kRowH + 60, 28, kDim, kWidth - 80, 2);
+        break;
+    }
     case kLive: {
         const json::Value *devs = d.live.get("devices");
         if (devs && devs->type == json::Value::Array)
@@ -422,8 +502,9 @@ void draw(std::vector<std::uint8_t> &px, const Data &d, const Context &ctx) {
                 kTableTop - 40, 24, kGold, kWidth - 80);
     // Footer
     cv.rect(0, kHeight - 56, kWidth, 56, kHeader);
-    cv.text("Right stick  left/right: tab   up/down: scroll        B or both stick clicks: close", 40, kHeight - 20, 22,
-            kDim, kWidth - 80, 2);
+    cv.text(g_tab == kRaces ? "Right stick  left/right: tab   up/down: choose     A: select     B or both stick clicks: close"
+                            : "Right stick  left/right: tab   up/down: scroll        B or both stick clicks: close",
+            40, kHeight - 20, 22, kDim, kWidth - 80, 2);
 }
 
 }
@@ -470,9 +551,33 @@ void input(int dx, int dy) {
         g_dirty = true;
     }
     if (dy) {
-        g_scroll[g_tab] = std::max(0, g_scroll[g_tab] + dy);
+        if (g_tab == kRaces) g_sel = std::max(0, g_sel + dy);
+        else g_scroll[g_tab] = std::max(0, g_scroll[g_tab] + dy);
         g_dirty = true;
     }
+}
+
+void select() {
+    std::string join;
+    bool row0 = false;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_tab != kRaces) return;
+        const std::vector<RaceRow> rr = race_rows(g_data, gt4::results::room());
+        if (g_sel <= 0 || g_sel >= static_cast<int>(rr.size())) row0 = true;
+        else join = rr[g_sel].join;
+        g_sel = 0;
+    }
+    const gt4::results::Room cur = gt4::results::room();
+    if (row0) {
+        if (cur.id.empty()) gt4::results::createRoom();
+        else gt4::results::leaveRoom();
+    } else if (join != cur.id) {
+        gt4::results::joinRoom(join);
+    }
+    g_dirty = true;
+    g_refresh = true;
+    g_wake.notify_all();
 }
 
 void setTab(int tab) {
