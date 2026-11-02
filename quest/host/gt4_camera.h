@@ -22,4 +22,8 @@ using FrameSink = void (*)(int64_t key, float tanX, float tanY, bool immersive);
 
 // Registers the probe hooks (the addresses must be in games/gt4/probes.txt).
 void install(HeadSource head, FrameSink frame);
+// Race scene detection: the counter grows with every race camera build (races and replays, not
+// menus). installed() is false when the hooks are not in this build (retail GT4 Online).
+bool installed();
+std::uint64_t sceneBuilds();
 } // namespace gt4::camera

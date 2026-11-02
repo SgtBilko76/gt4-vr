@@ -208,10 +208,11 @@ bool extract_assets(AAssetManager *assets, const fs::path &files) {
     return true;
 }
 
-// HD texture packs (owner 2026-11-02, private build): assets/textures/ holds PCSX2 replacement packs as
-// <serial>/replacements/...; textures-manifest.txt lists the files, textures-stamp.txt changes with them.
-// They are copied to files/textures once (several GB, streamed in 1 MB chunks) and again only when the
-// stamp changes, so an app update without new textures doesn't copy anything.
+// HD texture packs (owner 2026-11-02, private build): PCSX2 replacement packs (<serial>/replacements/...)
+// packed into assets/textures/bundle-NN.bin (an APK holds at most 65535 entries; the packs have ~90k
+// files). textures-manifest.txt: "bundle<TAB>offset<TAB>size<TAB>path" per file; textures-stamp.txt
+// changes with them. Copied out to files/textures once (several GB) and again only when the stamp changes,
+// so an app update without new textures doesn't copy anything.
 bool extract_textures(AAssetManager *assets, const fs::path &files) {
     const std::string stamp = read_asset(assets, "textures-stamp.txt");
     if (stamp.empty()) return false;
@@ -227,27 +228,45 @@ bool extract_textures(AAssetManager *assets, const fs::path &files) {
     fs::remove_all(dir, ec);
     const auto start = std::chrono::steady_clock::now();
     std::istringstream manifest(read_asset(assets, "textures-manifest.txt"));
-    std::vector<char> buf(1 << 20);
+    std::vector<char> buf;
     std::size_t count = 0, failed = 0;
     unsigned long long bytes = 0;
-    for (std::string rel; std::getline(manifest, rel);) {
-        if (rel.empty()) continue;
-        AAsset *a = AAssetManager_open(assets, ("textures/" + rel).c_str(), AASSET_MODE_STREAMING);
-        if (!a) {
+    int open_bundle = -1;
+    AAsset *bundle = nullptr;
+    for (std::string line; std::getline(manifest, line);) {
+        if (line.empty()) continue;
+        std::istringstream fields(line);
+        int b = -1;
+        long long offset = -1, size = -1;
+        fields >> b >> offset >> size;
+        std::string rel;
+        std::getline(fields >> std::ws, rel);
+        if (b < 0 || offset < 0 || size < 0 || rel.empty()) {
+            ++failed;
+            continue;
+        }
+        if (b != open_bundle) {
+            if (bundle) AAsset_close(bundle);
+            char name[64];
+            std::snprintf(name, sizeof name, "textures/bundle-%02d.bin", b);
+            bundle = AAssetManager_open(assets, name, AASSET_MODE_RANDOM);
+            open_bundle = b;
+        }
+        buf.resize(static_cast<std::size_t>(size));
+        if (!bundle || AAsset_seek64(bundle, offset, SEEK_SET) != offset ||
+            AAsset_read(bundle, buf.data(), buf.size()) != static_cast<int>(size)) {
             ++failed;
             continue;
         }
         const fs::path out = dir / rel;
         fs::create_directories(out.parent_path(), ec);
         std::ofstream o(out, std::ios::binary);
-        for (int n; (n = AAsset_read(a, buf.data(), buf.size())) > 0;) {
-            o.write(buf.data(), n);
-            bytes += static_cast<unsigned>(n);
-        }
-        AAsset_close(a);
+        o.write(buf.data(), static_cast<std::streamsize>(size));
+        bytes += static_cast<unsigned long long>(size);
         if (!o) ++failed;
         if (++count % 5000 == 0) logf("[quest] textures: %zu files copied ...", count);
     }
+    if (bundle) AAsset_close(bundle);
     if (failed) {
         logf("[quest] textures: %zu files failed (disk full?), will retry next start", failed);
         return false;

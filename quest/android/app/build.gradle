@@ -28,9 +28,9 @@ android {
         }
     }
 
-    // PNG/DDS are already compressed: stored as-is. The ASTC .ktx packs deflate well (flat blocks).
+    // Texture bundles (.bin) are stored, so the app can read each texture at its offset directly.
     androidResources {
-        noCompress 'png', 'dds'
+        noCompress 'png', 'dds', 'bin'
     }
 
     buildTypes {

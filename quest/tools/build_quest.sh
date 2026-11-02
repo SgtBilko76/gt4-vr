@@ -61,23 +61,33 @@ fi
 # HD texture packs (A-Spec II only, private build): TEXTURES=<dir> with <serial>/replacements/... (default
 # quest/assets/textures, symlinks allowed), staged as assets/textures + its own manifest/stamp; stamp =
 # file names + sizes, so the headset copies them again only when the packs change. TEXTURES=none skips.
+# An APK holds at most 65535 zip entries and the packs have ~90k files, so they go into a few bundle
+# files (assets/textures/bundle-NN.bin, <= 64 MB each: Gradle reads each asset whole): textures-manifest.txt lists
+# "bundle<TAB>offset<TAB>size<TAB>path" per file. Only .ktx/.png/.dds are packed.
 TEXTURES=${TEXTURES:-$ROOT/quest/assets/textures}
 if [ "$GAME" = gt4 ] && [ "$TEXTURES" != none ] && [ -d "$TEXTURES" ]; then
-  mkdir -p "$STAGE/assets"
-  cp -rL "$TEXTURES" "$STAGE/assets/textures"
-  python3 - "$STAGE/assets" <<'EOF'
-import hashlib, pathlib, sys
-assets = pathlib.Path(sys.argv[1]); root = assets / "textures"
-files = sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file())
-digest = hashlib.sha256()
-total = 0
+  mkdir -p "$STAGE/assets/textures"
+  python3 - "$TEXTURES" "$STAGE/assets" <<'EOF'
+import hashlib, os, pathlib, sys
+src = pathlib.Path(sys.argv[1]).resolve(); assets = pathlib.Path(sys.argv[2])
+files = sorted(p.relative_to(src).as_posix() for p in src.rglob("*")
+               if p.is_file() and p.suffix.lower() in (".ktx", ".png", ".dds"))
+digest = hashlib.sha256(); limit = 64 << 20
+lines, bundle, offset, out, total = [], 0, 0, None, 0
 for rel in files:
-    size = (root / rel).stat().st_size
-    total += size
-    digest.update(rel.encode() + b"\0" + str(size).encode() + b"\n")
-(assets / "textures-manifest.txt").write_text("\n".join(files) + "\n")
+    data = (src / rel).read_bytes()
+    if out is None or offset + len(data) > limit:
+        if out: out.close()
+        bundle += 0 if out is None else 1
+        out = open(assets / "textures" / f"bundle-{bundle:02d}.bin", "wb"); offset = 0
+    out.write(data)
+    lines.append(f"{bundle}\t{offset}\t{len(data)}\t{rel}")
+    digest.update(rel.encode() + b"\0" + str(len(data)).encode() + b"\n")
+    offset += len(data); total += len(data)
+out.close()
+(assets / "textures-manifest.txt").write_text("\n".join(lines) + "\n")
 (assets / "textures-stamp.txt").write_text(digest.hexdigest()[:16])
-print(f"textures: {len(files)} files, {total / 2**30:.2f} GB, stamp {digest.hexdigest()[:16]}")
+print(f"textures: {len(files)} files in {bundle + 1} bundles, {total / 2**30:.2f} GB, stamp {digest.hexdigest()[:16]}")
 EOF
 fi
 python3 - "$STAGE/assets/gt4vr" <<'EOF'

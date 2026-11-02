@@ -20,6 +20,8 @@
 //   0x1EB234: C = V. Turn it: C = R^T * V (R = head rotation in GT4's eye space).
 #include "gt4_camera.h"
 
+#include <atomic>
+
 #include "ps2/cpu.hpp"
 #include "ps2/generated.hpp"
 #include "ps2/guest_call.hpp"
@@ -45,6 +47,8 @@ bool g_immersive = false;
 float g_tanX = 0.0f, g_tanY = 0.0f;
 int g_log = 0;         // PS2_GT4_CAM_LOG: 1 = changes, 2 = matrices every 300 builds
 std::uint64_t g_builds = 0;
+std::atomic<std::uint64_t> g_scene_builds{0}; // race scene camera builds, read by the XR thread
+std::atomic<bool> g_installed{false};
 
 // Per-eye rendering test (Wipeout Rewrite VR's method: the 3D world drawn once per eye). The race
 // scene renderer 0x1EB0F8(a0, a1, a2, a3, t0, f12) is called from 0x1EA43C and 0x1EA900; its
@@ -87,6 +91,7 @@ void dump(const char *what, const ps2::Cpu &c)
 void after_projection(ps2::Cpu &c)
 {
     ++g_builds;
+    g_scene_builds.fetch_add(1, std::memory_order_relaxed);
     g_scene_seen = true;
     g_in_renderer = true;
     g_pose = g_head ? g_head() : Head{};
@@ -294,8 +299,12 @@ Head test_head()
 }
 } // namespace
 
+bool installed() { return g_installed.load(std::memory_order_relaxed); }
+std::uint64_t sceneBuilds() { return g_scene_builds.load(std::memory_order_relaxed); }
+
 void install(HeadSource head, FrameSink frame)
 {
+    g_installed = true;
     if (const char *l = std::getenv("PS2_GT4_CAM_LOG"))
         g_log = std::atoi(l);
     if (const char *s = std::getenv("PS2_GT4_CAM_SIGNS"); s && std::strlen(s) >= 3)

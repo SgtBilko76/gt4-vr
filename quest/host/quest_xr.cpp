@@ -15,6 +15,7 @@
 
 #include "quest_host.h"
 #include "rrv_pcsx2_gs_bridge.h"
+#include "gt4_camera.h"
 #include "online_panel.h"
 
 #include <EGL/egl.h>
@@ -1225,7 +1226,26 @@ private:
             }
             m_stereo_applied = false;
         }
-        const bool stereo = ReadFloatProperty("debug.gt4vr.stereo", 1.0f) != 0.0f;
+        // Depth stereo only while GT4's race scene renders (owner 2026-11-02): in menus the depth
+        // buffer holds stale race depth in parts of the picture, so one half came out shifted
+        // sideways (GT Mode map). Race = race camera builds within the last ~1 s (this runs every
+        // 30 XR frames). debug.gt4vr.stereomenu 1 = stereo everywhere as before.
+        const std::uint64_t builds = gt4::camera::sceneBuilds();
+        if (builds != m_scene_builds)
+        {
+            m_scene_builds = builds;
+            m_scene_idle_checks = 0;
+        }
+        else if (m_scene_idle_checks < 1000)
+            ++m_scene_idle_checks;
+        const bool race_scene = !gt4::camera::installed() || m_scene_idle_checks < 3 ||
+                                ReadFloatProperty("debug.gt4vr.stereomenu", 0.0f) != 0.0f;
+        const bool stereo = ReadFloatProperty("debug.gt4vr.stereo", 1.0f) != 0.0f && race_scene;
+        if (race_scene != m_race_scene)
+        {
+            m_race_scene = race_scene;
+            XR_LOG("stereo: %s", race_scene ? "race scene - depth on" : "menu - flat");
+        }
         const float sep = stereo ? ReadFloatProperty("debug.gt4vr.sep", kStereoSeparation) : 0.0f;
         const float conv = ReadFloatProperty("debug.gt4vr.conv", kStereoConvergence);
         const float show_depth = ReadFloatProperty("debug.gt4vr.showdepth", 0.0f);
@@ -1774,6 +1794,9 @@ private:
     SetStereoFn m_set_stereo = nullptr;
     SetStereoOptionsFn m_set_stereo_options = nullptr;
     bool m_stereo_unavailable = false, m_stereo_applied = false, m_stereo_on = true;
+    std::uint64_t m_scene_builds = 0;  // gt4::camera::sceneBuilds() at the last stereo check
+    int m_scene_idle_checks = 1000;    // stereo checks since the race scene last rendered
+    bool m_race_scene = false;
     float m_stereo_sep = kStereoSeparation, m_stereo_conv = kStereoConvergence, m_stereo_show_depth = 0.0f;
 
     XrSwapchain m_screen_swapchain = XR_NULL_HANDLE;
