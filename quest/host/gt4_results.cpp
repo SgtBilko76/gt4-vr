@@ -345,6 +345,27 @@ constexpr Probe kProbes[] = {
 
 }
 
+void current(std::string &player, std::string &track, std::string &car) {
+    // Read from another thread while the game runs: rdstr() only accepts clean printable strings.
+    player.clear(), track.clear(), car.clear();
+    const std::uint32_t spec = rd32(kRaceSpecPtr);
+    if (!spec) return;
+    player = rdstr(spec + 0x350, 32);
+    const std::string course = rdstr(spec + 0x04, 64);
+    if (!course.empty()) track = course_name(course);
+    const std::uint32_t n = rd32(spec + 0xC4);
+    for (std::uint32_t i = 0; i < n && i < 32; ++i) {
+        const std::uint32_t e = spec + 0xC8 + i * 0x68;
+        if (rd32(e + 0x04) == 1) {
+            const std::string label = rdstr(e + 0x18, 64);
+            if (!label.empty()) car = car_name(label);
+            break;
+        }
+    }
+    if (player.empty())
+        if (const char *p = std::getenv("PS2_PLAYER_NAME")) player = p;
+}
+
 void install() {
     if (const char *v = std::getenv("PS2_GT4_LAPLOG")) g_log = std::atoi(v);
     if (const char *v = std::getenv("PS2_GT4_RESULTS_CAR")) g_force_car = std::atoi(v);

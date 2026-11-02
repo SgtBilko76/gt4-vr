@@ -15,8 +15,10 @@
 
 #include "quest_host.h"
 #include "rrv_pcsx2_gs_bridge.h"
+#include "online_panel.h"
 
 #include <EGL/egl.h>
+#include <GLES3/gl3.h>
 #include <android/log.h>
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
@@ -250,12 +252,47 @@ public:
         if (in.leftStickClick && in.rightStickClick && !m_stickCombo)
         {
             m_stickCombo = true;
-            if (g_vr_allowed.load(std::memory_order_relaxed))
+            // GT4 Online: the online menu (owner 2026-11-02). The VR view switch only when VR mode
+            // is allowed again (debug.gt4vr.vrallow) or the build has no online menu.
+            if (g_vr_allowed.load(std::memory_order_relaxed) || !gt4::panel::available())
                 gt4::quest::setCurvedView(!gt4::quest::curvedView());
+            else
+                gt4::panel::toggle();
         }
         else if (!in.leftStickClick && !in.rightStickClick)
         {
             m_stickCombo = false;
+        }
+
+        // Online menu open: the right stick picks the tab (left/right) and scrolls (up/down), B closes
+        // it, and the game gets a released pad (pause GT4 first if a race is running).
+        const bool panel_b = in.b && !m_panelB;
+        m_panelB = in.b;
+        if (gt4::panel::isOpen())
+        {
+            const int dx = (right && !m_panelDir[3]) - (left && !m_panelDir[2]);
+            const int dy = (down && !m_panelDir[1]) - (up && !m_panelDir[0]);
+            if (dx || dy)
+                gt4::panel::input(dx, dy);
+            if (panel_b)
+                gt4::panel::setOpen(false);
+            m_panelDir[0] = up, m_panelDir[1] = down, m_panelDir[2] = left, m_panelDir[3] = right;
+            m_panelHeld = true;
+            gt4::quest::Pad idle;
+            idle.connected = true;
+            return idle;
+        }
+        // After closing: keep the pad released until B and the stick are let go, so the closing
+        // press doesn't reach the game.
+        if (m_panelHeld)
+        {
+            if (in.b || up || down || left || right)
+            {
+                gt4::quest::Pad idle;
+                idle.connected = true;
+                return idle;
+            }
+            m_panelHeld = false;
         }
 
         gt4::quest::Pad pad;
@@ -292,6 +329,8 @@ private:
     bool m_rt = false, m_lt = false, m_lg = false, m_rg = false;
     bool m_stickCombo = false;
     bool m_rs[4] = {};
+    bool m_panelB = false, m_panelHeld = false;
+    bool m_panelDir[4] = {};
 };
 
 struct HeadSample
@@ -638,6 +677,8 @@ private:
             ANativeWindow_release(m_screen_window);
         if (m_screen_swapchain != XR_NULL_HANDLE)
             xrDestroySwapchain(m_screen_swapchain);
+        if (m_panel_swapchain != XR_NULL_HANDLE)
+            xrDestroySwapchain(m_panel_swapchain);
         if (m_local_space != XR_NULL_HANDLE)
             xrDestroySpace(m_local_space);
         if (m_view_space != XR_NULL_HANDLE)
@@ -800,6 +841,16 @@ private:
             m_vr_prop = vr_prop;
             if (vr_prop == 0 || vr_prop == 1)
                 gt4::quest::setCurvedView(vr_prop == 0);
+        }
+        // Headless testing: debug.gt4vr.panel 1 / 0 opens / closes the online menu, 2..5 picks tab 1..4.
+        const int panel_prop = static_cast<int>(ReadFloatProperty("debug.gt4vr.panel", -1.0f));
+        if (panel_prop != m_panel_prop)
+        {
+            m_panel_prop = panel_prop;
+            if (panel_prop >= 0)
+                gt4::panel::setOpen(panel_prop != 0);
+            if (panel_prop >= 2)
+                gt4::panel::setTab(panel_prop - 2);
         }
         const bool vr_allowed = ReadFloatProperty("debug.gt4vr.vrallow", kVrModeAllowed ? 1.0f : 0.0f) != 0.0f;
         g_vr_allowed.store(vr_allowed, std::memory_order_relaxed);
@@ -1243,7 +1294,8 @@ private:
         // top row first like any Android window, so flip it in the compositor.
         XrCompositionLayerImageLayoutFB image_layout{XR_TYPE_COMPOSITION_LAYER_IMAGE_LAYOUT_FB};
         image_layout.flags = XR_COMPOSITION_LAYER_IMAGE_LAYOUT_VERTICAL_FLIP_BIT_FB;
-        const XrCompositionLayerBaseHeader *layers[3] = {};
+        const XrCompositionLayerBaseHeader *layers[4] = {};
+        XrCompositionLayerQuad panel_quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
         XrCompositionLayerQuad hud_quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
         XrCompositionLayerProjectionView proj_views[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
                                                           {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
@@ -1374,12 +1426,133 @@ private:
                 }
             }
         }
+        // GT4 Online's online menu: its own quad in front of everything, where the head looked when
+        // it was opened.
+        if (frame_state.shouldRender && UpdatePanel(frame_state.predictedDisplayTime))
+        {
+            panel_quad.space = m_local_space;
+            panel_quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            panel_quad.subImage.swapchain = m_panel_swapchain;
+            panel_quad.subImage.imageRect.extent = {gt4::panel::kWidth, gt4::panel::kHeight};
+            panel_quad.pose = m_panel_pose;
+            panel_quad.size = {kPanelWidthM, kPanelWidthM * gt4::panel::kHeight / gt4::panel::kWidth};
+            layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&panel_quad);
+        }
         XrFrameEndInfo end_info{XR_TYPE_FRAME_END_INFO};
         end_info.displayTime = frame_state.predictedDisplayTime;
         end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
         end_info.layerCount = layer_count;
         end_info.layers = layer_count ? layers : nullptr;
         xrEndFrame(m_session, &end_info);
+    }
+
+    // ---- online menu (online_panel.h)
+    static constexpr float kPanelWidthM = 1.1f;     // 1.1 m wide ...
+    static constexpr float kPanelDistanceM = 1.25f; // ... at 1.25 m: about 47 degrees
+    static constexpr float kPanelBelowEyeM = 0.08f;
+
+    // Returns true when the panel layer is to be shown this frame.
+    bool UpdatePanel(XrTime time)
+    {
+        const bool open = gt4::panel::isOpen();
+        if (!open)
+        {
+            m_panel_shown = false;
+            return false;
+        }
+        if (m_panel_swapchain == XR_NULL_HANDLE && !m_panel_failed && !CreatePanelSwapchain())
+        {
+            m_panel_failed = true;
+            gt4::panel::setOpen(false);
+            return false;
+        }
+        if (m_panel_failed)
+            return false;
+        if (!m_panel_shown)
+        {
+            // Opened: in front of the head, upright, turned towards it (yaw only).
+            XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+            if (XR_FAILED(xrLocateSpace(m_view_space, m_local_space, time, &location)) ||
+                !(location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT))
+                return false;
+            const XrQuaternionf &q = location.pose.orientation;
+            const float fx = -2.0f * (q.x * q.z + q.w * q.y);
+            const float fz = -(1.0f - 2.0f * (q.x * q.x + q.y * q.y));
+            const float yaw = std::atan2(-fx, -fz);
+            const XrVector3f &head = location.pose.position;
+            m_panel_pose.orientation = {0.0f, std::sin(yaw * 0.5f), 0.0f, std::cos(yaw * 0.5f)};
+            m_panel_pose.position = {head.x - std::sin(yaw) * kPanelDistanceM, head.y - kPanelBelowEyeM,
+                                     head.z - std::cos(yaw) * kPanelDistanceM};
+            m_panel_shown = true;
+        }
+        if (gt4::panel::render(m_panel_pixels))
+        {
+            // The compositor samples GL-style (first row = bottom): upload the rows bottom-up.
+            const size_t row = static_cast<size_t>(gt4::panel::kWidth) * 4;
+            m_panel_flipped.resize(m_panel_pixels.size());
+            for (int y = 0; y < gt4::panel::kHeight; ++y)
+                std::memcpy(&m_panel_flipped[(gt4::panel::kHeight - 1 - y) * row], &m_panel_pixels[y * row], row);
+            uint32_t index = 0;
+            XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+            XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+            wait.timeout = XR_INFINITE_DURATION;
+            if (XR_SUCCEEDED(xrAcquireSwapchainImage(m_panel_swapchain, &acquire, &index)) &&
+                XR_SUCCEEDED(xrWaitSwapchainImage(m_panel_swapchain, &wait)))
+            {
+                glBindTexture(GL_TEXTURE_2D, m_panel_images[index].image);
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, gt4::panel::kWidth, gt4::panel::kHeight, GL_RGBA, GL_UNSIGNED_BYTE,
+                                m_panel_flipped.data());
+                glBindTexture(GL_TEXTURE_2D, 0);
+                glFlush();
+                XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                xrReleaseSwapchainImage(m_panel_swapchain, &release);
+                m_panel_uploaded = true;
+            }
+        }
+        return m_panel_uploaded;
+    }
+
+    bool CreatePanelSwapchain()
+    {
+        uint32_t count = 0;
+        xrEnumerateSwapchainFormats(m_session, 0, &count, nullptr);
+        std::vector<int64_t> formats(count);
+        xrEnumerateSwapchainFormats(m_session, count, &count, formats.data());
+        // sRGB: the panel's colours are sRGB values and the compositor shows them as such.
+        int64_t format = 0;
+        for (int64_t want : {static_cast<int64_t>(GL_SRGB8_ALPHA8), static_cast<int64_t>(GL_RGBA8)})
+            if (!format && std::find(formats.begin(), formats.end(), want) != formats.end())
+                format = want;
+        if (!format)
+        {
+            XR_ERR("online menu: no RGBA8 swapchain format");
+            return false;
+        }
+        XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+        info.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+        info.format = format;
+        info.sampleCount = 1;
+        info.width = gt4::panel::kWidth;
+        info.height = gt4::panel::kHeight;
+        info.faceCount = 1;
+        info.arraySize = 1;
+        info.mipCount = 1;
+        const XrResult res = xrCreateSwapchain(m_session, &info, &m_panel_swapchain);
+        if (XR_FAILED(res))
+        {
+            XR_ERR("online menu: xrCreateSwapchain failed (%d)", static_cast<int>(res));
+            m_panel_swapchain = XR_NULL_HANDLE;
+            return false;
+        }
+        uint32_t images = 0;
+        xrEnumerateSwapchainImages(m_panel_swapchain, 0, &images, nullptr);
+        m_panel_images.assign(images, {XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR});
+        xrEnumerateSwapchainImages(m_panel_swapchain, images, &images,
+                                   reinterpret_cast<XrSwapchainImageBaseHeader *>(m_panel_images.data()));
+        XR_LOG("online menu: swapchain %dx%d, format 0x%llx, %u images", gt4::panel::kWidth, gt4::panel::kHeight,
+               static_cast<unsigned long long>(format), images);
+        return true;
     }
 
     // Straight ahead of the head at eye height, upright (yaw only).
@@ -1583,6 +1756,12 @@ private:
     bool m_head_tracked = false;
     int m_head_log_countdown = 0;
     uint32_t m_debug_buttons = 0;
+    XrSwapchain m_panel_swapchain = XR_NULL_HANDLE;
+    std::vector<XrSwapchainImageOpenGLESKHR> m_panel_images;
+    std::vector<uint8_t> m_panel_pixels, m_panel_flipped;
+    XrPosef m_panel_pose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.25f}};
+    bool m_panel_shown = false, m_panel_uploaded = false, m_panel_failed = false;
+    int m_panel_prop = -1;
     float m_fake_yaw_deg = 0.0f, m_fake_pitch_deg = 0.0f, m_fake_roll_deg = 0.0f;
     float m_menu_req = 0.0f;
     bool m_menu_req_init = false;

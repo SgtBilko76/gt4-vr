@@ -47,6 +47,7 @@ void register_generated_code();
 
 #include "gt4_camera.h"
 #include "gt4_results.h"
+#include "online_panel.h"
 #include <sys/system_properties.h>
 
 namespace
@@ -560,6 +561,14 @@ bool start_game(const fs::path &files) {
         setenv("PS2_RESULTS_SERVER", "217.154.211.69:27314", 0);
         setenv("PS2_RESULTS_LOG", (kDataDir + "/laps.txt").c_str(), 0);
         gt4::results::install();
+        // The online menu (both stick clicks): leaderboard data from the same server.
+        const char *server = std::getenv("PS2_RESULTS_SERVER");
+        if (server && std::strcmp(server, "off") != 0)
+            gt4::panel::start(server, (files / "resources" / "fonts" / "Roboto-Regular.ttf").string(), [] {
+                gt4::panel::Context c;
+                gt4::results::current(c.player, c.track, c.car);
+                return c;
+            });
     }
     ps2::gs::bridge::set_field_tags(gt4::quest::takeBuiltKey, gt4::quest::notePresentedKey);
 

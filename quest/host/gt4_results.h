@@ -11,9 +11,15 @@
 //   PS2_PLAYER_NAME     player name if the GT4 save name can't be read
 //   PS2_GT4_LAPLOG=1    log every line crossing of every car
 //   PS2_GT4_RESULTS_CAR=n  treat car n as the player's (PC tests with an AI car)
+#include <string>
+
 namespace gt4::results {
 
 // Installs the probe hooks. The probe addresses must be compiled in (games/gt4r/probes.txt).
 void install();
+
+// What the game has set up right now (read from its race setup; empty in menus without a race):
+// the GT4 save name, the track and car display names.
+void current(std::string &player, std::string &track, std::string &car);
 
 }
