@@ -184,7 +184,21 @@ void relink_hle_imports() {
                     continue;
                 }
                 if ((w0 >> 26) != kHleOpcode || (w1 & 0xFFFF0000u) != 0x24000000u) break;
-                set_ram32(stub, (kHleOpcode << 26) | hle_id_for(library, w1 & 0xFFFFu));
+                const std::uint32_t index = w1 & 0xFFFFu;
+                // An HLE stub into a guest library is a wrapper (tracing, inet receive retry): wrap it
+                // again, or link it straight to the library when no wrapper applies any more.
+                const auto guest = g_libraries.find(library);
+                if (guest != g_libraries.end()) {
+                    if (const std::uint32_t wrapper = wrap_import(library, index)) {
+                        set_ram32(stub, (kHleOpcode << 26) | wrapper);
+                    } else {
+                        const std::uint32_t target = ram32(guest->second + 20 + index * 4);
+                        set_ram32(stub, 0x08000000u | ((target >> 2) & 0x03FFFFFFu));
+                        set_ram32(stub + 4, 0);
+                    }
+                    continue;
+                }
+                set_ram32(stub, (kHleOpcode << 26) | hle_id_for(library, index));
             }
         }
     }
