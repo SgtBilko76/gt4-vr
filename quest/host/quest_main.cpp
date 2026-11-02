@@ -479,6 +479,40 @@ bool start_game(const fs::path &files) {
     if (const fs::path seed = files / "pipelines" / "rrv_tfx_pipelines.bin"; fs::exists(seed))
         setenv("RRV_PIPELINE_SEED", seed.c_str(), 0);
     fs::create_directories(files / "pcsx2-data");
+    // Compiled shaders (owner 2026-11-02: a new player's game should run fast from the start). PCSX2
+    // keeps the SPIR-V cache (vulkan_shaders.idx/.bin) and the GPU driver's pipeline cache
+    // (vulkan_pipelines.bin) in pcsx2-data/ARMSX2/cache, all three checked against the driver
+    // (vendor, device, pipelineCacheUUID): on another driver PCSX2 discards them and compiles as before.
+    // Seed: a fresh install (no shader index yet) gets the copy shipped in the APK (files/shader-cache).
+    // Export: otherwise the cache (complete here: the GS isn't open yet) is mirrored to
+    // <data dir>/shader-cache for quest/tools/quest_pull_pipelines.sh.
+    {
+        const fs::path cache = files / "pcsx2-data" / "ARMSX2" / "cache";
+        const fs::path seed = files / "shader-cache";
+        const fs::path out = fs::path(kDataDir) / "shader-cache";
+        static const char *const kNames[] = {"vulkan_shaders.idx", "vulkan_shaders.bin", "vulkan_pipelines.bin"};
+        std::error_code ec;
+        fs::create_directories(cache, ec);
+        const auto size = [&ec](const fs::path &p) { return fs::exists(p, ec) ? fs::file_size(p, ec) : 0; };
+        if (!fs::exists(cache / kNames[0], ec) && fs::exists(seed / kNames[0], ec)) {
+            std::uintmax_t bytes = 0;
+            for (const char *n : kNames) {
+                fs::copy_file(seed / n, cache / n, fs::copy_options::overwrite_existing, ec);
+                bytes += size(cache / n);
+            }
+            logf("[quest] shader cache seeded from the APK (%ju KB)", bytes / 1024);
+        } else if (fs::exists(cache / kNames[0], ec)) {
+            bool same = true;
+            for (const char *n : kNames) same = same && size(cache / n) == size(out / n);
+            if (!same) {
+                fs::create_directories(out, ec);
+                for (const char *n : kNames)
+                    if (fs::exists(cache / n, ec)) fs::copy_file(cache / n, out / n, fs::copy_options::overwrite_existing, ec);
+                logf("[quest] shader cache exported to %s (shaders %ju KB, pipelines %ju KB)", out.c_str(),
+                     size(out / kNames[1]) / 1024, size(out / kNames[2]) / 1024);
+            }
+        }
+    }
 
     ps2::g_options.disc_path = disc;
     ps2::g_options.memcard_path = card;

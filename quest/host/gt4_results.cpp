@@ -33,6 +33,7 @@
 #include <ctime>
 #include <deque>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 
@@ -230,6 +231,11 @@ int g_log = 0;
 std::uint64_t g_race_no = 0;
 std::string g_race_id;
 std::uint32_t g_last_lap = 0, g_last_ms = 0;
+// Laps already reported this session (track|car|lap|ms). GT4's replay after a race runs the race
+// again through the same conductor, so its laps arrive a second time with identical times (seen
+// 2026-11-02: New York lap 1 2'02.804 reported again at the replay); two real laps never match
+// to the millisecond.
+std::set<std::string> g_reported;
 std::chrono::steady_clock::time_point g_last_status{};
 
 std::string new_race_id() {
@@ -278,6 +284,10 @@ void on_lap(ps2::Cpu &c) {
     if (lap == g_last_lap && ms == g_last_ms) return;  // a mode's override and the base both ran
     g_last_lap = lap;
     g_last_ms = ms;
+    if (!g_reported.insert(r.course_label + "|" + r.car_label + "|" + std::to_string(lap) + "|" + std::to_string(ms)).second) {
+        std::fprintf(stderr, "[results] lap %u (%u ms) seen before: replay, not reported\n", lap, ms);
+        return;
+    }
     if (g_race_id.empty()) g_race_id = new_race_id();
     std::fprintf(stderr, "[results] lap %u: %u'%02u.%03u  %s, %s, %s, %s\n", lap, ms / 60000, ms / 1000 % 60, ms % 1000,
                  r.mode.c_str(), course_name(r.course_label).c_str(), car_name(r.car_label).c_str(), r.player.c_str());
@@ -293,6 +303,7 @@ void on_lap(ps2::Cpu &c) {
         std::fprintf(stderr, "[results] lap not sent: track/car unknown in this mode (%s)\n", r.mode.c_str());
         return;
     }
+
     enqueue("{" + base_fields(r) + ",\"type\":\"lap\",\"lap\":" + std::to_string(lap) + ",\"time_ms\":" +
                 std::to_string(ms) + ",\"race\":" + json_str(g_race_id) + "}",
             true);

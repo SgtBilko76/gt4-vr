@@ -52,6 +52,11 @@ if [ -f "$ROOT/quest/assets/rrv_tfx_pipelines.bin" ]; then
   mkdir -p "$STAGE/assets/gt4vr/pipelines"
   cp "$ROOT/quest/assets/rrv_tfx_pipelines.bin" "$STAGE/assets/gt4vr/pipelines/"
 fi
+# Compiled shader seed (same tool): PCSX2's SPIR-V + driver pipeline cache for a fresh install.
+if [ -f "$ROOT/quest/assets/shader-cache/vulkan_shaders.idx" ]; then
+  mkdir -p "$STAGE/assets/gt4vr/shader-cache"
+  cp "$ROOT"/quest/assets/shader-cache/vulkan_* "$STAGE/assets/gt4vr/shader-cache/"
+fi
 python3 - "$STAGE/assets/gt4vr" <<'EOF'
 import hashlib, pathlib, sys
 root = pathlib.Path(sys.argv[1])
