@@ -1,5 +1,6 @@
 #ifdef PS2_GT4_CAMERA
 #include "../quest/host/gt4_camera.h"
+#include "../quest/host/gt4_results.h"
 #endif
 #include "ps2/system.hpp"
 
@@ -121,6 +122,7 @@ int main(int argc, char **argv) {
     }
 #ifdef PS2_GT4_CAMERA
     gt4::camera::install(nullptr, nullptr); // ps2run: test pose from PS2_GT4_TEST_* only
+    gt4::results::install();                // GT4 Online lap results (retail build probes)
 #endif
     const auto emulate = [&]() -> int {
         std::uint32_t entry = 0;
