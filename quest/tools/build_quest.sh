@@ -4,7 +4,7 @@
 #
 # usage: quest/tools/build_quest.sh [--no-apk]
 #   GAME=gt4|gt4r gt4 = A-Spec II (online.portroyale.gt4vr, /sdcard/GT4VR, default),
-#                 gt4r = retail USA v2.00 with LAN play (online.portroyale.gt4lan, /sdcard/GT4LAN)
+#                 gt4r = retail USA v2.00 with LAN play (online.portroyale.gt4online "GT4 Online", /sdcard/GT4Online)
 #   JOBS=N        parallel compile jobs (default 4: generated units take ~1 GB each)
 #   BRIDGE_BUILD  PCSX2 GS bridge build dir (default: the Ridge Racer V port's Android bridge)
 #
@@ -16,9 +16,9 @@ SDK_CMAKE=$(ls -d "$HOME"/workspace/android-sdk/cmake/*/bin | tail -1)
 GAME=${GAME:-gt4}
 case "$GAME" in
   gt4)  variant=(); APP_ID=online.portroyale.gt4vr; APP_LABEL="GT4 VR" ;;
-  gt4r) variant=(-DGT4VR_DATA_DIR=/sdcard/GT4LAN -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="Gran Turismo 4 LAN VR"
+  gt4r) variant=(-DGT4VR_DATA_DIR=/sdcard/GT4Online -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="GT4 Online"
                  -DGT4VR_NET_PRODUCT=SCUS97328 -DGT4VR_CAMERA_HOOKS=OFF)
-        APP_ID=online.portroyale.gt4lan; APP_LABEL="GT4 LAN VR" ;;
+        APP_ID=online.portroyale.gt4online; APP_LABEL="GT4 Online" ;;
   *) echo "unknown GAME=$GAME" >&2; exit 2 ;;
 esac
 BUILD="$ROOT/build/android-$GAME"

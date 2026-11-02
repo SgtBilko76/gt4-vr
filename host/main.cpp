@@ -10,10 +10,12 @@
 #include "profile.hpp"
 #endif
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 void register_generated_code();
@@ -93,6 +95,30 @@ int main(int argc, char **argv) {
 #endif
     register_generated_code();
     register_generated_vu();
+    // PS2_PACE_FPS=60: hold the game at real time, as the Quest's audio clock does (two-player LAN
+    // tests: GT4 keeps both consoles in step, so an unpaced copy only waits for its partner).
+    // Every 5 s it prints the speed reached ([pace] N fps, behind = frames it could not keep up).
+    if (const char *pace = std::getenv("PS2_PACE_FPS"); pace && std::atof(pace) > 0) {
+        const double fps = std::atof(pace);
+        auto previous = ps2::g_options.on_vblank;
+        ps2::g_options.on_vblank = [previous, fps] {
+            using clock = std::chrono::steady_clock;
+            static clock::time_point next = clock::now(), report = clock::now();
+            static unsigned frames = 0, behind = 0;
+            if (previous) previous();
+            next += std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(1.0 / fps));
+            const auto now = clock::now();
+            if (now < next) std::this_thread::sleep_until(next);
+            else if (now - next > std::chrono::milliseconds(100)) { next = now; ++behind; }
+            ++frames;
+            if (now - report >= std::chrono::seconds(5)) {
+                std::fprintf(stderr, "[pace] %.1f fps (target %.0f), behind %u\n",
+                             frames / std::chrono::duration<double>(now - report).count(), fps, behind);
+                report = now;
+                frames = behind = 0;
+            }
+        };
+    }
 #ifdef PS2_GT4_CAMERA
     gt4::camera::install(nullptr, nullptr); // ps2run: test pose from PS2_GT4_TEST_* only
 #endif

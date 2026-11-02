@@ -92,7 +92,7 @@ namespace fs = std::filesystem;
 #define GT4VR_CAMERA_HOOKS 1
 #endif
 // The build's variant (CMakeLists.txt GT4VR_*): A-Spec II = /sdcard/GT4VR, retail v2.00 with LAN
-// play = /sdcard/GT4LAN.
+// play ("GT4 Online") = /sdcard/GT4Online.
 const std::string kDataDir = GT4VR_DATA_DIR;
 const std::string kOldDataDir = GT4VR_OLD_DATA_DIR;
 
