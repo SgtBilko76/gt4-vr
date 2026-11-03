@@ -718,9 +718,15 @@ void android_main(android_app *app) {
     // lifecycle (native_app_glue blocks onResume until APP_CMD_RESUME is processed here).
     AAssetManager *assets = app->activity->assetManager;
     std::thread([files, assets] {
-        // A-Spec II: the HD texture packs from the APK, on this thread: the first copy takes minutes and
-        // must not block the looper (config.txt RRV_PCSX2_GS_TEXTURE_DIR=off turns them off).
-        if (std::strcmp(GT4VR_NET_PRODUCT, "SCUS97436") == 0 && extract_textures(assets, files)) {
+        // HD texture packs from the APK, on this thread: the first copy takes a while and must not block
+        // the looper. config.txt RRV_PCSX2_GS_TEXTURE_DIR=off turns them off (nothing copied or loaded).
+        // The serial is only the packs' folder name in the APK (SCUS-97436/replacements); the textures
+        // are matched by hash, the same in Spec II and the retail disc.
+        const char *tex = std::getenv("RRV_PCSX2_GS_TEXTURE_DIR");
+        if (tex && std::strcmp(tex, "off") == 0) {
+            unsetenv("RRV_PCSX2_GS_TEXTURE_DIR");
+            logf("[quest] textures: off (config.txt)");
+        } else if (extract_textures(assets, files)) {
             setenv("RRV_PCSX2_GS_TEXTURE_DIR", (files / "textures").c_str(), 0);
             setenv("RRV_PCSX2_GS_TEXTURE_SERIAL", "SCUS-97436", 0);
         }

@@ -17,9 +17,14 @@ SDK_CMAKE=$(ls -d "$HOME"/workspace/android-sdk/cmake/*/bin | tail -1)
 GAME=${GAME:-gt4}
 case "$GAME" in
   gt4)  variant=(-DGT4VR_ONLINE=OFF); APP_ID=online.portroyale.gt4vr; APP_LABEL="GT4 Spec II HD 3D" ;;
-  gt4r) variant=(-DGT4VR_DATA_DIR=/sdcard/GT4Online -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="GT4 Online"
+  # Retail USA v2.00 (owner 2026-11-02: online stopped; same HD textures / 3D as Spec II, private).
+  # The old LAN app (online.portroyale.gt4online, -DGT4VR_ONLINE=ON) is GAME=gt4online.
+  gt4r) variant=(-DGT4VR_DATA_DIR=/sdcard/GT4HD -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="GT4 HD 3D"
+                 -DGT4VR_NET_PRODUCT=SCUS97328 -DGT4VR_CAMERA_HOOKS=OFF -DGT4VR_ONLINE=OFF)
+        APP_ID=online.portroyale.gt4hd; APP_LABEL="GT4 HD 3D" ;;
+  gt4online) variant=(-DGT4VR_DATA_DIR=/sdcard/GT4Online -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="GT4 Online"
                  -DGT4VR_NET_PRODUCT=SCUS97328 -DGT4VR_CAMERA_HOOKS=OFF -DGT4VR_ONLINE=ON)
-        APP_ID=online.portroyale.gt4online; APP_LABEL="GT4 Online" ;;
+        APP_ID=online.portroyale.gt4online; APP_LABEL="GT4 Online"; GAME=gt4r ;;
   *) echo "unknown GAME=$GAME" >&2; exit 2 ;;
 esac
 BUILD="$ROOT/build/android-$GAME"
@@ -65,7 +70,7 @@ fi
 # files (assets/textures/bundle-NN.bin, <= 64 MB each: Gradle reads each asset whole): textures-manifest.txt lists
 # "bundle<TAB>offset<TAB>size<TAB>path" per file. Only .ktx/.png/.dds are packed.
 TEXTURES=${TEXTURES:-$ROOT/quest/assets/textures}
-if [ "$GAME" = gt4 ] && [ "$TEXTURES" != none ] && [ -d "$TEXTURES" ]; then
+if [ "$TEXTURES" != none ] && [ -d "$TEXTURES" ]; then
   mkdir -p "$STAGE/assets/textures"
   python3 - "$TEXTURES" "$STAGE/assets" <<'EOF'
 import hashlib, os, pathlib, sys
