@@ -73,7 +73,7 @@ inline void fpu_compare(Cpu &c, bool condition) {
 }
 
 inline void fpu_div(Cpu &c, unsigned fd, std::uint32_t a, std::uint32_t b) {
-    const fp::Result r = fp::div(a, b);
+    const fp::Result r = fp::fpu_div(a, b);  // PS2 hardware divider (fpu.hpp)
     c.f[fd] = r.value;
     if (r.invalid) c.fcr31 |= 0x30000u;
 }

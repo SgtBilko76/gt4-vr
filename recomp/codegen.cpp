@@ -631,7 +631,7 @@ private:
         case Ctc1: line(std::format("ctc1(c, {}u, {});", i.fs(), w(rt))); break;
         case AddS: line(std::format("{} = fp::add({}, {});", f(i.fd()), f(i.fs()), f(i.ft()))); break;
         case SubS: line(std::format("{} = fp::sub({}, {});", f(i.fd()), f(i.fs()), f(i.ft()))); break;
-        case MulS: line(std::format("{} = fp::mul({}, {});", f(i.fd()), f(i.fs()), f(i.ft()))); break;
+        case MulS: line(std::format("{} = fp::fpu_mul({}, {});", f(i.fd()), f(i.fs()), f(i.ft()))); break;
         case DivS: line(std::format("fpu_div(c, {}u, {}, {});", i.fd(), f(i.fs()), f(i.ft()))); break;
         case SqrtS: line(std::format("{} = fp::sqrt({});", f(i.fd()), f(i.ft()))); break;
         case AbsS: line(std::format("{} = {} & fp::kAbs;", f(i.fd()), f(i.fs()))); break;
@@ -640,11 +640,11 @@ private:
         case RsqrtS: line(std::format("fpu_rsqrt(c, {}u, {}, {});", i.fd(), f(i.fs()), f(i.ft()))); break;
         case AddaS: line(std::format("c.facc = fp::add({}, {});", f(i.fs()), f(i.ft()))); break;
         case SubaS: line(std::format("c.facc = fp::sub({}, {});", f(i.fs()), f(i.ft()))); break;
-        case MulaS: line(std::format("c.facc = fp::mul({}, {});", f(i.fs()), f(i.ft()))); break;
-        case MaddS: line(std::format("{} = fp::add(c.facc, fp::mul({}, {}));", f(i.fd()), f(i.fs()), f(i.ft()))); break;
-        case MsubS: line(std::format("{} = fp::sub(c.facc, fp::mul({}, {}));", f(i.fd()), f(i.fs()), f(i.ft()))); break;
-        case MaddaS: line(std::format("c.facc = fp::add(c.facc, fp::mul({}, {}));", f(i.fs()), f(i.ft()))); break;
-        case MsubaS: line(std::format("c.facc = fp::sub(c.facc, fp::mul({}, {}));", f(i.fs()), f(i.ft()))); break;
+        case MulaS: line(std::format("c.facc = fp::fpu_mul({}, {});", f(i.fs()), f(i.ft()))); break;
+        case MaddS: line(std::format("{} = fp::add(c.facc, fp::fpu_mul({}, {}));", f(i.fd()), f(i.fs()), f(i.ft()))); break;
+        case MsubS: line(std::format("{} = fp::sub(c.facc, fp::fpu_mul({}, {}));", f(i.fd()), f(i.fs()), f(i.ft()))); break;
+        case MaddaS: line(std::format("c.facc = fp::add(c.facc, fp::fpu_mul({}, {}));", f(i.fs()), f(i.ft()))); break;
+        case MsubaS: line(std::format("c.facc = fp::sub(c.facc, fp::fpu_mul({}, {}));", f(i.fs()), f(i.ft()))); break;
         case CvtWS: line(std::format("{} = fp::cvt_w_s({});", f(i.fd()), f(i.fs()))); break;
         case CvtSW: line(std::format("{} = fp::cvt_s_w({});", f(i.fd()), f(i.fs()))); break;
         case MaxS: line(std::format("{} = fp::max({}, {});", f(i.fd()), f(i.fs()), f(i.ft()))); break;

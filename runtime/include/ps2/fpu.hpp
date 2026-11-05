@@ -112,6 +112,109 @@ struct Result {
     bool invalid;
 };
 
+// ---- EE FPU (COP1) multiply / divide as the PS2 hardware computes them.
+// Ported from PCSX2 soft-float (PR #12001, GPL-3.0+, GitHubProUser67 et al.: Booth multiplier
+// after Gregory Gaines' research; radix divider after DOI 10.1109/ARITH.1995.465363).
+// GT4 needs it bit-exact: its file decryption (0x579E00) runs a float key stream through mul.s /
+// div.s and saturates after ~250 bytes, so the output depends on every bit. Verified on all 125
+// license files of the retail disc: hardware mul+div = 125/125 correct (game's own CRC), the IEEE
+// versions 0/125 (license tests crashed while loading, owner 2026-11-05). The VU units keep the
+// plain versions (PCSX2 found accurate VU mul/div harmful there).
+namespace hw {
+struct CarrySave {
+    std::uint32_t sum, carry;
+};
+inline CarrySave csa(std::uint32_t a, std::uint32_t b, std::uint32_t c) {
+    const std::uint32_t u = a ^ b;
+    return {u ^ c, ((a & b) | (u & c)) << 1};
+}
+inline std::int32_t quotient_select(CarrySave cur) {
+    const std::uint32_t mask = (1u << 24) - 1;  // the point sits between bits 24 and 25
+    const auto test = static_cast<std::int32_t>(((cur.sum & ~mask) + cur.carry) | (cur.sum & mask));
+    if (test >= (1 << 23)) return 1;
+    if (test < static_cast<std::int32_t>(~0u << 24)) return -1;
+    return 0;
+}
+struct Booth {
+    std::uint32_t data, negate;
+};
+inline Booth booth(std::uint32_t a, std::uint32_t b, std::uint32_t bit) {
+    const std::uint32_t test = (bit ? b >> (bit * 2 - 1) : b << 1) & 7;
+    a <<= bit * 2;
+    a += (test == 3 || test == 4) ? a : 0;
+    const std::uint32_t neg = (test >= 4 && test <= 6) ? ~0u : 0;
+    const std::uint32_t pos = 1u << (bit * 2);
+    a ^= neg & (0u - pos);
+    a &= (test >= 1 && test <= 6) ? ~0u : 0;
+    return {a, neg & pos};
+}
+inline CarrySave add3(std::uint32_t a, std::uint32_t b, std::uint32_t c) {
+    const std::uint32_t u = a ^ b;
+    return {u ^ c, ((u & c) | (a & b)) << 1};
+}
+inline std::uint64_t mul_mantissa(std::uint32_t a, std::uint32_t b) {
+    const std::uint64_t full = static_cast<std::uint64_t>(a) * b;
+    const Booth b0 = booth(a, b, 0), b1 = booth(a, b, 1), b2 = booth(a, b, 2), b3 = booth(a, b, 3);
+    const Booth b4 = booth(a, b, 4), b5 = booth(a, b, 5), b6 = booth(a, b, 6);
+    Booth b7 = booth(a, b, 7);
+    const CarrySave t0 = add3(b1.data, b2.data, b3.data);
+    CarrySave t1 = add3(b4.data & ~0x7FFu, b5.data & ~0xFFFu, b6.data);
+    t1.carry |= b6.negate | (b5.data & 0x800);
+    b7.data |= (b5.data & 0x400) + b5.negate;
+    const CarrySave t2 = add3(b0.data, t0.sum, t0.carry);
+    const CarrySave t3 = add3(b7.data, t1.sum, t1.carry);
+    const CarrySave t4 = add3(t2.carry, t3.sum, t3.carry);
+    CarrySave t5 = add3(t2.sum, t4.sum, t4.carry);
+    t5.carry += b7.negate;
+    t5.sum &= ~0x7FFFu;
+    t5.carry &= ~0x7FFFu;
+    const std::uint32_t lo = t5.sum + t5.carry;
+    return full - ((lo ^ full) & 0x8000);
+}
+}  // namespace hw
+
+inline std::uint32_t fpu_mul(std::uint32_t a, std::uint32_t b) {
+    const std::uint32_t sign = (a ^ b) & kSign;
+    if (!exponent(a) || !exponent(b)) return sign;
+    int e = static_cast<int>(exponent(a)) + static_cast<int>(exponent(b)) - 127;
+    auto m = static_cast<std::uint32_t>(hw::mul_mantissa(mantissa(a), mantissa(b)) >> 23);
+    if (m > 0xFFFFFFu) {
+        m >>= 1;
+        ++e;
+    }
+    if (e > 255) return sign | kAbs;
+    if (e < 1) return sign;
+    return sign | (static_cast<std::uint32_t>(e) << 23) | (m & 0x7FFFFFu);
+}
+
+inline Result fpu_div(std::uint32_t a, std::uint32_t b) {
+    const std::uint32_t sign = (a ^ b) & kSign;
+    const bool a_zero = !exponent(a), b_zero = !exponent(b);
+    if (b_zero) return {sign | kAbs, true};  // x/0 and 0/0: max with the sign, flags set
+    if (a_zero) return {sign, false};
+    std::uint32_t am = mantissa(a) << 2, bm = mantissa(b) << 2;
+    hw::CarrySave cur{am, 0};
+    std::uint32_t q = 0;
+    int qbit = 1;
+    for (int i = 0; i < 25; ++i) {
+        q = (q << 1) + static_cast<std::uint32_t>(qbit);
+        const std::uint32_t add = qbit > 0 ? ~bm : qbit < 0 ? bm : 0;
+        cur.carry += qbit > 0;
+        const hw::CarrySave s = hw::csa(cur.sum, cur.carry, add);
+        qbit = hw::quotient_select(qbit ? s : cur);
+        cur.sum = s.sum << 1;
+        cur.carry = s.carry << 1;
+    }
+    int e = static_cast<int>(exponent(a)) - static_cast<int>(exponent(b)) + 126;
+    if (q >= (1u << 24)) {
+        ++e;
+        q >>= 1;
+    }
+    if (e > 255) return {sign | kAbs, false};
+    if (e < 1) return {sign, false};
+    return {sign | (static_cast<std::uint32_t>(e) << 23) | (q & 0x7FFFFFu), false};
+}
+
 inline Result div(std::uint32_t a, std::uint32_t b) {
     a = flush(a);
     b = flush(b);
