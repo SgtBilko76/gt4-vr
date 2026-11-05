@@ -165,7 +165,7 @@ constexpr float kScreenWidthM = 5.71f;
 // (owner: the screen was much too high -> correct the vertical height, put it below eye level).
 // Live tuning:
 //   adb shell setprop debug.gt4vr.screenu -0.8    (metres, negative = lower than the eyes)
-constexpr float kScreenVerticalOffsetM = 0.0f;
+constexpr float kScreenVerticalOffsetM = -0.95f; // owner 2026-11-05 GT4 HD 3D: 95 cm below eye level
 // VR mode OFF (owner 2026-11-01, after the per-eye VR tests: "keep the curved screen as the main
 // mode", then "turn off the switch"): both stick clicks no longer switch to the old head-tracked VR
 // race view; the curved HD 3D screen is the only race view. debug.gt4vr.vrallow 1 re-enables the
@@ -932,7 +932,7 @@ private:
                                 ? 2.0f * dist * std::tan(std::clamp(screen_fov, 20.0f, 170.0f) * 0.5f * 0.0174533f)
                                 : kScreenWidthM;
         const float width = std::max(0.2f, ReadFloatProperty("debug.gt4vr.screenw", sized));
-        const float screen_vertical_m = std::clamp(ReadFloatProperty("debug.gt4vr.screenu", kScreenVerticalOffsetM), -1.0f, 1.0f);
+        const float screen_vertical_m = std::clamp(ReadFloatProperty("debug.gt4vr.screenu", kScreenVerticalOffsetM), -2.0f, 1.0f);
         if (screen_vertical_m != m_screen_vertical_offset_m)
         {
             m_screen_vertical_offset_m = screen_vertical_m;

@@ -106,7 +106,7 @@ long long num(const json::Value *v, long long fallback = -1) {
 struct Data {
     bool reached = false;  // last fetch got through
     std::time_t fetched = 0;
-    json::Value live, leaderboard, recent, tracks, track, rooms;
+    json::Value live, leaderboard, tracks, track, rooms;
     std::string track_name;  // the track `track` belongs to
 };
 
@@ -119,8 +119,9 @@ int g_tab = 0;
 int g_scroll[8] = {};
 int g_sel = 0;  // selected row on the Races tab
 
-enum Tab { kRaces, kLive, kLeaderboard, kTrack, kRecent, kTabCount };
-const char *const kTabNames[kTabCount] = {"Races", "Live", "Leaderboard", "Track", "Recent"};
+// No "Recent" tab (owner 2026-11-05: too much data); the server no longer serves api/recent.
+enum Tab { kRaces, kLive, kLeaderboard, kTrack, kTabCount };
+const char *const kTabNames[kTabCount] = {"Races", "Live", "Leaderboard", "Track"};
 
 void fetch_loop() {
     std::chrono::steady_clock::time_point last_all{};
@@ -140,14 +141,19 @@ void fetch_loop() {
         bool reached = get_json("/api/live", d.live);
         if (reached) get_json("/api/rooms", d.rooms);
         if (reached && (now - last_all > std::chrono::seconds(15) || d.leaderboard.type == json::Value::Null)) {
-            reached = get_json("/api/leaderboard", d.leaderboard) && get_json("/api/recent", d.recent) &&
-                      get_json("/api/tracks", d.tracks);
+            reached = get_json("/api/leaderboard", d.leaderboard) && get_json("/api/tracks", d.tracks);
             if (reached) last_all = now;
         }
-        // Track tab: the track being driven, else the latest lap's track.
+        // Track tab: the track being driven, else the track with the newest record.
         std::string track = ctx.track;
-        if (track.empty() && d.recent.type == json::Value::Array && !d.recent.arr.empty())
-            track = str(d.recent.arr[0].get("track"));
+        if (track.empty() && d.tracks.type == json::Value::Array) {
+            std::string newest;
+            for (const json::Value &t : d.tracks.arr) {
+                const json::Value *rec = t.get("record");
+                const std::string date = rec ? str(rec->get("date")) : std::string();
+                if (date > newest) newest = date, track = str(t.get("track"));
+            }
+        }
         if (reached && !track.empty()) {
             if (get_json("/api/track?name=" + url_encode(track), d.track)) d.track_name = track;
         }
@@ -488,18 +494,6 @@ void draw(std::vector<std::uint8_t> &px, const Data &d, const Context &ctx) {
         table(cv, {{"#", 50, 50, 0}, {"Time", 110, 150, 0}, {"Player", 280, 200, 0}, {"Car", 490, 420, 0},
                    {"Mode", 920, 130, 0}, {"Date", 1060, 180, 1}},
               rows, mine, g_scroll[kTrack], "No laps on this track yet");
-        break;
-    }
-    case kRecent: {
-        if (d.recent.type == json::Value::Array)
-            for (const json::Value &v : d.recent.arr) {
-                rows.push_back({short_date(str(v.get("date"))), lap_time(num(v.get("time_ms"))), str(v.get("player")),
-                                str(v.get("track")), str(v.get("car")), mode_name(str(v.get("mode")))});
-                mine.push_back(own(str(v.get("player"))));
-            }
-        table(cv, {{"Date", 50, 150, 0}, {"Time", 210, 140, 0}, {"Player", 360, 170, 0}, {"Track", 540, 250, 0},
-                   {"Car", 800, 300, 0}, {"Mode", 1110, 130, 1}},
-              rows, mine, g_scroll[kRecent], "No laps yet");
         break;
     }
     }
