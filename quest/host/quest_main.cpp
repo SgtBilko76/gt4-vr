@@ -327,14 +327,15 @@ void queue_audio(const std::int16_t *samples, std::size_t frames) {
 
 void audio_error(AAudioStream *, void *, aaudio_result_t error);
 
-void open_audio() {
+void open_audio(bool low_latency = true) {
     g_ring_read.store(g_ring_write.load());  // start empty (a reopen drops what the old stream left)
     AAudioStreamBuilder *builder = nullptr;
     if (AAudio_createStreamBuilder(&builder) != AAUDIO_OK) return;
     AAudioStreamBuilder_setSampleRate(builder, 48000);
     AAudioStreamBuilder_setChannelCount(builder, 2);
     AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_I16);
-    AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+    AAudioStreamBuilder_setPerformanceMode(builder, low_latency ? AAUDIO_PERFORMANCE_MODE_LOW_LATENCY
+                                                                : AAUDIO_PERFORMANCE_MODE_NONE);
     AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
     AAudioStreamBuilder_setDataCallback(builder, audio_callback, nullptr);
     AAudioStreamBuilder_setErrorCallback(builder, audio_error, nullptr);
@@ -346,7 +347,8 @@ void open_audio() {
         return;
     }
     AAudioStream_requestStart(g_audio);
-    logf("[quest] audio: AAudio 48000 Hz stereo, burst %d", AAudioStream_getFramesPerBurst(g_audio));
+    logf("[quest] audio: AAudio 48000 Hz stereo, burst %d%s", AAudioStream_getFramesPerBurst(g_audio),
+         low_latency ? "" : " (normal latency)");
 }
 
 // Pace the game on the audio clock: wait while more than ~80 ms is queued. If the stream stops
@@ -373,19 +375,43 @@ std::size_t audio_target_frames() {
     return frames;
 }
 
+// Standby (owner 2026-11-05: no sound after waking the headset): while the headset sleeps Horizon OS
+// holds every stream in STARTING, and the old code reopened it every second for the whole standby.
+// Now: no reopening while the session is not visible (frame clock instead), one fresh stream when it
+// becomes visible again, and a stream that still doesn't play is reopened with growing pauses
+// (1, 2, 4, 8 s), from the second retry on without the low-latency path.
 void pace() {
     static auto last = std::chrono::steady_clock::now();
     static std::size_t last_read = 0;
-    static int stalled = 0;
+    static int stalled = 0, retries = 0;
+    static bool was_visible = true;
+    const bool visible = gt4::quest::visible();
+    if (visible != was_visible) {
+        was_visible = visible;
+        std::fprintf(stderr, "[quest] audio: headset %s\n", visible ? "visible again - fresh stream" : "not visible - holding");
+        if (visible) {
+            g_audio_reopen = true;
+            retries = 0;
+        }
+        stalled = 0;
+    }
     if (g_audio_reopen.exchange(false)) {
         if (g_audio) AAudioStream_close(g_audio);
         g_audio = nullptr;
-        open_audio();
+        open_audio(retries < 2);
+        stalled = 0;
     }
     if (g_audio) {
         const std::size_t read = g_ring_read.load();
-        stalled = read == last_read ? stalled + 1 : 0;
+        if (read != last_read) {
+            if (retries) std::fprintf(stderr, "[quest] audio playing again\n");
+            stalled = 0;
+            retries = 0;
+        } else {
+            ++stalled;
+        }
         last_read = read;
+        const int limit = 60 << std::min(retries, 3);  // 1 s, 2 s, 4 s, 8 s of fields
         if (stalled < 30) {
             const std::size_t target = audio_target_frames();
             for (int guard = 0; ring_queued() > target && guard < 40; ++guard) usleep(1000);
@@ -393,9 +419,10 @@ void pace() {
                 last = std::chrono::steady_clock::now();
                 return;
             }
-        } else if (stalled == 30) {
-            std::fprintf(stderr, "[quest] audio not consumed for 30 fields (state %d): frame clock, reopening\n",
-                         static_cast<int>(AAudioStream_getState(g_audio)));
+        } else if (visible && stalled == limit) {
+            std::fprintf(stderr, "[quest] audio not consumed for %d fields (state %d): reopening (retry %d)\n", limit,
+                         static_cast<int>(AAudioStream_getState(g_audio)), retries + 1);
+            ++retries;
             g_audio_reopen = true;
         }
     }
