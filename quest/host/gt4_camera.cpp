@@ -28,6 +28,7 @@
 #include "ps2/memory.hpp"
 #include "ps2/system.hpp"
 
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -48,6 +49,7 @@ float g_tanX = 0.0f, g_tanY = 0.0f;
 int g_log = 0;         // PS2_GT4_CAM_LOG: 1 = changes, 2 = matrices every 300 builds
 std::uint64_t g_builds = 0;
 std::atomic<std::uint64_t> g_scene_builds{0}; // race scene camera builds, read by the XR thread
+std::atomic<bool> g_scene_windowed{false};      // retail: the last race scene went into a small window
 std::atomic<bool> g_installed{false};
 
 // Per-eye rendering test (Wipeout Rewrite VR's method: the 3D world drawn once per eye). The race
@@ -301,6 +303,7 @@ Head test_head()
 
 bool installed() { return g_installed.load(std::memory_order_relaxed); }
 std::uint64_t sceneBuilds() { return g_scene_builds.load(std::memory_order_relaxed); }
+bool sceneWindowed() { return g_scene_windowed.load(std::memory_order_relaxed); }
 
 void install(HeadSource head, FrameSink frame)
 {
@@ -357,4 +360,34 @@ void install(HeadSource head, FrameSink frame)
         }
     }
 }
+void installSceneDetector()
+{
+    // Retail USA v2.00 (SCUS-97328): race renderer, right after camera->applyProjection returned -
+    // the same spot as A-Spec II's 0x1EB1F4 (instruction-for-instruction match, owner 2026-11-05:
+    // the 3D effect flickered on the license result screen because it ran outside races).
+    constexpr std::uint32_t kRetailAfterProjection = 0x33EBB4u;
+    g_installed = true;
+    // The race renderer (s1 here) can draw the scene into a picture-in-picture window: renderer+0xE304
+    // = 1 with the window rect at +0xE2F4 (x, y, w, h in pixels; the license result screen: 64, 118,
+    // 300x210), 0 when the scene fills the screen (rect 0,0,1,1). 3D only for the full-screen scene:
+    // driving and full-screen replays, not the small result-screen replay (measured 2026-11-05).
+    constexpr std::uint32_t kRendererWindowed = 0xE304u;
+    static const bool log = std::getenv("PS2_GT4_SCENELOG") != nullptr;
+    ps2::set_probe_hook(kRetailAfterProjection, [](ps2::Cpu &c) {
+        const std::uint32_t renderer = c.r[17].w[0];
+        const bool windowed = renderer && ps2::ld32(renderer + kRendererWindowed) != 0;
+        static std::uint64_t calls = 0;
+        const std::uint64_t n = calls++;
+        if (!windowed) g_scene_builds.fetch_add(1, std::memory_order_relaxed);
+        g_scene_windowed.store(windowed, std::memory_order_relaxed);
+        // PS2_GT4_SCENELOG=1: one line a second, plus every switch between full screen and window.
+        static bool last = false;
+        if ((log && n % 60 == 0) || windowed != last)
+            std::fprintf(stderr, "[gt4scene] frame %llu %s\n", static_cast<unsigned long long>(ps2::frame_count()),
+                         windowed ? "windowed (3D off)" : "full screen (3D on)");
+        last = windowed;
+    });
+    std::fprintf(stderr, "[gt4cam] retail scene detector at 0x%08X\n", kRetailAfterProjection);
+}
+
 } // namespace gt4::camera

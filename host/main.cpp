@@ -121,7 +121,8 @@ int main(int argc, char **argv) {
         };
     }
 #ifdef PS2_GT4_CAMERA
-    gt4::camera::install(nullptr, nullptr); // ps2run: test pose from PS2_GT4_TEST_* only
+    if (std::getenv("PS2_GT4_SCENELOG")) gt4::camera::installSceneDetector(); // retail scene probe test
+    else gt4::camera::install(nullptr, nullptr); // ps2run: test pose from PS2_GT4_TEST_* only
     gt4::results::install();                // GT4 Online lap results (retail build probes)
 #endif
     const auto emulate = [&]() -> int {

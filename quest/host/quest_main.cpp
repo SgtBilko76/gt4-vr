@@ -663,6 +663,7 @@ bool start_game(const fs::path &files) {
     register_generated_code();
     register_generated_vu();
     if (GT4VR_CAMERA_HOOKS) gt4::camera::install(quest_head, gt4::quest::noteHeadTrackedFrame);
+    else if (std::strcmp(GT4VR_NET_PRODUCT, "SCUS97328") == 0) gt4::camera::installSceneDetector();
 #if GT4VR_ONLINE
     // GT4 Online (retail): own laps go to the leaderboard (gt4.portroyale.online) and to laps.txt.
     // config.txt PS2_RESULTS_SERVER=off turns the reports off. Not built into the Spec II app.

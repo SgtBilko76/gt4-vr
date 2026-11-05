@@ -1299,7 +1299,10 @@ private:
         }
         else if (m_scene_idle_checks < 1000)
             ++m_scene_idle_checks;
-        const bool race_scene = !gt4::camera::installed() || m_scene_idle_checks < 3 ||
+        // Retail: a race scene in a picture-in-picture window (license result screen) is flat at once
+        // (owner 2026-11-05: upper half flickered there).
+        const bool race_scene = !gt4::camera::installed() ||
+                                (m_scene_idle_checks < 3 && !gt4::camera::sceneWindowed()) ||
                                 ReadFloatProperty("debug.gt4vr.stereomenu", 0.0f) != 0.0f;
         const bool stereo = ReadFloatProperty("debug.gt4vr.stereo", 1.0f) != 0.0f && race_scene;
         if (race_scene != m_race_scene)
