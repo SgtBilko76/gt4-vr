@@ -1,4 +1,5 @@
 #include "hw.hpp"
+#include "kernel.hpp"
 #include "vu_micro.hpp"
 #include "ps2/memory.hpp"
 #include "ps2/system.hpp"
@@ -6,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_set>
 
 namespace ps2 {
 
@@ -44,6 +46,25 @@ void watch_hit(std::uint32_t a, std::uint32_t v, const char *via) {
     const std::uint8_t *at = (a < kRamSize) ? g_ram + a : ((a >> 14) == (kScratchpadBase >> 14) ? g_spr + (a & (kScratchpadSize - 1)) : nullptr);
     std::uint32_t was = 0;
     if (at) std::memcpy(&was, at, 4);
+    // PS2_WATCH_REGS=1: the first write of each (pc, ra, value) also prints the argument / saved
+    // registers and the thread (who writes what where, without thousands of repeated lines; at most
+    // 2000 entries). The value is part of the key: a fill loop writing a new pattern still shows.
+    static const bool regs = [] { const char *e = std::getenv("PS2_WATCH_REGS"); return e && *e == '1'; }();
+    if (regs) {
+        static std::unordered_set<std::uint64_t> seen;
+        const std::uint64_t key = ((static_cast<std::uint64_t>(g_cpu.pc) << 32) | g_cpu.r[31].w[0]) ^
+                                  (static_cast<std::uint64_t>(v) * 0x9E3779B97F4A7C15ull);
+        if (seen.size() >= 2000 || !seen.insert(key).second) return;
+        const auto &r = g_cpu.r;
+        std::fprintf(stderr,
+                     "[watch] write %08X = %08X (was %08X) via %s, pc 0x%08X ra 0x%08X thread %d\n"
+                     "[watch]   a0 %08X a1 %08X a2 %08X a3 %08X v0 %08X v1 %08X sp %08X\n"
+                     "[watch]   s0 %08X s1 %08X s2 %08X s3 %08X s4 %08X s5 %08X s6 %08X s7 %08X\n",
+                     a, v, was, via, g_cpu.pc, r[31].w[0], kernel::current_thread(), r[4].w[0], r[5].w[0], r[6].w[0], r[7].w[0],
+                     r[2].w[0], r[3].w[0], r[29].w[0], r[16].w[0], r[17].w[0], r[18].w[0], r[19].w[0], r[20].w[0], r[21].w[0],
+                     r[22].w[0], r[23].w[0]);
+        return;
+    }
     std::fprintf(stderr, "[watch] write %08X = %08X (was %08X) via %s, pc 0x%08X ra 0x%08X\n", a, v, was, via, g_cpu.pc, g_cpu.r[31].w[0]);
 }
 

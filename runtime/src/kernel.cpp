@@ -465,6 +465,15 @@ void dump() {
         std::fprintf(stderr, "[thread] %d status %d prio %d wait %d/%d pc 0x%08X ra 0x%08X\n", id, t.status, t.priority, t.wait, t.wait_id,
                      id == g_current ? g_cpu.pc : t.context.pc, id == g_current ? g_cpu.r[31].w[0] : t.context.r[31].w[0]);
         const std::uint32_t sp = id == g_current ? g_cpu.r[29].w[0] : t.context.r[29].w[0];
+        // Saved registers of the waiting / ready threads (the running one's are in the [ee] dump).
+        if (id != g_current && t.context.pc) {
+            const auto &r = t.context.r;
+            std::fprintf(stderr,
+                         "[thread]   a0 %08X a1 %08X a2 %08X a3 %08X v0 %08X v1 %08X sp %08X\n"
+                         "[thread]   s0 %08X s1 %08X s2 %08X s3 %08X s4 %08X s5 %08X s6 %08X s7 %08X fp %08X\n",
+                         r[4].w[0], r[5].w[0], r[6].w[0], r[7].w[0], r[2].w[0], r[3].w[0], r[29].w[0], r[16].w[0], r[17].w[0],
+                         r[18].w[0], r[19].w[0], r[20].w[0], r[21].w[0], r[22].w[0], r[23].w[0], r[30].w[0]);
+        }
         std::fprintf(stderr, "[thread]   stack:");
         for (std::uint32_t i = 0; i < 512 && sp + i * 4 < kRamSize; ++i) {
             const std::uint32_t v = load<std::uint32_t>(g_ram + sp + i * 4);
