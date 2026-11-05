@@ -377,22 +377,29 @@ void installSceneDetector()
     // (track drawn full screen behind the menu panels: the panels took the track's depth -> flicker
     // and "glass", owner 2026-11-05), 6 on the license result screen (measured, license tests).
     constexpr std::uint32_t kRendererMode = 0x1B8u;
+    // renderer+0xBC: 0 while the player drives, 1 on both license result screens - also the full-
+    // screen one (car with instructors, Retry/Exit), whose mode is 0 like driving (owner video
+    // 2026-11-05: upper half flickered there; measured on his B-3 state and on B-1).
+    constexpr std::uint32_t kRendererShowcase = 0xBCu;
     ps2::set_probe_hook(kRetailAfterProjection, [](ps2::Cpu &c) {
         const std::uint32_t renderer = c.r[17].w[0];
         const bool windowed = renderer && ps2::ld32(renderer + kRendererWindowed) != 0;
         const std::uint32_t mode = renderer ? ps2::ld32(renderer + kRendererMode) : 0;
-        const bool flat = windowed || mode != 0;
+        const std::uint32_t showcase = renderer ? ps2::ld32(renderer + kRendererShowcase) : 0;
+        const bool flat = windowed || mode != 0 || showcase != 0;
         static std::uint64_t calls = 0;
         const std::uint64_t n = calls++;
         if (!flat) g_scene_builds.fetch_add(1, std::memory_order_relaxed);
         g_scene_windowed.store(flat, std::memory_order_relaxed);
         // Every change goes to the log (rare), PS2_GT4_SCENELOG=1 adds one line a second.
-        static std::uint32_t last_mode = ~0u;
+        static std::uint32_t last_mode = ~0u, last_showcase = ~0u;
         static bool last_windowed = false;
-        if ((log && n % 60 == 0) || mode != last_mode || windowed != last_windowed)
-            std::fprintf(stderr, "[gt4scene] frame %llu mode %u%s -> %s\n", static_cast<unsigned long long>(ps2::frame_count()),
-                         mode, windowed ? " windowed" : "", flat ? "3D off" : "3D on");
+        if ((log && n % 60 == 0) || mode != last_mode || windowed != last_windowed || showcase != last_showcase)
+            std::fprintf(stderr, "[gt4scene] frame %llu mode %u showcase %u%s -> %s\n",
+                         static_cast<unsigned long long>(ps2::frame_count()), mode, showcase, windowed ? " windowed" : "",
+                         flat ? "3D off" : "3D on");
         last_mode = mode;
+        last_showcase = showcase;
         last_windowed = windowed;
     });
     std::fprintf(stderr, "[gt4cam] retail scene detector at 0x%08X\n", kRetailAfterProjection);
