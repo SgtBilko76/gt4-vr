@@ -84,6 +84,29 @@ inline std::uint32_t from_double(double d) {
     return pack(sign, e - 1023 + 127, static_cast<std::uint32_t>(bits >> 29));
 }
 
+// Division rounds to nearest (ties to even), the other FPU ops chop. PCSX2's default EE settings
+// (eeRoundMode chop, eeDivRoundMode nearest) - GT4 depends on it: its file decryption (0x579E00)
+// runs a float key stream through mul.s/div.s, and a chopped div.s turns the license-test data
+// into garbage (runaway copy -> crash when a license test starts). The double quotient of two
+// singles rounds correctly to single (53 >= 2*24+2 bits), so no double-rounding error.
+inline std::uint32_t from_double_nearest(double d) {
+    const std::uint64_t bits = std::bit_cast<std::uint64_t>(d);
+    const std::uint32_t sign = static_cast<std::uint32_t>(bits >> 32) & kSign;
+    int e = static_cast<int>((bits >> 52) & 0x7FFu);
+    if (!e) return sign;
+    std::uint64_t m = (bits & 0xFFFFFFFFFFFFFull) | (1ull << 52);  // 53 bits
+    const std::uint64_t rest = m & ((1ull << 29) - 1), half = 1ull << 28;
+    m >>= 29;                                                         // 24 bits
+    if (rest > half || (rest == half && (m & 1))) {
+        ++m;
+        if (m >> 24) {
+            m >>= 1;
+            ++e;
+        }
+    }
+    return pack(sign, e - 1023 + 127, static_cast<std::uint32_t>(m));
+}
+
 struct Result {
     std::uint32_t value;
     bool invalid;
@@ -95,7 +118,7 @@ inline Result div(std::uint32_t a, std::uint32_t b) {
     const std::uint32_t sign = (a ^ b) & kSign;
     if (!(b & kAbs)) return {sign | kAbs, true};
     if (!(a & kAbs)) return {sign, false};
-    return {from_double(to_double(a) / to_double(b)), false};
+    return {from_double_nearest(to_double(a) / to_double(b)), false};
 }
 
 inline std::uint32_t sqrt(std::uint32_t a) {

@@ -146,10 +146,40 @@ bool has_code(std::uint32_t pc) {
     return mu && mu->entries[(pc - m->base - mu->base) >> 2] != 0;
 }
 
+// Porting aid: PS2_TRACE_CALLS=addr[,addr...] (hex) logs the registers whenever an indirect call or
+// jump lands on one of these addresses (first 40 times each). Direct jal calls don't pass here.
+void trace_call(const Cpu &c, std::uint32_t pc) {
+    static const std::vector<std::uint32_t> targets = [] {
+        std::vector<std::uint32_t> v;
+        if (const char *e = std::getenv("PS2_TRACE_CALLS"))
+            for (const char *p = e; *p;) {
+                char *end = nullptr;
+                const unsigned long a = std::strtoul(p, &end, 16);
+                if (end == p) break;
+                v.push_back(static_cast<std::uint32_t>(a));
+                p = *end == ',' ? end + 1 : end;
+            }
+        return v;
+    }();
+    if (targets.empty()) return;
+    static std::vector<unsigned> counts(targets.size());
+    for (std::size_t i = 0; i < targets.size(); ++i) {
+        if (targets[i] != pc || counts[i]++ >= 40) continue;
+        const auto &r = c.r;
+        std::fprintf(stderr,
+                     "[call] 0x%08X ra 0x%08X: a0 %08X a1 %08X a2 %08X a3 %08X v0 %08X v1 %08X sp %08X\n"
+                     "[call]   s0 %08X s1 %08X s2 %08X s3 %08X s4 %08X s5 %08X s6 %08X s7 %08X\n",
+                     pc, r[31].w[0], r[4].w[0], r[5].w[0], r[6].w[0], r[7].w[0],
+                     r[2].w[0], r[3].w[0], r[29].w[0], r[16].w[0], r[17].w[0], r[18].w[0], r[19].w[0], r[20].w[0],
+                     r[21].w[0], r[22].w[0], r[23].w[0]);
+    }
+}
+
 void dispatch(Cpu &c, std::uint32_t, std::uint32_t depth) {
     const std::uint32_t pc = c.pc;
     if (pc & kUnwind) return;
     if (pc == kHandlerReturn || pc == kIdle) return;
+    trace_call(c, pc);
     const UnitInfo *u = unit_for(pc);
     const std::uint16_t id = u ? u->entries[(pc - u->base) >> 2] : 0;
     if (!id) {
