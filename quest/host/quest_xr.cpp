@@ -17,6 +17,7 @@
 #include "rrv_pcsx2_gs_bridge.h"
 #include "gt4_camera.h"
 #include "online_panel.h"
+#include "ps2/net.hpp"
 
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
@@ -207,7 +208,9 @@ bool LoadFunction(XrInstance instance, const char *name, Fn &out)
 //   left stick = left analog stick (steering, menu pointer)      right stick = d-pad
 //   left / right stick click = L1 / R1                            Menu button = Start (pause)
 //   both stick clicks together = switch the race view (curved screen <-> VR), once per press
-//   (off while kVrModeAllowed is false).
+//   (off while kVrModeAllowed is false; with the online menu it opens / closes the online lobby).
+//   Online builds: Menu held 0.6 s = online lobby (open / close); a short Menu press stays Start,
+//   sent on release.
 // GT4 reads Cross/Square pressure, so the triggers give analog throttle and brake.
 struct ControllerInput
 {
@@ -222,7 +225,6 @@ class TouchMapper
 public:
     gt4::quest::Pad Update(const ControllerInput &in, double now)
     {
-        (void)now;
         // A trigger counts as held above 8 % travel (released below 4 %), with its travel as pressure.
         const auto trigger = [](bool &held, float v) {
             held = held ? v > 0.04f : v > 0.08f;
@@ -263,6 +265,41 @@ public:
         else if (!in.leftStickClick && !in.rightStickClick)
         {
             m_stickCombo = false;
+        }
+
+        // Menu button with the online menu (owner 2026-11-05: "Online Lobby" on the pause button):
+        // held 0.6 s it opens the lobby on its Races tab (or closes it); a shorter press is Start,
+        // sent as a 0.15 s tap on release (GT4 acts on the press, so the delay is invisible). With
+        // the lobby open a short press closes it. Without the online menu Menu is Start as before.
+        bool start = in.menu;
+        if (gt4::panel::available())
+        {
+            start = false;
+            if (in.menu)
+            {
+                if (m_menuDown < 0.0)
+                    m_menuDown = now;
+                else if (!m_menuLong && now - m_menuDown >= kMenuHoldS)
+                {
+                    m_menuLong = true;
+                    if (!gt4::panel::isOpen())
+                        gt4::panel::setTab(0);
+                    gt4::panel::toggle();
+                }
+            }
+            else
+            {
+                if (m_menuDown >= 0.0 && !m_menuLong)
+                {
+                    if (gt4::panel::isOpen())
+                        gt4::panel::setOpen(false);
+                    else
+                        m_startUntil = now + 0.15;
+                }
+                m_menuDown = -1.0;
+                m_menuLong = false;
+            }
+            start = now < m_startUntil;
         }
 
         // Online menu open: the right stick picks the tab (left/right) and scrolls (up/down), B closes
@@ -312,7 +349,7 @@ public:
         if (lg) b |= gt4::quest::HostPadButtonL2;
         if (in.leftStickClick && !m_stickCombo) b |= gt4::quest::HostPadButtonL1;
         if (in.rightStickClick && !m_stickCombo) b |= gt4::quest::HostPadButtonR1;
-        if (in.menu) b |= gt4::quest::HostPadButtonStart;
+        if (start) b |= gt4::quest::HostPadButtonStart;
         if (up) b |= gt4::quest::HostPadButtonUp;
         if (down) b |= gt4::quest::HostPadButtonDown;
         if (left) b |= gt4::quest::HostPadButtonLeft;
@@ -336,6 +373,9 @@ private:
     bool m_rs[4] = {};
     bool m_panelA = false, m_panelB = false, m_panelHeld = false;
     bool m_panelDir[4] = {};
+    static constexpr double kMenuHoldS = 0.6;
+    double m_menuDown = -1.0, m_startUntil = 0.0;
+    bool m_menuLong = false;
 };
 
 struct HeadSample
@@ -684,6 +724,8 @@ private:
             xrDestroySwapchain(m_screen_swapchain);
         if (m_panel_swapchain != XR_NULL_HANDLE)
             xrDestroySwapchain(m_panel_swapchain);
+        if (m_badge_swapchain != XR_NULL_HANDLE)
+            xrDestroySwapchain(m_badge_swapchain);
         if (m_local_space != XR_NULL_HANDLE)
             xrDestroySpace(m_local_space);
         if (m_view_space != XR_NULL_HANDLE)
@@ -846,6 +888,25 @@ private:
             m_vr_prop = vr_prop;
             if (vr_prop == 0 || vr_prop == 1)
                 gt4::quest::setCurvedView(vr_prop == 0);
+        }
+        // Online lobby on Multi-LAN Race (owner 2026-11-05): GT4 asks for an address (DHCP) when
+        // Arcade -> Multi-LAN Race connects, so the first request after a minute without one opens
+        // the lobby on its Races tab (create / join a race there while the game waits).
+        if (gt4::panel::available())
+        {
+            const uint64_t dhcp = ps2::net::dhcp_requests();
+            if (dhcp != m_dhcp_seen)
+            {
+                const double t = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                if (t - m_dhcp_last > 60.0 && !gt4::panel::isOpen())
+                {
+                    gt4::panel::setTab(0);
+                    gt4::panel::setOpen(true);
+                    XR_LOG("online lobby: Multi-LAN Race connects, opened");
+                }
+                m_dhcp_seen = dhcp;
+                m_dhcp_last = t;
+            }
         }
         // Headless testing: debug.gt4vr.panel 1 / 0 opens / closes the online menu, 2..6 picks tab 1..5.
         const int panel_prop = static_cast<int>(ReadFloatProperty("debug.gt4vr.panel", -1.0f));
@@ -1320,6 +1381,7 @@ private:
         image_layout.flags = XR_COMPOSITION_LAYER_IMAGE_LAYOUT_VERTICAL_FLIP_BIT_FB;
         const XrCompositionLayerBaseHeader *layers[4] = {};
         XrCompositionLayerQuad panel_quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+        XrCompositionLayerQuad badge_quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
         XrCompositionLayerQuad hud_quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
         XrCompositionLayerProjectionView proj_views[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
                                                           {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
@@ -1462,6 +1524,17 @@ private:
             panel_quad.size = {kPanelWidthM, kPanelWidthM * gt4::panel::kHeight / gt4::panel::kWidth};
             layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&panel_quad);
         }
+        // "Online" badge while the relay link is up: under the screen's lower left corner.
+        else if (frame_state.shouldRender && layer_count < 4 && UpdateBadge())
+        {
+            badge_quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            badge_quad.space = m_local_space;
+            badge_quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            badge_quad.subImage.swapchain = m_badge_swapchain;
+            badge_quad.subImage.imageRect.extent = {gt4::panel::kBadgeWidth, gt4::panel::kBadgeHeight};
+            badge_quad.pose = BadgePose(&badge_quad.size);
+            layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&badge_quad);
+        }
         XrFrameEndInfo end_info{XR_TYPE_FRAME_END_INFO};
         end_info.displayTime = frame_state.predictedDisplayTime;
         end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
@@ -1535,6 +1608,114 @@ private:
             }
         }
         return m_panel_uploaded;
+    }
+
+    // ---- "Online" badge
+    // True when the badge is to be shown this frame: relay link up, screen view (not the immersive
+    // race), online menu closed. The texture is drawn and uploaded once.
+    bool UpdateBadge()
+    {
+        if (!gt4::panel::available() || !m_screen_placed || m_immersive_shown || m_badge_failed ||
+            !ps2::net::connected())
+            return false;
+        if (m_badge_swapchain == XR_NULL_HANDLE)
+        {
+            std::vector<uint8_t> rgba;
+            if (!gt4::panel::renderBadge(rgba) ||
+                !CreateRgbaSwapchain(gt4::panel::kBadgeWidth, gt4::panel::kBadgeHeight, &m_badge_swapchain, &m_badge_images))
+            {
+                m_badge_failed = true;
+                return false;
+            }
+            const size_t row = static_cast<size_t>(gt4::panel::kBadgeWidth) * 4;
+            std::vector<uint8_t> flipped(rgba.size());
+            for (int y = 0; y < gt4::panel::kBadgeHeight; ++y)
+                std::memcpy(&flipped[(gt4::panel::kBadgeHeight - 1 - y) * row], &rgba[y * row], row);
+            // A static swapchain still needs every image filled (the runtime may hand any of them out).
+            for (size_t i = 0; i < m_badge_images.size(); ++i)
+            {
+                uint32_t index = 0;
+                XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+                XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+                wait.timeout = XR_INFINITE_DURATION;
+                if (XR_FAILED(xrAcquireSwapchainImage(m_badge_swapchain, &acquire, &index)) ||
+                    XR_FAILED(xrWaitSwapchainImage(m_badge_swapchain, &wait)))
+                    break;
+                glBindTexture(GL_TEXTURE_2D, m_badge_images[index].image);
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, gt4::panel::kBadgeWidth, gt4::panel::kBadgeHeight, GL_RGBA,
+                                GL_UNSIGNED_BYTE, flipped.data());
+                glBindTexture(GL_TEXTURE_2D, 0);
+                glFlush();
+                XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                xrReleaseSwapchainImage(m_badge_swapchain, &release);
+            }
+            XR_LOG("online badge: ready");
+        }
+        return true;
+    }
+
+    // Under the screen, left-aligned with its lower left corner, slightly towards the viewer. On the
+    // curved screen the corner sits on the cylinder: same angle, same radius.
+    XrPosef BadgePose(XrExtent2Df *size) const
+    {
+        const float W = m_screen_width_m, H = W * m_eye_h / m_eye_w;
+        const float bw = std::clamp(W * 0.09f, 0.18f, 0.5f), bh = bw * gt4::panel::kBadgeHeight / gt4::panel::kBadgeWidth;
+        *size = {bw, bh};
+        const XrQuaternionf &q = m_flat_screen_pose.orientation;
+        const float x_off = -W * 0.5f + bw * 0.5f;           // along the screen, from its centre
+        const float y_off = -H * 0.5f - bh * 0.5f - 0.03f;   // below its bottom edge
+        float lateral = x_off, depth = 0.0f, yaw_extra = 0.0f;
+        if (m_curved && m_has_cylinder_ext)
+        {
+            const float R = m_screen_distance_m, a = x_off / R; // arc length -> angle
+            lateral = R * std::sin(a);
+            depth = R - R * std::cos(a);
+            yaw_extra = -a;                                      // face the viewer
+        }
+        const XrVector3f right = QuatRotate(q, {1.0f, 0.0f, 0.0f}), fwd = QuatRotate(q, {0.0f, 0.0f, 1.0f});
+        const XrVector3f &c = m_flat_screen_pose.position;
+        const float toward = depth + 0.02f;
+        XrPosef pose;
+        pose.position = {c.x + right.x * lateral + fwd.x * toward, c.y + y_off, c.z + right.z * lateral + fwd.z * toward};
+        const XrQuaternionf turn{0.0f, std::sin(yaw_extra * 0.5f), 0.0f, std::cos(yaw_extra * 0.5f)};
+        pose.orientation = QuatMul(q, turn);
+        return pose;
+    }
+
+    bool CreateRgbaSwapchain(int w, int h, XrSwapchain *out, std::vector<XrSwapchainImageOpenGLESKHR> *images_out)
+    {
+        uint32_t count = 0;
+        xrEnumerateSwapchainFormats(m_session, 0, &count, nullptr);
+        std::vector<int64_t> formats(count);
+        xrEnumerateSwapchainFormats(m_session, count, &count, formats.data());
+        int64_t format = 0;
+        for (int64_t want : {static_cast<int64_t>(GL_SRGB8_ALPHA8), static_cast<int64_t>(GL_RGBA8)})
+            if (!format && std::find(formats.begin(), formats.end(), want) != formats.end())
+                format = want;
+        if (!format)
+            return false;
+        XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+        info.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+        info.format = format;
+        info.sampleCount = 1;
+        info.width = w;
+        info.height = h;
+        info.faceCount = 1;
+        info.arraySize = 1;
+        info.mipCount = 1;
+        const XrResult res = xrCreateSwapchain(m_session, &info, out);
+        if (XR_FAILED(res))
+        {
+            XR_ERR("online badge: xrCreateSwapchain failed (%d)", static_cast<int>(res));
+            *out = XR_NULL_HANDLE;
+            return false;
+        }
+        uint32_t images = 0;
+        xrEnumerateSwapchainImages(*out, 0, &images, nullptr);
+        images_out->assign(images, {XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR});
+        xrEnumerateSwapchainImages(*out, images, &images, reinterpret_cast<XrSwapchainImageBaseHeader *>(images_out->data()));
+        return true;
     }
 
     bool CreatePanelSwapchain()
@@ -1785,6 +1966,11 @@ private:
     std::vector<uint8_t> m_panel_pixels, m_panel_flipped;
     XrPosef m_panel_pose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.25f}};
     bool m_panel_shown = false, m_panel_uploaded = false, m_panel_failed = false;
+    XrSwapchain m_badge_swapchain = XR_NULL_HANDLE;
+    std::vector<XrSwapchainImageOpenGLESKHR> m_badge_images;
+    bool m_badge_failed = false;
+    uint64_t m_dhcp_seen = 0;
+    double m_dhcp_last = -1e9;
     int m_panel_prop = -1;
     float m_fake_yaw_deg = 0.0f, m_fake_pitch_deg = 0.0f, m_fake_roll_deg = 0.0f;
     float m_menu_req = 0.0f;

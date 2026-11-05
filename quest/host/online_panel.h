@@ -38,5 +38,10 @@ void select();
 // Draws the panel into rgba (kWidth * kHeight, R G B A bytes, top row first) when something
 // changed since the last call (data, tab, scroll, open). Returns false when nothing changed.
 bool render(std::vector<std::uint8_t> &rgba);
+// The "Online" badge shown while the relay link is up: a dark pill with a green dot and the word,
+// kBadgeWidth * kBadgeHeight RGBA (transparent around it, top row first). False without the font.
+constexpr int kBadgeWidth = 320;
+constexpr int kBadgeHeight = 96;
+bool renderBadge(std::vector<std::uint8_t> &rgba);
 
 }

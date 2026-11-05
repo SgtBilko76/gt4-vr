@@ -599,6 +599,11 @@ bool start_game(const fs::path &files) {
     // Network play (runtime/src/net/link.hpp): config.txt PS2_NET_SERVER=host turns the PS2 network
     // adapter on; players of the same product code and group meet on that ad hoc relay server.
     setenv("PS2_NET_PRODUCT", GT4VR_NET_PRODUCT, 0);
+#if GT4VR_ONLINE
+    // Online builds: ad hoc play through the owner's relay (GT4 Server, TCP 27312/27313) by default.
+    // config.txt PS2_NET_SERVER=host[:port] picks another relay, PS2_NET_SERVER=off turns the adapter off.
+    setenv("PS2_NET_SERVER", "217.154.211.69", 0);
+#endif
     // Every headset reports "localhost" as its host name, so the link's defaults (nickname = host
     // name, MAC = hash of it) would give two headsets the same MAC and they would never see each
     // other. Each install draws a random 24-bit id once (net-id.txt) instead: nickname Quest-<id>

@@ -50,7 +50,7 @@ const Config &config() {
     static const Config c = [] {
         Config c;
         const char *server = std::getenv("PS2_NET_SERVER");
-        if (!server || !*server) return c;
+        if (!server || !*server || std::strcmp(server, "off") == 0) return c;
         c.enabled = true;
         c.host = server;
         if (const auto colon = c.host.rfind(':'); colon != std::string::npos) {
@@ -103,7 +103,7 @@ std::deque<std::vector<std::uint8_t>> g_rx;
 std::mutex g_tx_mutex;
 int g_relay = -1;
 std::atomic<bool> g_started{false};
-std::atomic<std::uint64_t> g_sent{0}, g_received{0};
+std::atomic<std::uint64_t> g_sent{0}, g_received{0}, g_dhcp{0};
 // The group the relay puts this adapter in (set_group: GT4 Online's race rooms). Only players in the
 // same group see each other. A change reconnects with the new group.
 std::mutex g_group_mutex;
@@ -311,6 +311,14 @@ void set_group(const std::string &group) {
 std::string group() { return current_group(); }
 std::string default_group() { return config().group; }
 
+std::uint64_t dhcp_requests() { return g_dhcp.load(); }
+
+bool connected()
+{
+    std::lock_guard lock(g_tx_mutex);
+    return g_relay >= 0;
+}
+
 void start() {
 #ifndef __EMSCRIPTEN__
     if (!enabled() || g_started.exchange(true)) return;
@@ -329,6 +337,7 @@ void send(const std::uint8_t *frame, std::size_t size) {
     trace_frame("out", frame, size);
     // DHCP is answered here, by the adapter itself (dhcp.hpp): the relay has no router behind it.
     if (std::vector<std::uint8_t> reply; dhcp::handle(frame, size, config().mac, reply)) {
+        ++g_dhcp;
         inject(std::move(reply));
         return;
     }

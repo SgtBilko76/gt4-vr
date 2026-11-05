@@ -12,4 +12,5 @@ void input(int, int) {}
 void setTab(int) {}
 void select() {}
 bool render(std::vector<std::uint8_t> &) { return false; }
+bool renderBadge(std::vector<std::uint8_t> &) { return false; }
 }  // namespace gt4::panel

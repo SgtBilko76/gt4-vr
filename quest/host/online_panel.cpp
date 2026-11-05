@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -590,6 +591,53 @@ void setTab(int tab) {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_tab = std::clamp(tab, 0, kTabCount - 1);
     g_dirty = true;
+}
+
+bool renderBadge(std::vector<std::uint8_t> &rgba) {
+    if (!g_available.load()) return false;
+    constexpr int W = kBadgeWidth, H = kBadgeHeight;
+    rgba.assign(static_cast<std::size_t>(W) * H * 4, 0);
+    const auto put = [&](int x, int y, Color c, unsigned a) {
+        if (x < 0 || y < 0 || x >= W || y >= H || !a) return;
+        std::uint8_t *p = &rgba[(static_cast<std::size_t>(y) * W + x) * 4];
+        const unsigned cr = c >> 16, cg = (c >> 8) & 0xFF, cb = c & 0xFF;
+        // "over" onto what is there (premultiplied-free: colour blended by a, alpha accumulated)
+        p[0] = static_cast<std::uint8_t>((cr * a + p[0] * (255 - a)) / 255);
+        p[1] = static_cast<std::uint8_t>((cg * a + p[1] * (255 - a)) / 255);
+        p[2] = static_cast<std::uint8_t>((cb * a + p[2] * (255 - a)) / 255);
+        p[3] = static_cast<std::uint8_t>(a + p[3] * (255 - a) / 255);
+    };
+    // Pill: a rectangle with round ends (radius H/2), anti-aliased edge.
+    const float r = H * 0.5f;
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const float cx = std::clamp(x + 0.5f, r, W - r), dx = x + 0.5f - cx, dy = y + 0.5f - r;
+            const float edge = r - std::sqrt(dx * dx + dy * dy);
+            const float cov = std::clamp(edge, 0.0f, 1.0f);
+            put(x, y, kBg, static_cast<unsigned>(200 * cov));
+        }
+    // Green dot.
+    const float dot_r = H * 0.17f, dot_x = r, dot_y = r;
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const float dx = x + 0.5f - dot_x, dy = y + 0.5f - dot_y;
+            const float cov = std::clamp(dot_r - std::sqrt(dx * dx + dy * dy) + 0.5f, 0.0f, 1.0f);
+            put(x, y, kGreen, static_cast<unsigned>(255 * cov));
+        }
+    // The word.
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const int size = static_cast<int>(H * 0.56f);
+    float pen = r + dot_r + H * 0.22f;
+    const int base = static_cast<int>(H * 0.5f + size * 0.36f);
+    for (std::uint32_t cp : utf8("Online")) {
+        const Glyph &g = glyph(size, cp);
+        const int gx = static_cast<int>(pen + 0.5f) + g.xoff, gy = base + g.yoff;
+        for (int yy = 0; yy < g.h; ++yy)
+            for (int xx = 0; xx < g.w; ++xx)
+                put(gx + xx, gy + yy, kText, g.alpha[static_cast<std::size_t>(yy) * g.w + xx]);
+        pen += g.advance;
+    }
+    return true;
 }
 
 bool render(std::vector<std::uint8_t> &rgba) {

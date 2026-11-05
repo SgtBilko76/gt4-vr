@@ -17,10 +17,11 @@ SDK_CMAKE=$(ls -d "$HOME"/workspace/android-sdk/cmake/*/bin | tail -1)
 GAME=${GAME:-gt4}
 case "$GAME" in
   gt4)  variant=(-DGT4VR_ONLINE=OFF); APP_ID=online.portroyale.gt4vr; APP_LABEL="GT4 Spec II HD 3D" ;;
-  # Retail USA v2.00 (owner 2026-11-02: online stopped; same HD textures / 3D as Spec II, private).
-  # The old LAN app (online.portroyale.gt4online, -DGT4VR_ONLINE=ON) is GAME=gt4online.
+  # Retail USA v2.00 "GT4 HD 3D" (owner 2026-11-05: the public build, online through his relay:
+  # online lobby, leaderboard reports, ad hoc Multi-LAN Race; HD textures; 3D).
+  # The old LAN app (online.portroyale.gt4online) is GAME=gt4online.
   gt4r) variant=(-DGT4VR_DATA_DIR=/sdcard/GT4HD -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="GT4 HD 3D"
-                 -DGT4VR_NET_PRODUCT=SCUS97328 -DGT4VR_CAMERA_HOOKS=OFF -DGT4VR_ONLINE=OFF)
+                 -DGT4VR_NET_PRODUCT=SCUS97328 -DGT4VR_CAMERA_HOOKS=OFF -DGT4VR_ONLINE=ON)
         APP_ID=online.portroyale.gt4hd; APP_LABEL="GT4 HD 3D" ;;
   gt4online) variant=(-DGT4VR_DATA_DIR=/sdcard/GT4Online -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="GT4 Online"
                  -DGT4VR_NET_PRODUCT=SCUS97328 -DGT4VR_CAMERA_HOOKS=OFF -DGT4VR_ONLINE=ON)
