@@ -83,6 +83,10 @@ constexpr float kHudWorldWidthM = 1.8f; // Wipeout Pure VR: PURE_VR_HUD_WIDTH=1.
 //   adb shell setprop debug.gt4vr.showdepth 1    (diagnostic: draw the depth buffer)
 constexpr float kStereoSeparation = 0.011f;
 constexpr float kStereoConvergence = 0.0f;
+// Retail race renderer states with depth 3D (bit n = value n allowed): mode 0 (the race scene, not
+// menus / briefing / result), showcase 0 (driving; 1.. = after the finish).
+constexpr float kStereoModeMask = 1.0f;
+constexpr float kStereoShowcaseMask = 1.0f;
 // Depth packing scale for the screen stereo. GT4's race depth packs to almost 0 unscaled; measured on
 // the Nurburgring (2026-10-30, debug.gt4vr.showdepth 1): 4096 dark, 8192 road near ~0.6 and trees
 // mid-grey, 16384 near road saturated, 65536 everything white. Live: debug.gt4vr.depthscale.
@@ -1299,16 +1303,23 @@ private:
         }
         else if (m_scene_idle_checks < 1000)
             ++m_scene_idle_checks;
-        // Retail: a race scene in a picture-in-picture window (license result screen) is flat at once
-        // (owner 2026-11-05: upper half flickered there).
-        const bool race_scene = !gt4::camera::installed() ||
-                                (m_scene_idle_checks < 3 && !gt4::camera::sceneWindowed()) ||
+        // Retail: which race-scene states get the depth 3D (owner 2026-11-05: flicker / "glass" on the
+        // test menu and the result screens, 3D wanted in replays). Bit n of the masks = mode n /
+        // showcase n allowed; picture-in-picture is always flat. Live: debug.gt4vr.stereomode,
+        // debug.gt4vr.stereoshow (decimal masks); the log names every state the game switches to.
+        const gt4::camera::SceneState scene = gt4::camera::sceneState();
+        const auto mode_mask = static_cast<std::uint32_t>(ReadFloatProperty("debug.gt4vr.stereomode", kStereoModeMask));
+        const auto show_mask = static_cast<std::uint32_t>(ReadFloatProperty("debug.gt4vr.stereoshow", kStereoShowcaseMask));
+        const bool scene_3d = !scene.windowed && scene.mode < 32 && scene.showcase < 32 &&
+                              ((mode_mask >> scene.mode) & 1u) && ((show_mask >> scene.showcase) & 1u);
+        const bool race_scene = !gt4::camera::installed() || (m_scene_idle_checks < 3 && scene_3d) ||
                                 ReadFloatProperty("debug.gt4vr.stereomenu", 0.0f) != 0.0f;
         const bool stereo = ReadFloatProperty("debug.gt4vr.stereo", 1.0f) != 0.0f && race_scene;
         if (race_scene != m_race_scene)
         {
             m_race_scene = race_scene;
-            XR_LOG("stereo: %s", race_scene ? "race scene - depth on" : "menu - flat");
+            XR_LOG("stereo: %s (mode %u, showcase %u%s)", race_scene ? "race scene - depth on" : "menu - flat", scene.mode,
+                   scene.showcase, scene.windowed ? ", windowed" : "");
         }
         const float sep = stereo ? ReadFloatProperty("debug.gt4vr.sep", kStereoSeparation) : 0.0f;
         const float conv = ReadFloatProperty("debug.gt4vr.conv", kStereoConvergence);

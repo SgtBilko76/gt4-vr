@@ -49,7 +49,8 @@ float g_tanX = 0.0f, g_tanY = 0.0f;
 int g_log = 0;         // PS2_GT4_CAM_LOG: 1 = changes, 2 = matrices every 300 builds
 std::uint64_t g_builds = 0;
 std::atomic<std::uint64_t> g_scene_builds{0}; // race scene camera builds, read by the XR thread
-std::atomic<bool> g_scene_windowed{false};      // retail: the last race scene went into a small window
+std::atomic<std::uint32_t> g_scene_mode{0}, g_scene_showcase{0}; // retail renderer state (sceneState)
+std::atomic<bool> g_scene_windowed{false};
 std::atomic<bool> g_installed{false};
 
 // Per-eye rendering test (Wipeout Rewrite VR's method: the 3D world drawn once per eye). The race
@@ -303,7 +304,14 @@ Head test_head()
 
 bool installed() { return g_installed.load(std::memory_order_relaxed); }
 std::uint64_t sceneBuilds() { return g_scene_builds.load(std::memory_order_relaxed); }
-bool sceneWindowed() { return g_scene_windowed.load(std::memory_order_relaxed); }
+SceneState sceneState()
+{
+    SceneState s;
+    s.mode = g_scene_mode.load(std::memory_order_relaxed);
+    s.showcase = g_scene_showcase.load(std::memory_order_relaxed);
+    s.windowed = g_scene_windowed.load(std::memory_order_relaxed);
+    return s;
+}
 
 void install(HeadSource head, FrameSink frame)
 {
@@ -386,18 +394,21 @@ void installSceneDetector()
         const bool windowed = renderer && ps2::ld32(renderer + kRendererWindowed) != 0;
         const std::uint32_t mode = renderer ? ps2::ld32(renderer + kRendererMode) : 0;
         const std::uint32_t showcase = renderer ? ps2::ld32(renderer + kRendererShowcase) : 0;
-        const bool flat = windowed || mode != 0 || showcase != 0;
+        // The XR host picks the 3D scenes from this state (quest_xr.cpp ApplyStereo, live-tunable).
+        const bool flat = windowed || mode != 0 || showcase != 0;  // the default rule, for the log only
         static std::uint64_t calls = 0;
         const std::uint64_t n = calls++;
-        if (!flat) g_scene_builds.fetch_add(1, std::memory_order_relaxed);
-        g_scene_windowed.store(flat, std::memory_order_relaxed);
+        g_scene_mode.store(mode, std::memory_order_relaxed);
+        g_scene_showcase.store(showcase, std::memory_order_relaxed);
+        g_scene_windowed.store(windowed, std::memory_order_relaxed);
+        g_scene_builds.fetch_add(1, std::memory_order_relaxed);
         // Every change goes to the log (rare), PS2_GT4_SCENELOG=1 adds one line a second.
         static std::uint32_t last_mode = ~0u, last_showcase = ~0u;
         static bool last_windowed = false;
         if ((log && n % 60 == 0) || mode != last_mode || windowed != last_windowed || showcase != last_showcase)
             std::fprintf(stderr, "[gt4scene] frame %llu mode %u showcase %u%s -> %s\n",
                          static_cast<unsigned long long>(ps2::frame_count()), mode, showcase, windowed ? " windowed" : "",
-                         flat ? "3D off" : "3D on");
+                         flat ? "default 3D off" : "default 3D on");
         last_mode = mode;
         last_showcase = showcase;
         last_windowed = windowed;

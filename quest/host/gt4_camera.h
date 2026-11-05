@@ -28,7 +28,13 @@ bool installed();
 // Retail GT4 (no camera hooks): only count the race scene builds, so the XR host can tell races from
 // menus / result screens (3D on in races only). Probe at the retail counterpart of 0x1EB1F4.
 void installSceneDetector();
-// True while the race scene is drawn into a picture-in-picture window (result screens): 3D off at once.
-bool sceneWindowed();
+// Retail: the race renderer's state at its last scene build - mode (+0x1B8: 0 driving, 3 briefing,
+// 4 test menu, 6 result), showcase (+0xBC: 0 driving, 1.. after the finish) and the picture-in-
+// picture flag. The XR host decides from these whether the depth 3D is on.
+struct SceneState {
+    std::uint32_t mode = 0, showcase = 0;
+    bool windowed = false;
+};
+SceneState sceneState();
 std::uint64_t sceneBuilds();
 } // namespace gt4::camera
