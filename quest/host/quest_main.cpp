@@ -659,7 +659,8 @@ bool start_game(const fs::path &files) {
     // and 8x anisotropic texture filtering (far road and walls). config.txt overrides
     // (RRV_PCSX2_GS_CAS=0 / RRV_PCSX2_GS_ANISO=0 = off).
     // Owner 2026-11-01 at 3x3 after the eye-sized CAS fix: 60 too soft, 70/80 too sharp -> 50.
-    setenv("RRV_PCSX2_GS_CAS", "50", 0);
+    // Owner 2026-11-06 (Spec II 1.10): CAS 50 looked \"very noisy and crispy\" -> off.
+    setenv("RRV_PCSX2_GS_CAS", "0", 0);
     setenv("RRV_PCSX2_GS_ANISO", "8", 0);
     // Anti-aliasing (owner 2026-10-30: "3 times PS2 resolution and antialiasing, that works good at
     // Wipeout"): PCSX2's hardware renderer has no MSAA, FXAA on the presented frame is its edge
