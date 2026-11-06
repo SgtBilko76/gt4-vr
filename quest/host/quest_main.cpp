@@ -656,7 +656,10 @@ bool start_game(const fs::path &files) {
     // Owner 2026-11-02 (release): 3x. Tested on Costa di Amalfi: 2.5x = 60 fps, clean sound, too
     // soft; 2.75x = sound crackles sometimes, still too soft. He keeps 3x for sharpness, accepting
     // dips below 60 fps (and crackling) on heavy tracks. FXAA stays off for headroom.
-    setenv("RRV_PCSX2_GS_SCALE", "3", 0);
+    // Owner 2026-11-06 (Spec II head-view VR): 3x wide, 4x tall (1920x1792) - a little sharper in VR,
+    // races ~55 fps instead of 60 (accepted; he collects shaders for the remaining hitches).
+    setenv("RRV_PCSX2_GS_SCALE_X", "3", 0);
+    setenv("RRV_PCSX2_GS_SCALE", "4", 0);
     // Sharpness (owner 2026-10-30: "das Bild ist total unscharf"): AMD CAS on the presented frame
     // and 8x anisotropic texture filtering (far road and walls). config.txt overrides
     // (RRV_PCSX2_GS_CAS=0 / RRV_PCSX2_GS_ANISO=0 = off).
