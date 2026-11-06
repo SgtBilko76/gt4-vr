@@ -24,10 +24,10 @@ case "$GAME" in
                  -DGT4VR_NET_PRODUCT=SCUS97328 -DGT4VR_CAMERA_HOOKS=OFF -DGT4VR_ONLINE=ON)
         APP_ID=online.portroyale.gt4hd; APP_LABEL="GT4 HD 3D" ;;
   # Spec II 1.10 (owner 2026-11-06): the user brings his own patched ISO (any *.iso in /sdcard/GT4SpecII),
-  # the app checks the program's CRC; Multi-LAN Race through the relay, only with other Spec II 1.10
-  # players (own product code). No leaderboard / lobby panel (those show retail data).
+  # the app checks the program's CRC. Offline only (owner: no network play options in Spec II; the
+  # beta's LAN mode hangs anyway). Goal: a polished single-player version.
   gt4s) variant=(-DGT4VR_DATA_DIR=/sdcard/GT4SpecII -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="GT4 Spec II HD 3D"
-                 -DGT4VR_NET_PRODUCT=SPEC2V110 -DGT4VR_CAMERA_HOOKS=ON -DGT4VR_ONLINE=OFF -DGT4VR_RELAY=ON
+                 -DGT4VR_NET_PRODUCT=SPEC2V110 -DGT4VR_CAMERA_HOOKS=ON -DGT4VR_ONLINE=OFF -DGT4VR_RELAY=OFF
                  -DGT4VR_ELF_CRC=646B2E29)
         APP_ID=online.portroyale.gt4vr; APP_LABEL="GT4 Spec II HD 3D" ;;
   gt4online) variant=(-DGT4VR_DATA_DIR=/sdcard/GT4Online -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="GT4 Online"
