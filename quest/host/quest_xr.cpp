@@ -169,7 +169,7 @@ constexpr float kScreenWidthM = 5.71f;
 // (owner: the screen was much too high -> correct the vertical height, put it below eye level).
 // Live tuning:
 //   adb shell setprop debug.gt4vr.screenu -0.8    (metres, negative = lower than the eyes)
-constexpr float kScreenVerticalOffsetM = -1.0f; // owner 2026-11-05 GT4 HD 3D: 1 m below eye level
+constexpr float kScreenVerticalOffsetM = 0.0f; // owner 2026-11-06 GT4 Spec II HD 3D: eye level (was -1.0 in GT4 HD 3D)
 // VR mode OFF (owner 2026-11-01, after the per-eye VR tests: "keep the curved screen as the main
 // mode", then "turn off the switch"): both stick clicks no longer switch to the old head-tracked VR
 // race view; the curved HD 3D screen is the only race view. debug.gt4vr.vrallow 1 re-enables the
