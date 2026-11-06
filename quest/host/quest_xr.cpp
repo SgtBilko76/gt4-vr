@@ -971,7 +971,11 @@ private:
         // showcase != 0, or another mode) the curved 3D screen is shown (owner 2026-11-06: the replay
         // looks much better there). The next race is VR again by itself.
         const gt4::camera::SceneState scene_now = gt4::camera::sceneState();
-        const bool driving = scene_now.mode == 0 && scene_now.showcase == 0 && !scene_now.windowed;
+        // showcase (+0xBC) is NOT a finish flag in every mode (measured 2026-11-06 on his states: GT
+        // mode intro 0, GT race 1; Arcade race 1; license driving 0, result 1) - using it put GT mode
+        // races on the curved screen. Until a mode-independent replay/intro signal is found, only
+        // the menu modes and the picture-in-picture result go flat.
+        const bool driving = scene_now.mode == 0 && !scene_now.windowed;
         m_immersive_enabled = ReadFloatProperty("debug.gt4vr.immersive", 1.0f) != 0.0f && !gt4::quest::curvedView() &&
                               (driving || ReadFloatProperty("debug.gt4vr.vrreplay", 0.0f) != 0.0f);
         if (driving != m_vr_driving)
