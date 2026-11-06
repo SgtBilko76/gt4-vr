@@ -102,7 +102,7 @@ using SetStereoFn = void (*)(int, float, float);
 //   adb shell setprop debug.gt4vr.headlag 50     (ms from sampling to display)
 //   adb shell setprop debug.gt4vr.headdist 1.5   (metres to the head-tracked screen)
 constexpr float kHeadLagMs = 50.0f;
-constexpr float kHeadScreenDistanceM = 1.5f;
+constexpr float kHeadScreenDistanceM = 3.0f; // owner 2026-11-06: 1.5 m felt too near
 
 XrQuaternionf QuatMul(const XrQuaternionf &a, const XrQuaternionf &b)
 {
@@ -1001,6 +1001,15 @@ private:
             m_htan_cap = ReadFloatProperty("debug.gt4vr.htan", cap);
         }
         m_view_shift = std::clamp(ReadFloatProperty("debug.gt4vr.vshift", kViewShiftTan), -0.6f, 0.6f);
+        // VR HUD panel distance (live debug.gt4vr.huddist, metres; the panel keeps its size, so farther
+        // = smaller, owner rule for distance changes).
+        const float hud_dist = std::clamp(ReadFloatProperty("debug.gt4vr.huddist", kHudDistanceM), 0.5f, 10.0f);
+        if (hud_dist != m_hud_dist_m)
+        {
+            m_hud_dist_m = hud_dist;
+            m_screen_placed = false;
+            XR_LOG("VR HUD panel distance %.2f m", hud_dist);
+        }
         m_hud_half_width = std::clamp(ReadFloatProperty("debug.gt4vr.hudw", kHudHalfWidth), 0.2f, 2.0f);
         m_hud_panel = ReadFloatProperty("debug.gt4vr.hudpanel", 0.0f) != 0.0f;
         m_hud_layer_on = ReadFloatProperty("debug.gt4vr.hudlayer", 1.0f) != 0.0f;
@@ -1839,7 +1848,7 @@ private:
         m_flat_screen_pose.position = {head.x - std::sin(yaw) * m_screen_distance_m, screen_y,
                                        head.z - std::cos(yaw) * m_screen_distance_m};
         m_hud_pose.orientation = yaw_orientation;
-        m_hud_pose.position = {head.x - std::sin(yaw) * kHudDistanceM, screen_y, head.z - std::cos(yaw) * kHudDistanceM};
+        m_hud_pose.position = {head.x - std::sin(yaw) * m_hud_dist_m, screen_y, head.z - std::cos(yaw) * m_hud_dist_m};
         m_screen_placed = true;
         if (m_first_place_time == 0)
             m_first_place_time = time;
@@ -2012,6 +2021,7 @@ private:
     float m_fov_margin = kFovMargin;
     float m_vtan_cap = 0.0f, m_htan_cap = 0.0f;
     float m_view_shift = kViewShiftTan;
+    float m_hud_dist_m = kHudDistanceM;
     float m_hud_half_width = kHudHalfWidth;
     SetHudVrFn m_set_hud_vr = nullptr;
     float m_hud_applied_scale = -1.0f, m_hud_applied_x = -1.0f;
