@@ -658,6 +658,9 @@ bool start_game(const fs::path &files) {
     // dips below 60 fps (and crackling) on heavy tracks. FXAA stays off for headroom.
     // Owner 2026-11-06 (Spec II head-view VR): 3x wide, 4x tall (1920x1792) - a little sharper in VR,
     // races ~55 fps instead of 60 (accepted; he collects shaders for the remaining hitches).
+    // Owner 2026-11-06: light flares / sun glare off (the glare landed on the VR HUD panel; saves the
+    // per-field GPU readback). runtime gs.cpp hide_flare_table; config.txt PS2_GS_HIDE_FLARES=0 = on.
+    setenv("PS2_GS_HIDE_FLARES", "1", 0);
     setenv("RRV_PCSX2_GS_SCALE_X", "3", 0);
     setenv("RRV_PCSX2_GS_SCALE", "4", 0);
     // Sharpness (owner 2026-10-30: "das Bild ist total unscharf"): AMD CAS on the presented frame

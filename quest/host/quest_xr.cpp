@@ -967,7 +967,18 @@ private:
         m_lag_auto = m_head_lag_ms == 0.0f; // 0 (default) = measured
         m_head_dist_m = std::max(0.3f, ReadFloatProperty("debug.gt4vr.headdist", kHeadScreenDistanceM));
         // Race view "curved screen" (menu): no immersive race, the camera stays the game's.
-        m_immersive_enabled = ReadFloatProperty("debug.gt4vr.immersive", 1.0f) != 0.0f && !gt4::quest::curvedView();
+        // VR only while the player drives: from the finish on (replay, result screens: race renderer
+        // showcase != 0, or another mode) the curved 3D screen is shown (owner 2026-11-06: the replay
+        // looks much better there). The next race is VR again by itself.
+        const gt4::camera::SceneState scene_now = gt4::camera::sceneState();
+        const bool driving = scene_now.mode == 0 && scene_now.showcase == 0 && !scene_now.windowed;
+        m_immersive_enabled = ReadFloatProperty("debug.gt4vr.immersive", 1.0f) != 0.0f && !gt4::quest::curvedView() &&
+                              (driving || ReadFloatProperty("debug.gt4vr.vrreplay", 0.0f) != 0.0f);
+        if (driving != m_vr_driving)
+        {
+            m_vr_driving = driving;
+            XR_LOG("VR view: %s", driving ? "driving - VR allowed" : "after the finish / not driving - curved screen");
+        }
         const float hz = ReadFloatProperty("debug.gt4vr.hz", 0.0f);
         if (hz != m_wanted_hz)
         {
@@ -1979,6 +1990,7 @@ private:
     int m_lag_log_countdown = 0;
     bool m_lag_auto = true;
     bool m_immersive_enabled = true;
+    bool m_vr_driving = true;
     float m_wanted_hz = 0.0f;
     float m_fov_margin = kFovMargin;
     float m_vtan_cap = 0.0f, m_htan_cap = 0.0f;

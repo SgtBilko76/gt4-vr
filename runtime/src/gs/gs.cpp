@@ -896,8 +896,36 @@ void write_image(const std::uint8_t *data, std::uint32_t qwords) { feed_image(da
 
 std::atomic<std::uint32_t> g_downloads{0};
 
+// GT4's light flare visibility table (one 64x8 32-bit readback = 128 qwords per field, read only by
+// VU1 for lamp/headlight/sun glare, never by the game logic). PS2_GS_HIDE_FLARES=1 answers it with
+// zeros = "every light hidden": no flares or sun glare are drawn and the EE never waits for the GPU
+// (idea and measurements: GT4Recomp 1.3.0 Performance Mode). The transfer is still posted (async)
+// so the GS stream stays in order.
+bool hide_flare_table(const DownloadKey &key, std::uint8_t *data, std::size_t bytes) {
+    static const bool hide = [] {
+        const char *v = std::getenv("PS2_GS_HIDE_FLARES");
+        return v && v[0] == '1';
+    }();
+    const auto rrw = static_cast<std::uint32_t>(key.reg & 0xFFFu), rrh = static_cast<std::uint32_t>((key.reg >> 32) & 0xFFFu);
+    static const bool log = std::getenv("PS2_GS_DOWNLOAD_LOG") != nullptr;
+    if (log) {
+        static std::uint64_t n = 0;
+        if (n++ < 400)
+            std::fprintf(stderr, "[gs] download %u qwords at +%u, %ux%u, BITBLTBUF %016llX TRXPOS %016llX\n", key.qwords,
+                         key.offset, rrw, rrh, static_cast<unsigned long long>(key.buf), static_cast<unsigned long long>(key.pos));
+    }
+    if (!hide || key.qwords != 128 || rrw != 64 || rrh != 8 || key.offset != 0) return false;
+    std::memset(data, 0, bytes);
+    static std::uint64_t hidden = 0;
+    if (hidden++ == 0) std::fprintf(stderr, "[gs] light flares hidden (64x8 visibility table answered with zeros)\n");
+    return true;
+}
+
 void read_image(std::uint8_t *data, std::uint32_t qwords) {
     if (!queue::active()) {
+        DownloadKey key = g_shadow;
+        key.qwords = qwords;
+        if (hide_flare_table(key, data, static_cast<std::size_t>(qwords) * 16)) { g_shadow.offset += qwords * 16; return; }
         render_read_image(data, qwords);
         return;
     }
@@ -915,6 +943,11 @@ void read_image(std::uint8_t *data, std::uint32_t qwords) {
         key.qwords = qwords;
         g_shadow.offset += qwords * 16;
         const std::size_t bytes = static_cast<std::size_t>(qwords) * 16;
+        if (hide_flare_table(key, data, bytes)) {
+            const BridgeAsyncDownload async{key, bridge::Download{0, key.buf, key.pos, key.reg}};
+            queue::post(queue::kDownloadAsync, qwords, 0, &async, sizeof async);
+            return;
+        }
         if (!sync) {
             std::lock_guard lock(g_cache_mutex);
             const auto it = std::find_if(g_download_cache.begin(), g_download_cache.end(), [&](const CachedDownload &c) { return c.key == key; });
@@ -937,6 +970,10 @@ void read_image(std::uint8_t *data, std::uint32_t qwords) {
     key.qwords = qwords;
     g_shadow.offset += qwords * 16;
     const std::size_t bytes = static_cast<std::size_t>(qwords) * 16;
+    if (hide_flare_table(key, data, bytes)) {
+        queue::post(queue::kDownloadAsync, qwords, 0, &key, sizeof key);
+        return;
+    }
     {
         std::lock_guard lock(g_cache_mutex);
         const auto it = std::find_if(g_download_cache.begin(), g_download_cache.end(), [&](const CachedDownload &c) { return c.key == key; });
