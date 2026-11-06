@@ -151,7 +151,12 @@ constexpr float kFovMargin = 1.08f;
 // Immersive race field of view (degrees, square), Wipeout Pure VR's race camera: 110. Live:
 // adb shell setprop debug.gt4vr.fov 90   (0 = the headset's whole view)
 // Owner choice 2026-10-30: 90 (sharper; no black border visible in the headset).
-constexpr float kImmersiveFovDeg = 110.0f; // Owner choice 2026-10-30: 110 (Wipeout Rewrite VR: 65)
+// Owner 2026-11-06 (Spec II head-view VR): 80 - sharper than 90 / 110 (one game picture spread over
+// fewer degrees), the black rim around it is fine for him.
+constexpr float kImmersiveFovDeg = 80.0f;
+// The eye image stays sized for 110 deg (as before): the curved screen uses the same eye image and he
+// is happy with its sharpness - a smaller one (80 deg -> 1920x1440) would soften it.
+constexpr float kEyeImageFovDeg = 110.0f;
 constexpr float kHudHalfWidth = 0.45f; // Wipeout Pure VR: 1.8 m wide at 2 m
 
 // ~77 degrees wide at 1.5 m, like ARMSX2-3D. Live tuning:
@@ -170,11 +175,14 @@ constexpr float kScreenWidthM = 5.71f;
 // Live tuning:
 //   adb shell setprop debug.gt4vr.screenu -0.8    (metres, negative = lower than the eyes)
 constexpr float kScreenVerticalOffsetM = 0.0f; // owner 2026-11-06 GT4 Spec II HD 3D: eye level (was -1.0 in GT4 HD 3D)
-// VR mode OFF (owner 2026-11-01, after the per-eye VR tests: "keep the curved screen as the main
-// mode", then "turn off the switch"): both stick clicks no longer switch to the old head-tracked VR
-// race view; the curved HD 3D screen is the only race view. debug.gt4vr.vrallow 1 re-enables the
-// switch for tests, debug.gt4vr.vr 1 / 0 still selects VR / curved headless.
-constexpr bool kVrModeAllowed = false;
+// VR mode switch (both stick clicks: curved screen <-> head-tracked VR race view). Off 2026-11-01
+// after the per-eye tests; back ON for Spec II 2026-11-06 (owner: polish a free head-view VR mode,
+// he switches it himself). The curved screen stays the start view. Builds without the race camera
+// hooks (retail GT4 HD 3D) keep the combo for the online menu. debug.gt4vr.vrallow overrides.
+#ifndef GT4VR_CAMERA_HOOKS
+#define GT4VR_CAMERA_HOOKS 1
+#endif
+constexpr bool kVrModeAllowed = GT4VR_CAMERA_HOOKS != 0;
 std::atomic<bool> g_vr_allowed{kVrModeAllowed}; // live: debug.gt4vr.vrallow
 
 float ReadFloatProperty(const char *name, float fallback)
@@ -690,13 +698,13 @@ private:
                 float ss = kEyeSupersample;
                 if (const char *v = std::getenv("RRV_VR_SS"))
                     ss = std::clamp(static_cast<float>(std::atof(v)), 0.5f, 2.0f);
-                const float tan_view = std::tan(kImmersiveFovDeg * 0.5f * 0.0174533f);
+                const float tan_view = std::tan(kEyeImageFovDeg * 0.5f * 0.0174533f);
                 const float k = ss * std::min(1.0f, tan_view / kHeadsetTan);
                 // Never below the defaults: they already hold the GS picture at scale 3 (1920x1344).
                 m_eye_w = std::clamp(static_cast<int32_t>(views[0].recommendedImageRectWidth * k + 0.5f) & ~7, kEyeWidthDefaultPx, 3072);
                 m_eye_h = std::clamp(static_cast<int32_t>(views[0].recommendedImageRectHeight * k + 0.5f) & ~7, kScreenHeightDefaultPx, 3072);
                 XR_LOG("eye image %dx%d (recommended %ux%u x SS %.2f, at %.0f deg)", m_eye_w, m_eye_h,
-                       views[0].recommendedImageRectWidth, views[0].recommendedImageRectHeight, ss, kImmersiveFovDeg);
+                       views[0].recommendedImageRectWidth, views[0].recommendedImageRectHeight, ss, kEyeImageFovDeg);
             }
             if (const char *v = std::getenv("RRV_VR_EYE"))
             {
@@ -1455,10 +1463,13 @@ private:
                     hud_quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
                     hud_quad.subImage.swapchain = m_screen_swapchain;
                     hud_quad.subImage.imageRect.offset = {0, m_eye_h};
-                    hud_quad.subImage.imageRect.extent = {kHudWidthPx, kHudRowsPx};
+                    // The fork draws the HUD strip one eye wide (presentation width / 2 = m_eye_w), not
+                    // kHudWidthPx: with eye images wider than 1920 the quad cut off the right edge
+                    // (owner 2026-11-06: speedometer and menus incomplete in VR).
+                    hud_quad.subImage.imageRect.extent = {m_eye_w, kHudRowsPx};
                     hud_quad.subImage.imageArrayIndex = 0;
                     hud_quad.pose = m_hud_pose;
-                    hud_quad.size = {kHudWorldWidthM, kHudWorldWidthM * kHudRowsPx / kHudWidthPx};
+                    hud_quad.size = {kHudWorldWidthM, kHudWorldWidthM * 9.0f / 16.0f}; // GT4's 16:9 picture
                     layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&hud_quad);
                 }
             }
