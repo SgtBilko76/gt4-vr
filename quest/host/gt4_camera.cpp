@@ -91,10 +91,52 @@ void dump(const char *what, const ps2::Cpu &c)
     std::fprintf(stderr, "\n");
 }
 
+// Race renderer state at the scene build (both builds: s1 = renderer right after applyProjection,
+// A-Spec II 0x1EB1F4 = retail 0x33EBB4). The XR host decides the 3D from it (sceneState()).
+void record_scene(ps2::Cpu &c)
+{
+    // The race renderer (s1 here) can draw the scene into a picture-in-picture window: renderer+0xE304
+    // = 1 with the window rect at +0xE2F4 (x, y, w, h in pixels; the license result screen: 64, 118,
+    // 300x210), 0 when the scene fills the screen (rect 0,0,1,1). 3D only for the full-screen scene:
+    // driving and full-screen replays, not the small result-screen replay (measured 2026-11-05).
+    constexpr std::uint32_t kRendererWindowed = 0xE304u;
+    // renderer+0x1B8: the renderer's screen mode - 0 while the player drives, 4 on the test menu
+    // (track drawn full screen behind the menu panels: the panels took the track's depth -> flicker
+    // and "glass", owner 2026-11-05), 6 on the license result screen (measured, license tests).
+    constexpr std::uint32_t kRendererMode = 0x1B8u;
+    // renderer+0xBC: 0 while the player drives, 1 on both license result screens - also the full-
+    // screen one (car with instructors, Retry/Exit), whose mode is 0 like driving (owner video
+    // 2026-11-05: upper half flickered there; measured on his B-3 state and on B-1).
+    constexpr std::uint32_t kRendererShowcase = 0xBCu;
+    static const bool log = std::getenv("PS2_GT4_SCENELOG") != nullptr;
+    const std::uint32_t renderer = c.r[17].w[0];
+    const bool windowed = renderer && ps2::ld32(renderer + kRendererWindowed) != 0;
+    const std::uint32_t mode = renderer ? ps2::ld32(renderer + kRendererMode) : 0;
+    const std::uint32_t showcase = renderer ? ps2::ld32(renderer + kRendererShowcase) : 0;
+    // The XR host picks the 3D scenes from this state (quest_xr.cpp ApplyStereo, live-tunable).
+    const bool flat = windowed || mode != 0 || showcase != 0;  // the default rule, for the log only
+    static std::uint64_t calls = 0;
+    const std::uint64_t n = calls++;
+    g_scene_mode.store(mode, std::memory_order_relaxed);
+    g_scene_showcase.store(showcase, std::memory_order_relaxed);
+    g_scene_windowed.store(windowed, std::memory_order_relaxed);
+    g_scene_builds.fetch_add(1, std::memory_order_relaxed);
+    // Every change goes to the log (rare), PS2_GT4_SCENELOG=1 adds one line a second.
+    static std::uint32_t last_mode = ~0u, last_showcase = ~0u;
+    static bool last_windowed = false;
+    if ((log && n % 60 == 0) || mode != last_mode || windowed != last_windowed || showcase != last_showcase)
+        std::fprintf(stderr, "[gt4scene] frame %llu mode %u showcase %u%s -> %s\n",
+                     static_cast<unsigned long long>(ps2::frame_count()), mode, showcase, windowed ? " windowed" : "",
+                     flat ? "default 3D off" : "default 3D on");
+    last_mode = mode;
+    last_showcase = showcase;
+    last_windowed = windowed;
+}
+
 void after_projection(ps2::Cpu &c)
 {
     ++g_builds;
-    g_scene_builds.fetch_add(1, std::memory_order_relaxed);
+    record_scene(c);
     g_scene_seen = true;
     g_in_renderer = true;
     g_pose = g_head ? g_head() : Head{};
@@ -375,44 +417,7 @@ void installSceneDetector()
     // the 3D effect flickered on the license result screen because it ran outside races).
     constexpr std::uint32_t kRetailAfterProjection = 0x33EBB4u;
     g_installed = true;
-    // The race renderer (s1 here) can draw the scene into a picture-in-picture window: renderer+0xE304
-    // = 1 with the window rect at +0xE2F4 (x, y, w, h in pixels; the license result screen: 64, 118,
-    // 300x210), 0 when the scene fills the screen (rect 0,0,1,1). 3D only for the full-screen scene:
-    // driving and full-screen replays, not the small result-screen replay (measured 2026-11-05).
-    constexpr std::uint32_t kRendererWindowed = 0xE304u;
-    static const bool log = std::getenv("PS2_GT4_SCENELOG") != nullptr;
-    // renderer+0x1B8: the renderer's screen mode - 0 while the player drives, 4 on the test menu
-    // (track drawn full screen behind the menu panels: the panels took the track's depth -> flicker
-    // and "glass", owner 2026-11-05), 6 on the license result screen (measured, license tests).
-    constexpr std::uint32_t kRendererMode = 0x1B8u;
-    // renderer+0xBC: 0 while the player drives, 1 on both license result screens - also the full-
-    // screen one (car with instructors, Retry/Exit), whose mode is 0 like driving (owner video
-    // 2026-11-05: upper half flickered there; measured on his B-3 state and on B-1).
-    constexpr std::uint32_t kRendererShowcase = 0xBCu;
-    ps2::set_probe_hook(kRetailAfterProjection, [](ps2::Cpu &c) {
-        const std::uint32_t renderer = c.r[17].w[0];
-        const bool windowed = renderer && ps2::ld32(renderer + kRendererWindowed) != 0;
-        const std::uint32_t mode = renderer ? ps2::ld32(renderer + kRendererMode) : 0;
-        const std::uint32_t showcase = renderer ? ps2::ld32(renderer + kRendererShowcase) : 0;
-        // The XR host picks the 3D scenes from this state (quest_xr.cpp ApplyStereo, live-tunable).
-        const bool flat = windowed || mode != 0 || showcase != 0;  // the default rule, for the log only
-        static std::uint64_t calls = 0;
-        const std::uint64_t n = calls++;
-        g_scene_mode.store(mode, std::memory_order_relaxed);
-        g_scene_showcase.store(showcase, std::memory_order_relaxed);
-        g_scene_windowed.store(windowed, std::memory_order_relaxed);
-        g_scene_builds.fetch_add(1, std::memory_order_relaxed);
-        // Every change goes to the log (rare), PS2_GT4_SCENELOG=1 adds one line a second.
-        static std::uint32_t last_mode = ~0u, last_showcase = ~0u;
-        static bool last_windowed = false;
-        if ((log && n % 60 == 0) || mode != last_mode || windowed != last_windowed || showcase != last_showcase)
-            std::fprintf(stderr, "[gt4scene] frame %llu mode %u showcase %u%s -> %s\n",
-                         static_cast<unsigned long long>(ps2::frame_count()), mode, showcase, windowed ? " windowed" : "",
-                         flat ? "default 3D off" : "default 3D on");
-        last_mode = mode;
-        last_showcase = showcase;
-        last_windowed = windowed;
-    });
+    ps2::set_probe_hook(kRetailAfterProjection, [](ps2::Cpu &c) { record_scene(c); });
     std::fprintf(stderr, "[gt4cam] retail scene detector at 0x%08X\n", kRetailAfterProjection);
 }
 

@@ -29,7 +29,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cmath>
+#include <iterator>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -95,6 +97,12 @@ namespace fs = std::filesystem;
 #define GT4VR_TITLE "Gran Turismo 4 VR"
 #define GT4VR_NET_PRODUCT "SCUS97436"
 #define GT4VR_CAMERA_HOOKS 1
+#endif
+#ifndef GT4VR_RELAY
+#define GT4VR_RELAY 0
+#endif
+#ifndef GT4VR_ELF_CRC
+#define GT4VR_ELF_CRC ""
 #endif
 // The build's variant (CMakeLists.txt GT4VR_*): A-Spec II = /sdcard/GT4VR, retail v2.00 with LAN
 // play ("GT4 Online") = /sdcard/GT4Online.
@@ -518,10 +526,104 @@ void gs_thread_main() {
     }
 }
 
+// ---------------------------------------------------------------- user's disc image (Spec II 1.10)
+// The public Spec II build ships no game files: the user copies his own patched ISO into the data
+// folder (any name ending in .iso). The game program is read out of it (ISO 9660, SYSTEM.CNF's BOOT2
+// file) and must have the PCSX2 CRC the APK's translated code was made from (GT4VR_ELF_CRC).
+
+std::string find_user_iso() {
+    const std::string fixed = kDataDir + "/disc.iso";
+    if (readable(fixed)) return fixed;
+    std::error_code ec;
+    std::vector<std::string> found;
+    for (const auto &e : fs::directory_iterator(kDataDir, ec)) {
+        std::string ext = e.path().extension().string();
+        for (char &ch : ext) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        if (ext == ".iso" && e.is_regular_file(ec)) found.push_back(e.path().string());
+    }
+    std::sort(found.begin(), found.end());
+    return found.empty() ? fixed : found.front();
+}
+
+// Reads one file of the ISO's root directory (name like "SYSTEM.CNF"); false when absent.
+bool read_iso_root_file(const std::string &iso, const std::string &name, std::vector<std::uint8_t> &out) {
+    std::ifstream in(iso, std::ios::binary);
+    if (!in) return false;
+    auto sector = [&](std::uint32_t lsn, std::uint32_t bytes, std::vector<std::uint8_t> &buf) {
+        buf.resize(bytes);
+        in.seekg(static_cast<std::streamoff>(lsn) * 2048);
+        return static_cast<bool>(in.read(reinterpret_cast<char *>(buf.data()), bytes));
+    };
+    std::vector<std::uint8_t> pvd;
+    if (!sector(16, 2048, pvd) || pvd[0] != 1 || std::memcmp(&pvd[1], "CD001", 5) != 0) return false;
+    auto le32 = [](const std::uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | static_cast<std::uint32_t>(p[3]) << 24; };
+    const std::uint8_t *root = &pvd[156];
+    std::vector<std::uint8_t> dir;
+    if (!sector(le32(root + 2), le32(root + 10), dir)) return false;
+    for (std::size_t off = 0; off < dir.size();) {
+        const std::uint8_t len = dir[off];
+        if (len == 0) { off = (off / 2048 + 1) * 2048; continue; }
+        if (off + len > dir.size()) break;
+        std::string entry(reinterpret_cast<const char *>(&dir[off + 33]), dir[off + 32]);
+        if (const auto semi = entry.find(';'); semi != std::string::npos) entry.resize(semi);
+        if (entry == name) return sector(le32(&dir[off + 2]), le32(&dir[off + 10]), out);
+        off += len;
+    }
+    return false;
+}
+
+std::uint32_t pcsx2_crc(const std::vector<std::uint8_t> &elf) {
+    std::uint32_t crc = 0;
+    for (std::size_t i = 0; i + 4 <= elf.size(); i += 4)
+        crc ^= elf[i] | elf[i + 1] << 8 | elf[i + 2] << 16 | static_cast<std::uint32_t>(elf[i + 3]) << 24;
+    return crc;
+}
+
+// Puts the program from the user's ISO into core.elf when it is the expected version. Returns the
+// ISO path, or "" with the reason in the log.
+std::string prepare_user_disc() {
+    const std::string iso = find_user_iso();
+    if (!readable(iso)) {
+        logf("[quest] no disc image: copy your Gran Turismo 4 Spec II 1.10 ISO into %s", kDataDir.c_str());
+        return "";
+    }
+    std::vector<std::uint8_t> cnf, elf;
+    std::string boot;
+    if (read_iso_root_file(iso, "SYSTEM.CNF", cnf)) {
+        const std::string text(cnf.begin(), cnf.end());
+        if (const auto p = text.find("cdrom0:\\"); p != std::string::npos) {
+            boot = text.substr(p + 8);
+            boot = boot.substr(0, boot.find_first_of(";\r\n"));
+        }
+    }
+    if (boot.empty() || !read_iso_root_file(iso, boot, elf)) {
+        logf("[quest] %s is not a PS2 disc image (no SYSTEM.CNF / boot program)", iso.c_str());
+        return "";
+    }
+    const std::uint32_t want = static_cast<std::uint32_t>(std::strtoul(GT4VR_ELF_CRC, nullptr, 16));
+    const std::uint32_t crc = pcsx2_crc(elf);
+    if (crc != want) {
+        logf("[quest] %s: program %s has CRC %08X, this app needs %08X (Gran Turismo 4 Spec II 1.10). "
+             "Patch the GT4 Online Public Beta ISO with the Spec II 1.10 patch first.", iso.c_str(), boot.c_str(), crc, want);
+        return "";
+    }
+    std::vector<std::uint8_t> have;
+    if (std::ifstream old(g_elf_path, std::ios::binary); old) have.assign(std::istreambuf_iterator<char>(old), {});
+    if (have != elf) {
+        std::ofstream(g_elf_path, std::ios::binary).write(reinterpret_cast<const char *>(elf.data()), elf.size());
+        logf("[quest] program %s (CRC %08X) taken from %s", boot.c_str(), crc, iso.c_str());
+    }
+    return iso;
+}
+
 bool start_game(const fs::path &files) {
     fs::create_directories(kDataDir);
     g_elf_path = kDataDir + "/core.elf";
     std::string disc = kDataDir + "/disc.iso";
+    if (GT4VR_ELF_CRC[0] != '\0') {
+        disc = prepare_user_disc();
+        if (disc.empty()) return false;
+    }
     if (!readable(disc) && !kOldDataDir.empty() && readable(kOldDataDir + "/disc.iso")) disc = kOldDataDir + "/disc.iso";
     const std::string card = kDataDir + "/memcard.ps2";
     if (!readable(card) && !kOldDataDir.empty() && readable(kOldDataDir + "/memcard.ps2")) {
@@ -626,7 +728,7 @@ bool start_game(const fs::path &files) {
     // Network play (runtime/src/net/link.hpp): config.txt PS2_NET_SERVER=host turns the PS2 network
     // adapter on; players of the same product code and group meet on that ad hoc relay server.
     setenv("PS2_NET_PRODUCT", GT4VR_NET_PRODUCT, 0);
-#if GT4VR_ONLINE
+#if GT4VR_ONLINE || GT4VR_RELAY
     // Online builds: ad hoc play through the owner's relay (GT4 Server, TCP 27312/27313) by default.
     // config.txt PS2_NET_SERVER=host[:port] picks another relay, PS2_NET_SERVER=off turns the adapter off.
     setenv("PS2_NET_SERVER", "217.154.211.69", 0);

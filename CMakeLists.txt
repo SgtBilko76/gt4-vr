@@ -141,10 +141,17 @@ if(PS2_GENERATED)
         set(GT4VR_TITLE "Gran Turismo 4 VR" CACHE STRING "Name in the log")
         set(GT4VR_NET_PRODUCT "SCUS97436" CACHE STRING "Ad hoc server product code")
         option(GT4VR_CAMERA_HOOKS "A-Spec II race camera hooks (VR view)" ON)
+        # Ad hoc play through the owner's relay by default (Multi-LAN Race). On in every online build;
+        # the Spec II 1.10 app has it without GT4VR_ONLINE's leaderboard / lobby panel (retail data).
+        option(GT4VR_RELAY "Relay server on by default" ${GT4VR_ONLINE})
+        # Spec II 1.10 public build: the user brings the patched ISO; the app takes the game program
+        # from it and checks it (PCSX2 CRC), and shows the hidden Multi-LAN Race entry again.
+        set(GT4VR_ELF_CRC "" CACHE STRING "Required PCSX2 CRC of the disc's program (empty = core.elf)")
         target_compile_definitions(gt4vr PRIVATE GT4VR_DATA_DIR="${GT4VR_DATA_DIR}"
             GT4VR_OLD_DATA_DIR="${GT4VR_OLD_DATA_DIR}" GT4VR_TITLE="${GT4VR_TITLE}"
             GT4VR_NET_PRODUCT="${GT4VR_NET_PRODUCT}" GT4VR_CAMERA_HOOKS=$<BOOL:${GT4VR_CAMERA_HOOKS}>
-            GT4VR_ONLINE=$<BOOL:${GT4VR_ONLINE}>)
+            GT4VR_ONLINE=$<BOOL:${GT4VR_ONLINE}> GT4VR_RELAY=$<BOOL:${GT4VR_RELAY}>
+            GT4VR_ELF_CRC="${GT4VR_ELF_CRC}")
         return()
     endif()
 
