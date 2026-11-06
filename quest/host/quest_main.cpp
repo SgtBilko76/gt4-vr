@@ -677,9 +677,9 @@ bool start_game(const fs::path &files) {
     // owner chose it off. RRV_PCSX2_GS_FXAA=1 turns it back on.
     // Owner now: picture unsharp again -> turn anti-aliasing back on to optimise the sharpness.
     // Owner 2026-11-02 (release): off again for GPU headroom on heavy tracks (with 2.5x).
-    // Owner 2026-11-06 (Spec II, 3x4): FXAA on against flickering edges, accepting the speed cost;
+    // Owner 2026-11-06 (Spec II, 3x4): FXAA tried again against flickering edges - too slow, off.
     // 16x anisotropic looked worse than 8x (kept 8x).
-    setenv("RRV_PCSX2_GS_FXAA", "1", 0);
+    setenv("RRV_PCSX2_GS_FXAA", "0", 0);
     // Flicker with a light source in view (owner 2026-11-01 video): the bridge's field skipping
     // dropped whole fields when the GS fell behind, GT4's brightness / glare post-processing passes
     // included, so the picture pulsed 3-4 times a second. Off, the flicker is gone (owner tested);
