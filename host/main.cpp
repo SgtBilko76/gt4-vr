@@ -1,5 +1,6 @@
 #ifdef PS2_GT4_CAMERA
 #include "../quest/host/gt4_camera.h"
+#include "../quest/host/gt4_lan.h"
 #include "../quest/host/gt4_results.h"
 #endif
 #include "ps2/system.hpp"
@@ -123,6 +124,7 @@ int main(int argc, char **argv) {
 #ifdef PS2_GT4_CAMERA
     if (std::getenv("PS2_GT4_SCENELOG")) gt4::camera::installSceneDetector(); // retail scene probe test
     else gt4::camera::install(nullptr, nullptr); // ps2run: test pose from PS2_GT4_TEST_* only
+    if (std::getenv("PS2_GT4_SPEC2LAN")) gt4::lan::installSpecIIMenu(); // games/gt4s probes
     gt4::results::install();                // GT4 Online lap results (retail build probes)
 #endif
     const auto emulate = [&]() -> int {

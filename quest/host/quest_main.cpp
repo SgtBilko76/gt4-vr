@@ -48,6 +48,7 @@
 void register_generated_code();
 
 #include "gt4_camera.h"
+#include "gt4_lan.h"
 #if GT4VR_ONLINE
 #include "gt4_results.h"
 #include "online_panel.h"
@@ -766,6 +767,10 @@ bool start_game(const fs::path &files) {
     register_generated_code();
     register_generated_vu();
     if (GT4VR_CAMERA_HOOKS) gt4::camera::install(quest_head, gt4::quest::noteHeadTrackedFrame);
+    // Spec II 1.10: Multi-LAN Race in the Arcade menu again (relay play with Spec II players only).
+    // Opt-in (config.txt PS2_GT4_SPEC2LAN=1): the entry shows, but the beta's LAN mode hangs on its
+    // loading screen (PC test 2026-11-06; the same is reported for the beta on PCSX2).
+    if (std::strcmp(GT4VR_NET_PRODUCT, "SPEC2V110") == 0 && std::getenv("PS2_GT4_SPEC2LAN")) gt4::lan::installSpecIIMenu();
     else if (std::strcmp(GT4VR_NET_PRODUCT, "SCUS97328") == 0) gt4::camera::installSceneDetector();
 #if GT4VR_ONLINE
     // GT4 Online (retail): own laps go to the leaderboard (gt4.portroyale.online) and to laps.txt.
