@@ -1432,6 +1432,15 @@ private:
         uint32_t layer_count = 0;
         if (frame_state.shouldRender)
         {
+            // The first frame comes during the app's start transition, when the head pose is not the
+            // player's settled one (owner 2026-11-06: started via QGO the screen sat too high, started
+            // directly too low). Place it once more 4 s later, when he sits still.
+            if (m_screen_placed && !m_replaced_after_start && m_first_place_time != 0 &&
+                frame_state.predictedDisplayTime - m_first_place_time > 4000000000LL)
+            {
+                m_replaced_after_start = true;
+                m_screen_placed = false;
+            }
             if (!m_screen_placed)
                 PlaceScreen(frame_state.predictedDisplayTime);
             XrPosef tracked_pose{};
@@ -1832,6 +1841,10 @@ private:
         m_hud_pose.orientation = yaw_orientation;
         m_hud_pose.position = {head.x - std::sin(yaw) * kHudDistanceM, screen_y, head.z - std::cos(yaw) * kHudDistanceM};
         m_screen_placed = true;
+        if (m_first_place_time == 0)
+            m_first_place_time = time;
+        XR_LOG("screen placed at head height %.2f m (offset %.2f m)%s", head.y, m_screen_vertical_offset_m,
+               m_replaced_after_start ? "" : " - re-placed once more 4 s after start");
     }
 
     bool GetBool(XrAction action)
@@ -2040,6 +2053,8 @@ private:
     XrPosef m_screen_pose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
     XrPosef m_flat_screen_pose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -kScreenDistanceM}};
     bool m_screen_placed = false;
+    XrTime m_first_place_time = 0;
+    bool m_replaced_after_start = false;
     bool m_curved = false;
     float m_screen_depth_scale = -1.0f;
     int m_vr_prop = -1;
