@@ -669,7 +669,8 @@ bool start_game(const fs::path &files) {
     // Owner 2026-11-01 at 3x3 after the eye-sized CAS fix: 60 too soft, 70/80 too sharp -> 50.
     // Owner 2026-11-06 (Spec II 1.10): CAS 50 looked \"very noisy and crispy\" -> off.
     setenv("RRV_PCSX2_GS_CAS", "0", 0);
-    setenv("RRV_PCSX2_GS_ANISO", "8", 0);
+    // Owner 2026-11-06 (Spec II): 16x anisotropic (his final pick after comparing 8x / 16x).
+    setenv("RRV_PCSX2_GS_ANISO", "16", 0);
     // Anti-aliasing (owner 2026-10-30: "3 times PS2 resolution and antialiasing, that works good at
     // Wipeout"): PCSX2's hardware renderer has no MSAA, FXAA on the presented frame is its edge
     // smoothing. RRV_PCSX2_GS_FXAA=0 in config.txt turns it off.
@@ -678,7 +679,6 @@ bool start_game(const fs::path &files) {
     // Owner now: picture unsharp again -> turn anti-aliasing back on to optimise the sharpness.
     // Owner 2026-11-02 (release): off again for GPU headroom on heavy tracks (with 2.5x).
     // Owner 2026-11-06 (Spec II, 3x4): FXAA tried again against flickering edges - too slow, off.
-    // 16x anisotropic looked worse than 8x (kept 8x).
     setenv("RRV_PCSX2_GS_FXAA", "0", 0);
     // Flicker with a light source in view (owner 2026-11-01 video): the bridge's field skipping
     // dropped whole fields when the GS fell behind, GT4's brightness / glare post-processing passes
