@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Take the owner's GT4 shader collection off the Quest into quest/assets/, the seed build_quest.sh packs
-# into both APKs (GT4 VR = /sdcard/GT4VR, GT4 Online = /sdcard/GT4Online):
+# into every GT4 APK (Spec II = /sdcard/GT4SpecII, old GT4VR, GT4 HD 3D = /sdcard/GT4HD, GT4Online):
 #   rrv_tfx_pipelines.bin  pipeline list (mirrored by RRV_PIPELINE_EXPORT): both apps' lists and the old
 #                          seed are merged, so a fresh install builds every pipeline either app has seen.
 #   shader-cache/          PCSX2's compiled shaders + driver pipeline cache (exported at app start by
@@ -14,7 +14,7 @@ dst="$root/quest/assets"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$dst"
-for app in GT4VR GT4Online; do
+for app in GT4SpecII GT4VR GT4HD GT4Online; do
   mkdir -p "$tmp/$app"
   $adb pull /sdcard/$app/rrv_tfx_pipelines.bin "$tmp/$app/" >/dev/null 2>&1 || true
   $adb pull /sdcard/$app/shader-cache "$tmp/$app/" >/dev/null 2>&1 || true
