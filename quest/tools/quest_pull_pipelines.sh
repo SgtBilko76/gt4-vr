@@ -30,7 +30,7 @@ def read(p):
 seed = os.path.join(dst, 'rrv_tfx_pipelines.bin')
 hdr, merged = read(seed) if os.path.exists(seed) else (None, set())
 before = len(merged)
-for app in ('GT4VR', 'GT4Online'):
+for app in ('GT4SpecII', 'GT4VR', 'GT4HD', 'GT4Online'):
     p = os.path.join(tmp, app, 'rrv_tfx_pipelines.bin')
     if os.path.exists(p):
         h, s = read(p)
@@ -45,7 +45,7 @@ if hdr:
 print(f"pipeline seed: {before} -> {len(merged)}")
 names = ('vulkan_shaders.idx', 'vulkan_shaders.bin', 'vulkan_pipelines.bin')
 best, best_size = None, 0
-for app in ('GT4VR', 'GT4Online'):
+for app in ('GT4SpecII', 'GT4VR', 'GT4HD', 'GT4Online'):
     d = os.path.join(tmp, app, 'shader-cache')
     if all(os.path.exists(os.path.join(d, n)) for n in names):
         size = sum(os.path.getsize(os.path.join(d, n)) for n in names)
