@@ -15,6 +15,7 @@ struct Head
     float px = 0.0f, py = 0.0f, pz = 0.0f;            // head position from the centred one (metres)
     int64_t key = 0;                                  // pose time; 0 = not tracked (game camera)
     float tanX = 0.0f, tanY = 0.0f;                   // wanted tan(half fov); 0 = game projection
+    float shiftY = 0.0f; // window moved down by this tan (off-axis): the frame covers tan -(tanY+shiftY)..tanY-shiftY
 };
 using HeadSource = Head (*)();
 // The race view was built: with the pose `key` and the projection's tan(half fov).

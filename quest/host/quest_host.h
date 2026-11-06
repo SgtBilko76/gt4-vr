@@ -90,6 +90,7 @@ struct HeadPose
     // Immersive race view: the field of view (tan of the half angles) the race camera is to
     // render with; 0 = keep the game's own projection (flat screen).
     float renderTanX = 0.0f, renderTanY = 0.0f;
+    float renderShiftY = 0.0f; // picture window moved down (tan), see gt4::camera::Head::shiftY
 };
 void publishHeadPose(const HeadPose &pose);
 HeadPose currentHeadPose();

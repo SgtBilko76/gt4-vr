@@ -83,6 +83,7 @@ gt4::camera::Head quest_head()
     out.key = h.key;
     out.tanX = h.renderTanX;
     out.tanY = h.renderTanY;
+    out.shiftY = h.renderShiftY;
     return out;
 }
 } // namespace

@@ -167,6 +167,17 @@ void after_projection(ps2::Cpu &c)
         }
         g_tanX = g_pose.tanX;
         g_tanY = g_pose.tanY;
+        // Off-axis: move the picture's window down by shiftY (tan) without turning the world - the
+        // mirror at the top of the frame comes into view (owner 2026-11-06: only its lower half
+        // showed, black rim below). NDC y' = y + shiftY / tanY, i.e. y_clip += s * w_clip.
+        // PS2_GT4_SHIFT_SIGN=-1 flips it if a PC test shows the wrong direction.
+        if (g_pose.shiftY != 0.0f)
+        {
+            static const float sign = std::getenv("PS2_GT4_SHIFT_SIGN") ? std::strtof(std::getenv("PS2_GT4_SHIFT_SIGN"), nullptr) : 1.0f;
+            const float s = sign * g_pose.shiftY / g_pose.tanY;
+            for (int k = 0; k < 4; ++k)
+                col[k][1] += s * col[k][3];
+        }
     }
     if (immersive != g_immersive || (g_log >= 1 && g_builds % 600 == 1))
         std::fprintf(stderr, "[gt4cam] race view %s: game fov tan %.3f x %.3f -> %.3f x %.3f\n",
@@ -343,6 +354,8 @@ Head test_head()
     h.key = 1;
     if (const char *t = std::getenv("PS2_GT4_TEST_TAN"))
         std::sscanf(t, "%f,%f", &h.tanX, &h.tanY);
+    if (const char *s = std::getenv("PS2_GT4_TEST_SHIFT"))
+        h.shiftY = std::strtof(s, nullptr);
     return h;
 }
 } // namespace

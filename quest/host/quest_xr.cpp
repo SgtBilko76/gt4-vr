@@ -157,6 +157,10 @@ constexpr float kImmersiveFovDeg = 80.0f;
 // The eye image stays sized for 110 deg (as before): the curved screen uses the same eye image and he
 // is happy with its sharpness - a smaller one (80 deg -> 1920x1440) would soften it.
 constexpr float kEyeImageFovDeg = 110.0f;
+// VR view window moved down (tan, off-axis; the world stays level): at 80 deg the mirror at the top
+// of the game picture sat at the upper edge of the view (only its lower half visible) and a black
+// rim showed below (owner 2026-11-06). Live: debug.gt4vr.vshift (0 = centred).
+constexpr float kViewShiftTan = 0.2f;
 constexpr float kHudHalfWidth = 0.45f; // Wipeout Pure VR: 1.8 m wide at 2 m
 
 // ~77 degrees wide at 1.5 m, like ARMSX2-3D. Live tuning:
@@ -981,6 +985,7 @@ private:
             m_vtan_cap = ReadFloatProperty("debug.gt4vr.vtan", cap);
             m_htan_cap = ReadFloatProperty("debug.gt4vr.htan", cap);
         }
+        m_view_shift = std::clamp(ReadFloatProperty("debug.gt4vr.vshift", kViewShiftTan), -0.6f, 0.6f);
         m_hud_half_width = std::clamp(ReadFloatProperty("debug.gt4vr.hudw", kHudHalfWidth), 0.2f, 2.0f);
         m_hud_panel = ReadFloatProperty("debug.gt4vr.hudpanel", 0.0f) != 0.0f;
         m_hud_layer_on = ReadFloatProperty("debug.gt4vr.hudlayer", 1.0f) != 0.0f;
@@ -1112,6 +1117,7 @@ private:
                 head.renderTanY = std::min(head.renderTanY, m_vtan_cap);
             if (m_htan_cap > 0.05f)
                 head.renderTanX = std::min(head.renderTanX, m_htan_cap);
+            head.renderShiftY = m_view_shift;
         }
         gt4::quest::publishHeadPose(head);
 
@@ -1436,12 +1442,14 @@ private:
             {
                 // The frame as a projection layer: each eye's half from the eye pose it was
                 // rendered for, at the game's (symmetric) field of view.
-                const float ax = std::atan(fov.tanHalfX), ay = std::atan(fov.tanHalfY);
+                // The window is moved down by m_view_shift (off-axis, same shift the camera used).
+                const float ax = std::atan(fov.tanHalfX);
+                const float up = std::atan(fov.tanHalfY - m_view_shift), down = -std::atan(fov.tanHalfY + m_view_shift);
                 for (uint32_t eye = 0; eye < 2; ++eye)
                 {
                     XrCompositionLayerProjectionView &view = proj_views[eye];
                     view.pose = shown->eyes[eye];
-                    view.fov = {-ax, ax, ay, -ay};
+                    view.fov = {-ax, ax, up, down};
                     view.subImage.swapchain = m_screen_swapchain;
                     view.subImage.imageRect.offset = {static_cast<int32_t>(eye) * m_eye_w, 0};
                     view.subImage.imageRect.extent = {m_eye_w, m_eye_h};
@@ -1974,6 +1982,7 @@ private:
     float m_wanted_hz = 0.0f;
     float m_fov_margin = kFovMargin;
     float m_vtan_cap = 0.0f, m_htan_cap = 0.0f;
+    float m_view_shift = kViewShiftTan;
     float m_hud_half_width = kHudHalfWidth;
     SetHudVrFn m_set_hud_vr = nullptr;
     float m_hud_applied_scale = -1.0f, m_hud_applied_x = -1.0f;
