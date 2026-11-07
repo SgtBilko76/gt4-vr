@@ -93,6 +93,9 @@ namespace {
 
 namespace fs = std::filesystem;
 
+#ifndef GT4VR_DISC_NAME
+#define GT4VR_DISC_NAME "Gran Turismo 4"
+#endif
 #ifndef GT4VR_DATA_DIR
 #define GT4VR_DATA_DIR "/sdcard/GT4VR"
 #define GT4VR_OLD_DATA_DIR "/sdcard/GT4"
@@ -595,7 +598,7 @@ std::uint32_t pcsx2_crc(const std::vector<std::uint8_t> &elf) {
 std::string prepare_user_disc() {
     const std::string iso = find_user_iso();
     if (!readable(iso)) {
-        logf("[quest] no disc image: copy your Gran Turismo 4 Spec II 1.10 ISO into %s", kDataDir.c_str());
+        logf("[quest] no disc image: copy your %s ISO into %s", GT4VR_DISC_NAME, kDataDir.c_str());
         return "";
     }
     std::vector<std::uint8_t> cnf, elf;
@@ -614,8 +617,8 @@ std::string prepare_user_disc() {
     const std::uint32_t want = static_cast<std::uint32_t>(std::strtoul(GT4VR_ELF_CRC, nullptr, 16));
     const std::uint32_t crc = pcsx2_crc(elf);
     if (crc != want) {
-        logf("[quest] %s: program %s has CRC %08X, this app needs %08X (Gran Turismo 4 Spec II 1.10). "
-             "Patch the GT4 Online Public Beta ISO with the Spec II 1.10 patch first.", iso.c_str(), boot.c_str(), crc, want);
+        logf("[quest] %s: program %s has CRC %08X, this version needs %08X (%s).", iso.c_str(), boot.c_str(), crc,
+             want, GT4VR_DISC_NAME);
         return "";
     }
     std::vector<std::uint8_t> have;

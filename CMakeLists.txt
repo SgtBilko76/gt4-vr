@@ -134,6 +134,10 @@ if(PS2_GENERATED)
         target_link_libraries(gt4vr PRIVATE ps2game ps2runtime native_app_glue
             "${PS2_OPENXR_DIR}/lib/${ANDROID_ABI}/libopenxr_loader.so" EGL GLESv3 aaudio android log dl)
         target_link_options(gt4vr PRIVATE "-uANativeActivity_onCreate")
+        # "Gran Turismo 4 VR" carries both versions: libgt4vr_specii.so + libgt4vr_online.so, each started
+        # by its own activity in its own process (quest/android LauncherActivity picks one).
+        set(GT4VR_LIB_NAME "gt4vr" CACHE STRING "Native library name (lib<name>.so)")
+        set_target_properties(gt4vr PROPERTIES OUTPUT_NAME "${GT4VR_LIB_NAME}")
         # Game variant (quest/tools/build_quest.sh GAME=gt4 | gt4r): data folder on the headset, the
         # product code the ad hoc server groups players by, and the A-Spec II race camera hooks.
         set(GT4VR_DATA_DIR "/sdcard/GT4VR" CACHE STRING "Data folder on the headset")
@@ -146,12 +150,13 @@ if(PS2_GENERATED)
         option(GT4VR_RELAY "Relay server on by default" ${GT4VR_ONLINE})
         # Spec II 1.10 public build: the user brings the patched ISO; the app takes the game program
         # from it and checks it (PCSX2 CRC), and shows the hidden Multi-LAN Race entry again.
+        set(GT4VR_DISC_NAME "Gran Turismo 4" CACHE STRING "Disc the version needs (log messages)")
         set(GT4VR_ELF_CRC "" CACHE STRING "Required PCSX2 CRC of the disc's program (empty = core.elf)")
         target_compile_definitions(gt4vr PRIVATE GT4VR_DATA_DIR="${GT4VR_DATA_DIR}"
             GT4VR_OLD_DATA_DIR="${GT4VR_OLD_DATA_DIR}" GT4VR_TITLE="${GT4VR_TITLE}"
             GT4VR_NET_PRODUCT="${GT4VR_NET_PRODUCT}" GT4VR_CAMERA_HOOKS=$<BOOL:${GT4VR_CAMERA_HOOKS}>
             GT4VR_ONLINE=$<BOOL:${GT4VR_ONLINE}> GT4VR_RELAY=$<BOOL:${GT4VR_RELAY}>
-            GT4VR_ELF_CRC="${GT4VR_ELF_CRC}")
+            GT4VR_ELF_CRC="${GT4VR_ELF_CRC}" GT4VR_DISC_NAME="${GT4VR_DISC_NAME}")
         return()
     endif()
 

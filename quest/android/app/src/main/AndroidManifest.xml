@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Gran Turismo 4 VR (A-Spec II on Meta Quest): NativeActivity (no Java code) running an immersive
-     OpenXR session. The game data is the user's own disc in /sdcard/GT4VR. -->
+<!-- Gran Turismo 4 VR (Meta Quest + Pico): a 2D start screen picks the version, each version is a
+     NativeActivity running an immersive OpenXR session. The game data is the user's own disc image. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     android:installLocation="auto">
 
@@ -33,31 +33,66 @@
         android:label="${appLabel}"
         android:icon="@mipmap/ic_launcher"
         android:allowBackup="false"
-        android:hasCode="false"
+        android:hasCode="true"
         android:extractNativeLibs="true"
         android:requestLegacyExternalStorage="true"
         android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
         <!-- simpleperf from adb shell on the release build (no debuggable needed) -->
         <profileable android:shell="true" />
 
+        <!-- Meta Quest -->
         <meta-data android:name="com.oculus.supportedDevices" android:value="quest2|questpro|quest3|quest3s" />
-        <meta-data android:name="com.oculus.intent.category.VR" android:value="vr_only" />
         <meta-data android:name="com.oculus.vr.focusaware" android:value="true" />
+        <!-- Pico (OpenXR through the Khronos loader) -->
+        <meta-data android:name="pvr.app.type" android:value="vr" />
+        <meta-data android:name="pvr.display.orientation" android:value="180" />
 
+        <!-- Start screen (2D panel): picks Spec II or the online version (LauncherActivity). -->
         <activity
-            android:name="android.app.NativeActivity"
+            android:name=".LauncherActivity"
             android:label="${appLabel}"
-            android:launchMode="singleTask"
-            android:screenOrientation="landscape"
-            android:resizeableActivity="false"
-            android:excludeFromRecents="false"
-            android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|smallestScreenSize|uiMode|layoutDirection|locale"
-            android:exported="true">
-            <meta-data android:name="android.app.lib_name" android:value="gt4vr" />
-            <meta-data android:name="com.oculus.vr.focusaware" android:value="true" />
+            android:exported="true"
+            android:excludeFromRecents="false">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- The two game versions: own native library, own process (the game's globals are not
+             re-entrant and the process ends with the activity), own task. -->
+        <activity
+            android:name=".SpecIIActivity"
+            android:label="${appLabel}"
+            android:process=":specii"
+            android:taskAffinity="online.portroyale.gt4vr.specii"
+            android:launchMode="singleTask"
+            android:screenOrientation="landscape"
+            android:resizeableActivity="false"
+            android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|smallestScreenSize|uiMode|layoutDirection|locale"
+            android:exported="false">
+            <meta-data android:name="android.app.lib_name" android:value="gt4vr_specii" />
+            <meta-data android:name="com.oculus.vr.focusaware" android:value="true" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="com.oculus.intent.category.VR" />
+                <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
+            </intent-filter>
+        </activity>
+        <activity
+            android:name=".OnlineActivity"
+            android:label="${appLabel}"
+            android:process=":online"
+            android:taskAffinity="online.portroyale.gt4vr.online"
+            android:launchMode="singleTask"
+            android:screenOrientation="landscape"
+            android:resizeableActivity="false"
+            android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|smallestScreenSize|uiMode|layoutDirection|locale"
+            android:exported="false">
+            <meta-data android:name="android.app.lib_name" android:value="gt4vr_online" />
+            <meta-data android:name="com.oculus.vr.focusaware" android:value="true" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
                 <category android:name="com.oculus.intent.category.VR" />
                 <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
             </intent-filter>

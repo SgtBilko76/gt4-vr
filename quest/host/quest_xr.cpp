@@ -551,6 +551,12 @@ private:
             extensions.push_back(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
             m_has_cylinder_ext = true;
         }
+        // Pico controllers (PICO 4 / 4 Ultra): their own interaction profiles, same button names as Touch.
+        if (has_ext("XR_BD_controller_interaction"))
+        {
+            extensions.push_back("XR_BD_controller_interaction");
+            m_has_bd_controller_ext = true;
+        }
         if (has_ext(XR_FB_COMPOSITION_LAYER_IMAGE_LAYOUT_EXTENSION_NAME))
         {
             extensions.push_back(XR_FB_COMPOSITION_LAYER_IMAGE_LAYOUT_EXTENSION_NAME);
@@ -683,6 +689,17 @@ private:
         res = xrSuggestInteractionProfileBindings(m_instance, &suggested);
         if (XR_FAILED(res))
             return Fail("Touch controller bindings refused", res);
+        // Pico: the same map for its controller profiles (optional - a runtime without them keeps Touch).
+        if (m_has_bd_controller_ext)
+            for (const char *profile : {"/interaction_profiles/bytedance/pico4_controller",
+                                        "/interaction_profiles/bytedance/pico4s_controller"})
+            {
+                XrInteractionProfileSuggestedBinding pico = suggested;
+                if (XR_FAILED(xrStringToPath(m_instance, profile, &pico.interactionProfile)))
+                    continue;
+                const XrResult pr = xrSuggestInteractionProfileBindings(m_instance, &pico);
+                XR_LOG("%s bindings %s (%d)", profile, XR_SUCCEEDED(pr) ? "set" : "refused", static_cast<int>(pr));
+            }
         XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
         attach.countActionSets = 1;
         attach.actionSets = &m_actions.set;
@@ -2012,6 +2029,7 @@ private:
     XrSpace m_view_space = XR_NULL_HANDLE;
     Actions m_actions;
     bool m_has_refresh_rate_ext = false;
+    bool m_has_bd_controller_ext = false;
     bool m_has_perf_settings_ext = false;
     bool m_has_cylinder_ext = false;
     bool m_has_image_layout_ext = false;

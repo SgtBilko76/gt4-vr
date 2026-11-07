@@ -3,8 +3,8 @@
 # stage it with the PCSX2 GS bridge, its resources and the OpenXR loader, then let Gradle package.
 #
 # usage: quest/tools/build_quest.sh [--no-apk]
-#   GAME=gt4|gt4r gt4 = A-Spec II (online.portroyale.gt4vr, /sdcard/GT4VR, default),
-#                 gt4r = retail USA v2.00 with LAN play (online.portroyale.gt4online "GT4 Online", /sdcard/GT4Online)
+#   GAME=gt4vr    "Gran Turismo 4 VR": Spec II 1.10 (/sdcard/GT4SpecII) + retail v2.00 online (/sdcard/GT4HD)
+#                 in one APK, selector at start (default). gt4s / gt4r = one version only.
 #   VERSION_NAME  versionName (default 0.1.0-beta), VERSION_CODE versionCode (default 2)
 #   JOBS=N        parallel compile jobs (default 4: generated units take ~1 GB each)
 #   BRIDGE_BUILD  PCSX2 GS bridge build dir (default: the Ridge Racer V port's Android bridge)
@@ -14,49 +14,63 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 NDK=${ANDROID_NDK:-$HOME/workspace/android-ndk-r30}
 SDK_CMAKE=$(ls -d "$HOME"/workspace/android-sdk/cmake/*/bin | tail -1)
-GAME=${GAME:-gt4}
-case "$GAME" in
-  gt4)  variant=(-DGT4VR_ONLINE=OFF); APP_ID=online.portroyale.gt4vr; APP_LABEL="GT4 Spec II HD 3D" ;;
-  # Retail USA v2.00 "Gran Turismo 4 Online VR" (was "GT4 HD 3D") (owner 2026-11-05: the public build, online through his relay:
-  # online lobby, leaderboard reports, ad hoc Multi-LAN Race; 3D; no HD texture pack since 2026-11-07).
-  # The old LAN app (online.portroyale.gt4online) is GAME=gt4online.
-  gt4r) variant=(-DGT4VR_DATA_DIR=/sdcard/GT4HD -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="Gran Turismo 4 Online VR"
-                 -DGT4VR_NET_PRODUCT=SCUS97328 -DGT4VR_CAMERA_HOOKS=ON -DGT4VR_ONLINE=ON)
-        APP_ID=online.portroyale.gt4hd; APP_LABEL="Gran Turismo 4 Online VR" ;;
+GAME=${GAME:-gt4vr}
+# variant <game>: compile flags, native library name and build dir of one game version.
+variant() {
+  case "$1" in
+  gt4)  VARIANT=(-DGT4VR_ONLINE=OFF -DGT4VR_LIB_NAME=gt4vr_specii); LIBNAME=gt4vr_specii; SRC=gt4 ;;
+  # Retail USA v2.00 (owner 2026-11-05: online through his relay: lobby panel, leaderboard reports, ad hoc
+  # Multi-LAN Race; 3D; no HD texture pack). The user's own ISO in /sdcard/GT4HD; the program is read from
+  # it and checked (CRC A9D9C0A2), like Spec II.
+  gt4r) VARIANT=(-DGT4VR_DATA_DIR=/sdcard/GT4HD -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="Gran Turismo 4 VR (Online)"
+                 -DGT4VR_NET_PRODUCT=SCUS97328 -DGT4VR_CAMERA_HOOKS=ON -DGT4VR_ONLINE=ON
+                 -DGT4VR_ELF_CRC=A9D9C0A2 "-DGT4VR_DISC_NAME=Gran Turismo 4 (USA) v2.00" -DGT4VR_LIB_NAME=gt4vr_online)
+        LIBNAME=gt4vr_online; SRC=gt4r ;;
   # Spec II 1.10 (owner 2026-11-06): the user brings his own patched ISO (any *.iso in /sdcard/GT4SpecII),
-  # the app checks the program's CRC. Offline only (owner: no network play options in Spec II; the
-  # beta's LAN mode hangs anyway). Goal: a polished single-player version.
-  gt4s) variant=(-DGT4VR_DATA_DIR=/sdcard/GT4SpecII -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="Gran Turismo 4 Spec II VR"
+  # the app checks the program's CRC. Offline only (no network play options in Spec II).
+  gt4s) VARIANT=(-DGT4VR_DATA_DIR=/sdcard/GT4SpecII -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="Gran Turismo 4 VR (Spec II)"
                  -DGT4VR_NET_PRODUCT=SPEC2V110 -DGT4VR_CAMERA_HOOKS=ON -DGT4VR_ONLINE=OFF -DGT4VR_RELAY=OFF
-                 -DGT4VR_ELF_CRC=646B2E29)
-        APP_ID=online.portroyale.gt4vr; APP_LABEL="Gran Turismo 4 Spec II VR" ;;
-  gt4online) variant=(-DGT4VR_DATA_DIR=/sdcard/GT4Online -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="GT4 Online"
-                 -DGT4VR_NET_PRODUCT=SCUS97328 -DGT4VR_CAMERA_HOOKS=OFF -DGT4VR_ONLINE=ON)
-        APP_ID=online.portroyale.gt4online; APP_LABEL="GT4 Online"; GAME=gt4r ;;
-  *) echo "unknown GAME=$GAME" >&2; exit 2 ;;
+                 -DGT4VR_ELF_CRC=646B2E29 "-DGT4VR_DISC_NAME=Gran Turismo 4 Spec II 1.10" -DGT4VR_LIB_NAME=gt4vr_specii)
+        LIBNAME=gt4vr_specii; SRC=gt4s ;;
+  *) echo "unknown GAME=$1" >&2; exit 2 ;;
+  esac
+}
+# "Gran Turismo 4 VR" (owner 2026-11-08): ONE app with both versions; a 2D selector at start picks one
+# (quest/android LauncherActivity). Package online.portroyale.gt4vr (the Spec II app's, keeps its saves).
+# GAME=gt4s / gt4r build an app with only that version (the selector then starts it directly).
+case "$GAME" in
+  gt4vr) GAMES=(gt4s gt4r); APP_ID=online.portroyale.gt4vr; APP_LABEL="Gran Turismo 4 VR" ;;
+  gt4s)  GAMES=(gt4s); APP_ID=online.portroyale.gt4vr; APP_LABEL="Gran Turismo 4 VR" ;;
+  gt4r)  GAMES=(gt4r); APP_ID=online.portroyale.gt4hd; APP_LABEL="Gran Turismo 4 Online VR" ;;
+  *) echo "unknown GAME=$GAME (gt4vr, gt4s, gt4r)" >&2; exit 2 ;;
 esac
-BUILD="$ROOT/build/android-$GAME"
 BRIDGE_BUILD=${BRIDGE_BUILD:-$HOME/Projekte/fukami-wt-bridge/build-android-bridge}
 STAGE="$ROOT/quest/android/build/stage"
 STRIP="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
 
-"$SDK_CMAKE/cmake" -S "$ROOT" -B "$BUILD" -G Ninja \
-  -DCMAKE_MAKE_PROGRAM="$SDK_CMAKE/ninja" \
-  -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
-  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 -DANDROID_STL=c++_static \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DPS2_GENERATED="$ROOT/generated/$GAME" "${variant[@]}" \
-  -DPS2_OPENXR_DIR="$ROOT/quest/third_party/openxr" > "$BUILD.configure.log" 2>&1 || { tail -30 "$BUILD.configure.log"; exit 1; }
-"$SDK_CMAKE/ninja" -C "$BUILD" -j "${JOBS:-4}" gt4vr
-
-# Undefined symbols not provided by system libraries mean a dlopen failure on the headset.
-"$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -D --undefined-only "$BUILD/libgt4vr.so" \
-  | grep -v -E '@(LIBC|LIBDL|LIBM|LIBLOG|LIBANDROID|LIBEGL|LIBGLESV3|LIBAAUDIO)|^ *w ' \
-  | grep -v -E ' (xr[A-Z]|A[A-Z][a-z]+_|egl[A-Z]|gl[A-Z]|__)' || true
+LIBS=()
+for g in "${GAMES[@]}"; do
+  variant "$g"
+  BUILD="$ROOT/build/android-$g"
+  "$SDK_CMAKE/cmake" -S "$ROOT" -B "$BUILD" -G Ninja \
+    -DCMAKE_MAKE_PROGRAM="$SDK_CMAKE/ninja" \
+    -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+    -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 -DANDROID_STL=c++_static \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DPS2_GENERATED="$ROOT/generated/$SRC" "${VARIANT[@]}" \
+    -DPS2_OPENXR_DIR="$ROOT/quest/third_party/openxr" > "$BUILD.configure.log" 2>&1 || { tail -30 "$BUILD.configure.log"; exit 1; }
+  "$SDK_CMAKE/ninja" -C "$BUILD" -j "${JOBS:-4}" gt4vr
+  lib="$BUILD/lib$LIBNAME.so"
+  # Undefined symbols not provided by system libraries mean a dlopen failure on the headset.
+  "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -D --undefined-only "$lib" \
+    | grep -v -E '@(LIBC|LIBDL|LIBM|LIBLOG|LIBANDROID|LIBEGL|LIBGLESV3|LIBAAUDIO)|^ *w ' \
+    | grep -v -E ' (xr[A-Z]|A[A-Z][a-z]+_|egl[A-Z]|gl[A-Z]|__)' || true
+  LIBS+=("$lib")
+done
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/jniLibs/arm64-v8a" "$STAGE/assets/gt4vr"
-for lib in "$BUILD/libgt4vr.so" "$BRIDGE_BUILD/pcsx2-gs-bridge/librrv-pcsx2-gs-bridge.so" \
+for lib in "${LIBS[@]}" "$BRIDGE_BUILD/pcsx2-gs-bridge/librrv-pcsx2-gs-bridge.so" \
            "$ROOT/quest/third_party/openxr/lib/arm64-v8a/libopenxr_loader.so"; do
   "$STRIP" --strip-unneeded -o "$STAGE/jniLibs/arm64-v8a/$(basename "$lib")" "$lib"
 done
