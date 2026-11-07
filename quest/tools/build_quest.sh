@@ -17,12 +17,12 @@ SDK_CMAKE=$(ls -d "$HOME"/workspace/android-sdk/cmake/*/bin | tail -1)
 GAME=${GAME:-gt4}
 case "$GAME" in
   gt4)  variant=(-DGT4VR_ONLINE=OFF); APP_ID=online.portroyale.gt4vr; APP_LABEL="GT4 Spec II HD 3D" ;;
-  # Retail USA v2.00 "GT4 HD 3D" (owner 2026-11-05: the public build, online through his relay:
+  # Retail USA v2.00 "Gran Turismo 4 Online VR" (was "GT4 HD 3D") (owner 2026-11-05: the public build, online through his relay:
   # online lobby, leaderboard reports, ad hoc Multi-LAN Race; 3D; no HD texture pack since 2026-11-07).
   # The old LAN app (online.portroyale.gt4online) is GAME=gt4online.
-  gt4r) variant=(-DGT4VR_DATA_DIR=/sdcard/GT4HD -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="GT4 HD 3D"
+  gt4r) variant=(-DGT4VR_DATA_DIR=/sdcard/GT4HD -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="Gran Turismo 4 Online VR"
                  -DGT4VR_NET_PRODUCT=SCUS97328 -DGT4VR_CAMERA_HOOKS=OFF -DGT4VR_ONLINE=ON)
-        APP_ID=online.portroyale.gt4hd; APP_LABEL="GT4 HD 3D" ;;
+        APP_ID=online.portroyale.gt4hd; APP_LABEL="Gran Turismo 4 Online VR" ;;
   # Spec II 1.10 (owner 2026-11-06): the user brings his own patched ISO (any *.iso in /sdcard/GT4SpecII),
   # the app checks the program's CRC. Offline only (owner: no network play options in Spec II; the
   # beta's LAN mode hangs anyway). Goal: a polished single-player version.
