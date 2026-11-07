@@ -40,6 +40,12 @@ namespace
 {
 constexpr std::uint32_t kAfterProjection = 0x1EB1F4u;
 constexpr std::uint32_t kAfterModelview = 0x1EB234u;
+// Retail USA v2.00 (SCUS-97328): the same race renderer code, instruction for instruction (only
+// the jal targets, the camera register s2 instead of s3 and f21/f20 swapped differ): after
+// applyProjection 0x33EBB4, after applyModelview 0x33EBF4 (games/gt4r/probes.txt).
+constexpr std::uint32_t kRetailAfterProjection = 0x33EBB4u;
+constexpr std::uint32_t kRetailAfterModelview = 0x33EBF4u;
+bool g_retail = false; // install(..., retail): retail renderer layout in record_scene, no per-eye probes
 
 HeadSource g_head = nullptr;
 FrameSink g_frame = nullptr;
@@ -139,7 +145,7 @@ void record_scene(ps2::Cpu &c, bool retail)
 void after_projection(ps2::Cpu &c)
 {
     ++g_builds;
-    record_scene(c, false);
+    record_scene(c, g_retail);
     g_scene_seen = true;
     g_in_renderer = true;
     g_pose = g_head ? g_head() : Head{};
@@ -371,9 +377,10 @@ SceneState sceneState()
     return s;
 }
 
-void install(HeadSource head, FrameSink frame)
+void install(HeadSource head, FrameSink frame, bool retail)
 {
     g_installed = true;
+    g_retail = retail;
     if (const char *l = std::getenv("PS2_GT4_CAM_LOG"))
         g_log = std::atoi(l);
     if (const char *s = std::getenv("PS2_GT4_CAM_SIGNS"); s && std::strlen(s) >= 3)
@@ -388,8 +395,15 @@ void install(HeadSource head, FrameSink frame)
     if (!g_head && (std::getenv("PS2_GT4_TEST_YAW") || std::getenv("PS2_GT4_TEST_PITCH") || std::getenv("PS2_GT4_TEST_TAN")))
         g_head = test_head;
     g_frame = frame;
-    ps2::set_probe_hook(kAfterProjection, after_projection);
-    ps2::set_probe_hook(kAfterModelview, after_modelview);
+    const std::uint32_t at_projection = retail ? kRetailAfterProjection : kAfterProjection;
+    const std::uint32_t at_modelview = retail ? kRetailAfterModelview : kAfterModelview;
+    ps2::set_probe_hook(at_projection, after_projection);
+    ps2::set_probe_hook(at_modelview, after_modelview);
+    std::fprintf(stderr, "[gt4cam] race camera hooks (%s) at 0x%06X / 0x%06X\n", retail ? "retail v2.00" : "A-Spec II",
+                 at_projection, at_modelview);
+    // The per-eye test and the renderer skip list below are A-Spec II addresses only.
+    if (retail)
+        return;
     if (const char *e = std::getenv("PS2_GT4_EYE2"); e && e[0] != '\0')
     {
         g_eye2_x = std::strtof(e, nullptr);
@@ -431,7 +445,6 @@ void installSceneDetector()
     // Retail USA v2.00 (SCUS-97328): race renderer, right after camera->applyProjection returned -
     // the same spot as A-Spec II's 0x1EB1F4 (instruction-for-instruction match, owner 2026-11-05:
     // the 3D effect flickered on the license result screen because it ran outside races).
-    constexpr std::uint32_t kRetailAfterProjection = 0x33EBB4u;
     g_installed = true;
     ps2::set_probe_hook(kRetailAfterProjection, [](ps2::Cpu &c) { record_scene(c, true); });
     std::fprintf(stderr, "[gt4cam] retail scene detector at 0x%08X\n", kRetailAfterProjection);

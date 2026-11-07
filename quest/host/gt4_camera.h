@@ -21,8 +21,9 @@ using HeadSource = Head (*)();
 // The race view was built: with the pose `key` and the projection's tan(half fov).
 using FrameSink = void (*)(int64_t key, float tanX, float tanY, bool immersive);
 
-// Registers the probe hooks (the addresses must be in games/gt4/probes.txt).
-void install(HeadSource head, FrameSink frame);
+// Registers the probe hooks (the addresses must be in games/<game>/probes.txt). retail = the
+// retail USA v2.00 program (GT4 Online VR) instead of A-Spec II.
+void install(HeadSource head, FrameSink frame, bool retail = false);
 // Race scene detection: the counter grows with every race camera build (races and replays, not
 // menus). installed() is false when the hooks are not in this build (retail GT4 Online).
 bool installed();

@@ -123,7 +123,8 @@ int main(int argc, char **argv) {
     }
 #ifdef PS2_GT4_CAMERA
     if (std::getenv("PS2_GT4_SCENELOG")) gt4::camera::installSceneDetector(); // retail scene probe test
-    else gt4::camera::install(nullptr, nullptr); // ps2run: test pose from PS2_GT4_TEST_* only
+    // ps2run: test pose from PS2_GT4_TEST_* only; PS2_GT4_RETAIL=1 = the retail v2.00 hook addresses.
+    else gt4::camera::install(nullptr, nullptr, std::getenv("PS2_GT4_RETAIL") != nullptr);
     if (std::getenv("PS2_GT4_SPEC2LAN")) gt4::lan::installSpecIIMenu(); // games/gt4s probes
     gt4::results::install();                // GT4 Online lap results (retail build probes)
 #endif

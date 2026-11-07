@@ -784,12 +784,15 @@ bool start_game(const fs::path &files) {
     ps2::set_audio_sink(queue_audio);
     register_generated_code();
     register_generated_vu();
-    if (GT4VR_CAMERA_HOOKS) gt4::camera::install(quest_head, gt4::quest::noteHeadTrackedFrame);
+    const bool retail_program = std::strcmp(GT4VR_NET_PRODUCT, "SCUS97328") == 0;
+    // Race camera hooks = the head-tracked VR view (both stick clicks). Spec II and, since
+    // 2026-11-07 (owner), the retail online version too; they also feed the race scene detection.
+    if (GT4VR_CAMERA_HOOKS) gt4::camera::install(quest_head, gt4::quest::noteHeadTrackedFrame, retail_program);
     // Spec II 1.10: Multi-LAN Race in the Arcade menu again (relay play with Spec II players only).
     // Opt-in (config.txt PS2_GT4_SPEC2LAN=1): the entry shows, but the beta's LAN mode hangs on its
     // loading screen (PC test 2026-11-06; the same is reported for the beta on PCSX2).
     if (std::strcmp(GT4VR_NET_PRODUCT, "SPEC2V110") == 0 && std::getenv("PS2_GT4_SPEC2LAN")) gt4::lan::installSpecIIMenu();
-    else if (std::strcmp(GT4VR_NET_PRODUCT, "SCUS97328") == 0) gt4::camera::installSceneDetector();
+    else if (retail_program && !GT4VR_CAMERA_HOOKS) gt4::camera::installSceneDetector();
 #if GT4VR_ONLINE
     // GT4 Online (retail): own laps go to the leaderboard (gt4.portroyale.online) and to laps.txt.
     // config.txt PS2_RESULTS_SERVER=off turns the reports off. Not built into the Spec II app.
