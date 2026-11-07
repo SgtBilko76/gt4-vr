@@ -225,8 +225,17 @@ bool extract_assets(AAssetManager *assets, const fs::path &files) {
 // so an app update without new textures doesn't copy anything.
 bool extract_textures(AAssetManager *assets, const fs::path &files) {
     const std::string stamp = read_asset(assets, "textures-stamp.txt");
-    if (stamp.empty()) return false;
     std::error_code ec;
+    if (stamp.empty()) {
+        // No HD pack in this APK (owner 2026-11-07: pack removed - broke skies, cost speed). Delete a
+        // copy left by an older build (~3 GB in app storage the user cannot reach).
+        if (fs::exists(files / "textures", ec) || fs::exists(files / "textures-stamp.txt", ec)) {
+            fs::remove(files / "textures-stamp.txt", ec);
+            const auto removed = fs::remove_all(files / "textures", ec);
+            logf("[quest] textures: old HD pack copy removed (%llu files)", static_cast<unsigned long long>(removed));
+        }
+        return false;
+    }
     const fs::path dir = files / "textures";
     {
         std::ifstream have(files / "textures-stamp.txt");
