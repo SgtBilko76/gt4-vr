@@ -188,6 +188,9 @@ constexpr float kScreenVerticalOffsetM = 0.0f; // owner 2026-11-06 GT4 Spec II H
 #endif
 constexpr bool kVrModeAllowed = GT4VR_CAMERA_HOOKS != 0;
 std::atomic<bool> g_vr_allowed{kVrModeAllowed}; // live: debug.gt4vr.vrallow
+// The player is racing (race scene drawn, driving camera active): the only time the VR view can be
+// switched on (owner 2026-11-07: menus, intros and replays always on the curved 3D screen).
+std::atomic<bool> g_racing{false};
 
 float ReadFloatProperty(const char *name, float fallback)
 {
@@ -274,7 +277,12 @@ public:
             // GT4 Online: the online menu (owner 2026-11-02). The VR view switch only when VR mode is
             // allowed again (debug.gt4vr.vrallow); otherwise (Spec II release) the combo does nothing.
             if (g_vr_allowed.load(std::memory_order_relaxed))
-                gt4::quest::setCurvedView(!gt4::quest::curvedView());
+            {
+                if (g_racing.load(std::memory_order_relaxed))
+                    gt4::quest::setCurvedView(!gt4::quest::curvedView());
+                else
+                    XR_LOG("VR view: not racing - stays on the curved screen");
+            }
             else if (gt4::panel::available())
                 gt4::panel::toggle();
         }
@@ -971,17 +979,31 @@ private:
         // showcase != 0, or another mode) the curved 3D screen is shown (owner 2026-11-06: the replay
         // looks much better there). The next race is VR again by itself.
         const gt4::camera::SceneState scene_now = gt4::camera::sceneState();
-        // showcase (+0xBC) is NOT a finish flag in every mode (measured 2026-11-06 on his states: GT
-        // mode intro 0, GT race 1; Arcade race 1; license driving 0, result 1) - using it put GT mode
-        // races on the curved screen. Until a mode-independent replay/intro signal is found, only
-        // the menu modes and the picture-in-picture result go flat.
-        const bool driving = scene_now.mode == 0 && !scene_now.windowed;
+        // Racing = the race scene is being drawn (camera builds in the last ~1 s; menus draw none)
+        // with the game's driving camera active. showcase (+0xBC) can't tell it: it means different
+        // things per mode (GT intro 0 / race 1, license driving 0 / result 1). The active camera
+        // class can: on-board while driving, designer cameras in intros / replays, a finish camera
+        // after the line (gt4_camera.cpp record_scene).
+        const std::uint64_t race_builds = gt4::camera::sceneBuilds();
+        if (race_builds != m_race_builds)
+        {
+            m_race_builds = race_builds;
+            m_race_idle = 0;
+        }
+        else if (m_race_idle < 1000)
+            ++m_race_idle;
+        const bool driving = m_race_idle < 3 && scene_now.mode == 0 && !scene_now.windowed && scene_now.driver_camera;
+        g_racing.store(driving, std::memory_order_relaxed);
         m_immersive_enabled = ReadFloatProperty("debug.gt4vr.immersive", 1.0f) != 0.0f && !gt4::quest::curvedView() &&
                               (driving || ReadFloatProperty("debug.gt4vr.vrreplay", 0.0f) != 0.0f);
         if (driving != m_vr_driving)
         {
             m_vr_driving = driving;
-            XR_LOG("VR view: %s", driving ? "driving - VR allowed" : "after the finish / not driving - curved screen");
+            // Race over (finish line, replay, back to the menus): back to the curved screen, so the
+            // next race starts there too and he switches to VR himself.
+            if (!driving && !gt4::quest::curvedView())
+                gt4::quest::setCurvedView(true);
+            XR_LOG("VR view: %s", driving ? "racing - VR can be switched on" : "not racing - curved screen");
         }
         const float hz = ReadFloatProperty("debug.gt4vr.hz", 0.0f);
         if (hz != m_wanted_hz)
@@ -2016,7 +2038,9 @@ private:
     int m_lag_log_countdown = 0;
     bool m_lag_auto = true;
     bool m_immersive_enabled = true;
-    bool m_vr_driving = true;
+    bool m_vr_driving = false;
+    std::uint64_t m_race_builds = 0; // gt4::camera::sceneBuilds() at the last racing check
+    int m_race_idle = 1000;          // checks (~0.4 s each) without a race camera build
     float m_wanted_hz = 0.0f;
     float m_fov_margin = kFovMargin;
     float m_vtan_cap = 0.0f, m_htan_cap = 0.0f;

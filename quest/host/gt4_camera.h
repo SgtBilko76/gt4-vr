@@ -36,6 +36,9 @@ void installSceneDetector();
 struct SceneState {
     std::uint32_t mode = 0, showcase = 0;
     bool windowed = false;
+    // The race camera manager's active camera is a driving camera (CameraSys::CameraOnBoard or
+    // CameraVariable): the player drives. Intro flyovers, finish cameras and replays use others.
+    bool driver_camera = false;
 };
 SceneState sceneState();
 std::uint64_t sceneBuilds();

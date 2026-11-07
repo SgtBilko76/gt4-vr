@@ -57,6 +57,7 @@ std::uint64_t g_builds = 0;
 std::atomic<std::uint64_t> g_scene_builds{0}; // race scene camera builds, read by the XR thread
 std::atomic<std::uint32_t> g_scene_mode{0}, g_scene_showcase{0}; // retail renderer state (sceneState)
 std::atomic<bool> g_scene_windowed{false};
+std::atomic<bool> g_scene_driver{false};
 std::atomic<bool> g_installed{false};
 
 // Per-eye rendering test (Wipeout Rewrite VR's method: the 3D world drawn once per eye). The race
@@ -122,6 +123,38 @@ void record_scene(ps2::Cpu &c, bool retail)
     const bool windowed = retail && renderer && ps2::ld32(renderer + kRendererWindowed) != 0;
     const std::uint32_t mode = renderer ? ps2::ld32(renderer + kRendererMode) : 0;
     const std::uint32_t showcase = renderer ? ps2::ld32(renderer + kRendererShowcase) : 0;
+    // The race camera manager (A-Spec II s3, retail s2 here) picks its active camera like its
+    // getter (A-Spec II 0x237B58, retail 0x373700): *(mgr + index * stride + slot), index at
+    // mgr + 0xA4C / 0x9BC. The camera's class (vtable) tells driving from intro flyover
+    // (CameraDesigner), finish (CameraFinishType1) and replay cameras (owner 2026-11-07: VR only while
+    // racing). Vtables from the RTTI names (quest/tools/vtable.py).
+    const std::uint32_t mgr = c.r[retail ? 18 : 19].w[0];
+    const std::uint32_t index_off = retail ? 0x9BCu : 0xA4Cu, stride = retail ? 0x19Cu : 0x1B4u,
+                        slot = retail ? 0x13Cu : 0x154u;
+    const std::uint32_t onboard_vt = retail ? 0x67A5D8u : 0x6B5728u, variable_vt = retail ? 0x67A498u : 0x6B55D8u,
+                        designer_vt = retail ? 0x67A758u : 0x6B58B8u;
+    std::uint32_t cam_vt = 0;
+    if (mgr >= 0x100000u && mgr < 0x2000000u)
+    {
+        const std::uint32_t index = ps2::ld32(mgr + index_off);
+        if (index < 4)
+        {
+            const std::uint32_t cam = ps2::ld32(mgr + index * stride + slot);
+            if (cam >= 0x100000u && cam < 0x2000000u)
+                cam_vt = ps2::ld32(cam);
+        }
+    }
+    const bool driver = cam_vt == onboard_vt || cam_vt == variable_vt;
+    static std::uint32_t last_cam_vt = ~0u;
+    if (cam_vt != last_cam_vt)
+    {
+        last_cam_vt = cam_vt;
+        std::fprintf(stderr, "[gt4scene] frame %llu camera %s (vtable %06X)\n",
+                     static_cast<unsigned long long>(ps2::frame_count()),
+                     cam_vt == onboard_vt ? "on board (driving)" : cam_vt == variable_vt ? "variable (driving)"
+                     : cam_vt == designer_vt ? "designer (intro / replay)" : "other (not driving)", cam_vt);
+    }
+    g_scene_driver.store(driver, std::memory_order_relaxed);
     // The XR host picks the 3D scenes from this state (quest_xr.cpp ApplyStereo, live-tunable).
     const bool flat = windowed || mode != 0 || showcase != 0;  // the default rule, for the log only
     static std::uint64_t calls = 0;
@@ -374,6 +407,7 @@ SceneState sceneState()
     s.mode = g_scene_mode.load(std::memory_order_relaxed);
     s.showcase = g_scene_showcase.load(std::memory_order_relaxed);
     s.windowed = g_scene_windowed.load(std::memory_order_relaxed);
+    s.driver_camera = g_scene_driver.load(std::memory_order_relaxed);
     return s;
 }
 
