@@ -93,6 +93,8 @@ namespace {
 
 namespace fs = std::filesystem;
 
+#include <zlib.h>
+
 #ifndef GT4VR_DISC_NAME
 #define GT4VR_DISC_NAME "Gran Turismo 4"
 #endif
@@ -593,6 +595,106 @@ std::uint32_t pcsx2_crc(const std::vector<std::uint8_t> &elf) {
     return crc;
 }
 
+// Retail GT4 boots a small loader (SCUS_973.28); the game program is CORE.GT4 in the disc's root:
+// a 6-byte header (flags u16, size u32) + raw deflate of a section list (two length-prefixed strings,
+// count i32, entry u32, then count x {address u32, size u32, bytes}). Rebuilt into the same ELF as
+// scripts/gt4_core.py (one PT_LOAD per merged section run), so its CRC matches the translated code.
+bool gt4_core_to_elf(const std::vector<std::uint8_t> &core, std::vector<std::uint8_t> &out) {
+    if (core.size() < 6) return false;
+    const std::uint32_t size = core[2] | core[3] << 8 | core[4] << 16 | static_cast<std::uint32_t>(core[5]) << 24;
+    std::vector<std::uint8_t> image(size);
+    z_stream zs{};
+    if (inflateInit2(&zs, -15) != Z_OK) return false;
+    zs.next_in = const_cast<Bytef *>(core.data() + 6);
+    zs.avail_in = static_cast<uInt>(core.size() - 6);
+    zs.next_out = image.data();
+    zs.avail_out = static_cast<uInt>(image.size());
+    const int zr = inflate(&zs, Z_FINISH);
+    const bool inflated = zr == Z_STREAM_END && zs.total_out == size;
+    inflateEnd(&zs);
+    if (!inflated) return false;
+    auto u16 = [&](std::size_t o) { return static_cast<std::uint32_t>(image[o] | image[o + 1] << 8); };
+    auto u32 = [&](std::size_t o) {
+        return image[o] | image[o + 1] << 8 | image[o + 2] << 16 | static_cast<std::uint32_t>(image[o + 3]) << 24;
+    };
+    std::size_t off = 0;
+    for (int i = 0; i < 2; ++i) {
+        if (off + 2 > image.size()) return false;
+        off += 2 + u16(off);
+    }
+    if (off + 8 > image.size()) return false;
+    const std::uint32_t count = u32(off), entry = u32(off + 4);
+    off += 8;
+    std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>> parts;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        if (off + 8 > image.size()) return false;
+        const std::uint32_t addr = u32(off), len = u32(off + 4);
+        if (off + 8 + len > image.size()) return false;
+        parts.emplace_back(addr, std::vector<std::uint8_t>(image.begin() + off + 8, image.begin() + off + 8 + len));
+        off += 8 + len;
+    }
+    if (off != image.size()) return false;
+    std::stable_sort(parts.begin(), parts.end(), [](const auto &a, const auto &b) {
+        return a.first != b.first ? a.first < b.first : a.second.size() > b.second.size();
+    });
+    std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>> segs;
+    for (auto &p : parts) {
+        if (!segs.empty()) {
+            auto &[start, body] = segs.back();
+            if (p.first < start + body.size()) {
+                const std::size_t at = p.first - start;
+                const std::size_t overlap = std::min(body.size() - at, p.second.size());
+                if (std::memcmp(body.data() + at, p.second.data(), overlap) != 0) return false;
+                if (p.first + p.second.size() > start + body.size())
+                    body.insert(body.end(), p.second.begin() + overlap, p.second.end());
+                continue;
+            }
+        }
+        segs.push_back(std::move(p));
+    }
+    auto put32 = [](std::vector<std::uint8_t> &v, std::size_t o, std::uint32_t x) {
+        for (int i = 0; i < 4; ++i) v[o + i] = static_cast<std::uint8_t>(x >> (8 * i));
+    };
+    auto put16 = [](std::vector<std::uint8_t> &v, std::size_t o, std::uint32_t x) {
+        v[o] = static_cast<std::uint8_t>(x);
+        v[o + 1] = static_cast<std::uint8_t>(x >> 8);
+    };
+    const std::size_t header = 52, ph = 32;
+    const std::size_t base = (header + ph * segs.size() + 0xFFF) & ~static_cast<std::size_t>(0xFFF);
+    std::vector<std::uint8_t> bodies, heads(ph * segs.size());
+    for (std::size_t i = 0; i < segs.size(); ++i) {
+        bodies.resize(bodies.size() + ((0 - (base + bodies.size())) & 0x7F));
+        const std::size_t h = ph * i;
+        const std::uint32_t len = static_cast<std::uint32_t>(segs[i].second.size());
+        put32(heads, h, 1);
+        put32(heads, h + 4, static_cast<std::uint32_t>(base + bodies.size()));
+        put32(heads, h + 8, segs[i].first);
+        put32(heads, h + 12, segs[i].first);
+        put32(heads, h + 16, len);
+        put32(heads, h + 20, len);
+        put32(heads, h + 24, 7);
+        put32(heads, h + 28, 0x80);
+        bodies.insert(bodies.end(), segs[i].second.begin(), segs[i].second.end());
+    }
+    out.assign(base, 0);
+    const std::uint8_t ident[16] = {0x7F, 'E', 'L', 'F', 1, 1, 1};
+    std::memcpy(out.data(), ident, 16);
+    put16(out, 16, 2);
+    put16(out, 18, 8);
+    put32(out, 20, 1);
+    put32(out, 24, entry);
+    put32(out, 28, header);
+    put32(out, 32, 0);
+    put32(out, 36, 0x20924001);
+    put16(out, 40, header);
+    put16(out, 42, ph);
+    put16(out, 44, static_cast<std::uint32_t>(segs.size()));
+    put16(out, 46, 40);
+    std::memcpy(out.data() + header, heads.data(), heads.size());
+    out.insert(out.end(), bodies.begin(), bodies.end());
+    return true;
+}
+
 // Puts the program from the user's ISO into core.elf when it is the expected version. Returns the
 // ISO path, or "" with the reason in the log.
 std::string prepare_user_disc() {
@@ -615,6 +717,15 @@ std::string prepare_user_disc() {
         return "";
     }
     const std::uint32_t want = static_cast<std::uint32_t>(std::strtoul(GT4VR_ELF_CRC, nullptr, 16));
+    // Retail: the boot file is a loader; the program is CORE.GT4 (see gt4_core_to_elf).
+    if (pcsx2_crc(elf) != want) {
+        std::vector<std::uint8_t> core, built;
+        if (read_iso_root_file(iso, "CORE.GT4", core) && gt4_core_to_elf(core, built) && pcsx2_crc(built) == want) {
+            logf("[quest] program unpacked from CORE.GT4 (%zu bytes)", built.size());
+            elf.swap(built);
+            boot = "CORE.GT4";
+        }
+    }
     const std::uint32_t crc = pcsx2_crc(elf);
     if (crc != want) {
         logf("[quest] %s: program %s has CRC %08X, this version needs %08X (%s).", iso.c_str(), boot.c_str(), crc,

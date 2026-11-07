@@ -132,7 +132,7 @@ if(PS2_GENERATED)
         add_library(gt4vr SHARED quest/host/quest_main.cpp quest/host/quest_xr.cpp quest/host/quest_host.cpp quest/host/gt4_camera.cpp quest/host/gt4_lan.cpp ${GT4VR_ONLINE_SOURCES})
         target_include_directories(gt4vr PRIVATE "${PS2_OPENXR_DIR}/include" runtime/src/gs)
         target_link_libraries(gt4vr PRIVATE ps2game ps2runtime native_app_glue
-            "${PS2_OPENXR_DIR}/lib/${ANDROID_ABI}/libopenxr_loader.so" EGL GLESv3 aaudio android log dl)
+            "${PS2_OPENXR_DIR}/lib/${ANDROID_ABI}/libopenxr_loader.so" EGL GLESv3 aaudio android log dl z)
         target_link_options(gt4vr PRIVATE "-uANativeActivity_onCreate")
         # "Gran Turismo 4 VR" carries both versions: libgt4vr_specii.so + libgt4vr_online.so, each started
         # by its own activity in its own process (quest/android LauncherActivity picks one).
