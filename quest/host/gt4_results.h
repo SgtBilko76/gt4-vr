@@ -35,4 +35,12 @@ void createRoom();
 void joinRoom(const std::string &id);
 void leaveRoom();
 
+// GT4's LAN Settings (GT Mode > Options > LAN Settings), written straight into the game's object so
+// the player never visits that menu: host = this console creates the race, players = how many
+// consoles the host waits for (1..6). False when the object isn't in memory (game not booted).
+// Test env (ps2run / config.txt): PS2_LAN_HOST=0|1 + PS2_LAN_PLAYERS=n are applied once the object
+// exists.
+bool setLanSettings(bool host, int players);
+bool lanSettings(bool &host, int &players);
+
 }

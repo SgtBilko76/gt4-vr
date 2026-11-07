@@ -485,6 +485,22 @@ void joinRoom(const std::string &id) {
 
 void leaveRoom() { set_room({}); }
 
+bool setLanSettings(bool host, int players) {
+    if (rd32(kLanSettings) != kLanSettingsVtable || players < 1 || players > 6) return false;
+    const std::uint32_t h = host ? 1u : 0u, n = static_cast<std::uint32_t>(players);
+    std::memcpy(ps2::g_ram + kLanSettings + 0x98, &h, 4);
+    std::memcpy(ps2::g_ram + kLanSettings + 0xA0, &n, 4);
+    std::fprintf(stderr, "[results] LAN settings set: host %s, %d players\n", host ? "yes" : "no", players);
+    return true;
+}
+
+bool lanSettings(bool &host, int &players) {
+    const LanSettings s = lan_settings();
+    host = s.host;
+    players = s.players;
+    return s.valid;
+}
+
 void install() {
     if (const char *v = std::getenv("PS2_GT4_LAPLOG")) g_log = std::atoi(v);
     if (const char *v = std::getenv("PS2_GT4_RESULTS_CAR")) g_force_car = std::atoi(v);
@@ -505,6 +521,26 @@ void install() {
             else joinRoom(room);
         }
         std::fprintf(stderr, "[results] reporting laps to %s:%s as %s\n", g_host.c_str(), g_port.c_str(), g_device.c_str());
+    }
+    // Test: LAN Settings written as soon as the object exists (then checked once a second, so a
+    // value the game reloads from the save is overwritten again and shows in the log).
+    if (const char *h = std::getenv("PS2_LAN_HOST"); h && *h) {
+        const bool host = std::atoi(h) != 0;
+        const int players = std::getenv("PS2_LAN_PLAYERS") ? std::atoi(std::getenv("PS2_LAN_PLAYERS")) : 2;
+        auto previous = ps2::g_options.on_vblank;
+        ps2::g_options.on_vblank = [previous, host, players] {
+            if (previous) previous();
+            static unsigned n = 0;
+            if (++n % 60) return;
+            bool h0 = false;
+            int p0 = 0;
+            if (lanSettings(h0, p0) && (h0 != host || p0 != players))
+            {
+                std::fprintf(stderr, "[results] LAN settings were host %d, %d players (frame %llu)\n", h0 ? 1 : 0, p0,
+                             static_cast<unsigned long long>(ps2::frame_count()));
+                setLanSettings(host, players);
+            }
+        };
     }
     for (const Probe &p : kProbes) {
         ps2::set_probe_hook(p.pc, [&p](ps2::Cpu &c) {
