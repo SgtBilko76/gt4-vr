@@ -434,15 +434,14 @@ void draw(std::vector<std::uint8_t> &px, const Data &d, const Context &ctx) {
         if (cur.id.empty()) {
             cv.text("You are in the open lobby: Multi-LAN Race finds everyone who is not in a race.", 40, 192, 22, kDim, kWidth - 80);
             cv.text("Create a race, or pick one below and press A to join it.", 40, 218, 22, kDim, kWidth - 80);
+        } else if (cur.host) {
+            cv.text("Your race " + cur.id + " is open. In GT4: Options > LAN Settings > Host: Yes, No. of Players = seats,", 40,
+                    192, 22, kGold, kWidth - 80);
+            cv.text("then Arcade > Multi-LAN Race > Connect. The race starts when all seats are taken.", 40, 218, 22, kGold,
+                    kWidth - 80);
         } else {
-            // GT4 is driven to the Multi-LAN lobby by the app (gt4_results lobby drive).
-            const std::string st = gt4::results::lobbyDriveStatus();
-            cv.text((cur.host ? "Your race " + cur.id + " is open (2 seats)." : "You joined race " + cur.id + ".") +
-                        (st.empty() ? std::string() : "  GT4: " + st),
-                    40, 192, 22, kGold, kWidth - 80);
-            cv.text(cur.host ? "Close this menu: GT4 goes to Multi-LAN Race by itself. Pick course and car when the other player is in."
-                             : "Close this menu: GT4 goes to Multi-LAN Race by itself and waits for the host's course and car.",
-                    40, 218, 22, kGold, kWidth - 80);
+            cv.text("You joined race " + cur.id + ". In GT4: Options > LAN Settings > Host: No,", 40, 192, 22, kGold, kWidth - 80);
+            cv.text("then Arcade > Multi-LAN Race > Connect and wait for the host to start.", 40, 218, 22, kGold, kWidth - 80);
         }
         constexpr int kRacesTop = kTableTop + 34;
         table(cv, {{"Host", 50, 180, 0}, {"Race", 240, 130, 0}, {"Track", 380, 330, 0}, {"Players", 720, 110, 0},
@@ -572,16 +571,10 @@ void select() {
     }
     const gt4::results::Room cur = gt4::results::room();
     if (row0) {
-        if (cur.id.empty()) {
-            gt4::results::createRoom();
-            gt4::results::startLobbyDrive(true, 2);
-        } else {
-            gt4::results::leaveRoom();
-            gt4::results::stopLobbyDrive();
-        }
+        if (cur.id.empty()) gt4::results::createRoom();
+        else gt4::results::leaveRoom();
     } else if (join != cur.id) {
         gt4::results::joinRoom(join);
-        gt4::results::startLobbyDrive(false);
     }
     g_dirty = true;
     g_refresh = true;
