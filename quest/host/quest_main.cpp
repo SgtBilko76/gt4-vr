@@ -879,6 +879,22 @@ void android_main(android_app *app) {
         } else if (extract_textures(assets, files)) {
             setenv("RRV_PCSX2_GS_TEXTURE_DIR", (files / "textures").c_str(), 0);
             setenv("RRV_PCSX2_GS_TEXTURE_SERIAL", "SCUS-97436", 0);
+            // config.txt RRV_PCSX2_GS_TEXTURE_DUMP=1: the bridge writes the textures without an HD
+            // replacement to textures/SCUS-97436/dumps; that folder is pointed at the shared data
+            // folder so they can be pulled (app storage is private).
+            const char *dump = std::getenv("RRV_PCSX2_GS_TEXTURE_DUMP");
+            if (dump && std::strcmp(dump, "1") == 0) {
+                std::error_code dec;
+                const fs::path link = files / "textures" / "SCUS-97436" / "dumps";
+                const fs::path target = fs::path(kDataDir) / "texdumps";
+                fs::create_directories(target, dec);
+                if (!fs::is_symlink(link, dec)) {
+                    fs::remove_all(link, dec);
+                    fs::create_directory_symlink(target, link, dec);
+                }
+                logf("[quest] textures without replacement are dumped to %s%s", target.c_str(),
+                     dec ? " (link failed)" : "");
+            }
         }
         if (!start_game(files)) logf("[quest] game not started: copy core.elf and disc.iso to %s", kDataDir.c_str());
         else perf_loop();
