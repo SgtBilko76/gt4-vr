@@ -670,6 +670,9 @@ bool start_game(const fs::path &files) {
     // Owner 2026-11-06: light flares / sun glare off (the glare landed on the VR HUD panel; saves the
     // per-field GPU readback). runtime gs.cpp hide_flare_table; config.txt PS2_GS_HIDE_FLARES=0 = on.
     setenv("PS2_GS_HIDE_FLARES", "1", 0);
+    // VR view: the rear-view mirror goes onto the HUD layer, fixed in the driving direction like the
+    // HUD (owner 2026-11-07: it moved with the head). PCSX2 fork rrv_mirror; RRV_GT4_MIRROR_HUD=0 = old.
+    setenv("RRV_GT4_MIRROR_HUD", "1", 0);
     setenv("RRV_PCSX2_GS_SCALE_X", "3", 0);
     setenv("RRV_PCSX2_GS_SCALE", "4", 0);
     // Sharpness (owner 2026-10-30: "das Bild ist total unscharf"): AMD CAS on the presented frame
