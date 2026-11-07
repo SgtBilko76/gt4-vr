@@ -138,6 +138,8 @@ std::uint64_t frames_run();
 std::uint64_t primitives_drawn();
 // pad 0 is the first controller port, pad 1 the second, which starts unplugged
 void set_pad_buttons(std::uint16_t pressed, int pad = 0);
+// Buttons the host presses on top of the player's input (menu automation); 0 releases them.
+void set_pad_override(std::uint16_t pressed, int pad = 0);
 void set_pad_axis(int axis, std::uint8_t value, int pad = 0);
 void set_pad_pressure(int button, std::uint8_t value, int pad = 0);
 void set_pad_connected(int pad, bool connected);

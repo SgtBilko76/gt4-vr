@@ -15,6 +15,8 @@ std::uint32_t read(std::uint32_t a);
 void write(std::uint32_t a, std::uint32_t v);
 void arm_dma(int channel, std::uint32_t madr, std::uint32_t block_words, std::uint32_t blocks);
 void set_buttons(int pad, std::uint16_t pressed_mask);
+// Buttons held on top of the player's (host-side menu automation); 0 = none.
+void set_override(int pad, std::uint16_t pressed_mask);
 void set_axis(int pad, int axis, std::uint8_t value);
 void set_pressure(int pad, int button, std::uint8_t value);
 void set_connected(int pad, bool connected);

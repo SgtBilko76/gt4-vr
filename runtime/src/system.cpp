@@ -724,6 +724,7 @@ void browser_yield() {}
 std::uint64_t frames_run() { return g_frames; }
 std::uint64_t primitives_drawn() { return gs::primitives_drawn(); }
 void set_pad_buttons(std::uint16_t pressed, int pad) { iop::sio2::set_buttons(pad, pressed); }
+void set_pad_override(std::uint16_t pressed, int pad) { iop::sio2::set_override(pad, pressed); }
 void set_pad_axis(int axis, std::uint8_t value, int pad) { iop::sio2::set_axis(pad, axis, value); }
 void set_pad_pressure(int button, std::uint8_t value, int pad) { iop::sio2::set_pressure(pad, button, value); }
 void set_pad_connected(int pad, bool connected) { iop::sio2::set_connected(pad, connected); }

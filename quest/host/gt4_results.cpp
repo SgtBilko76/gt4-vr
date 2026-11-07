@@ -485,6 +485,110 @@ void joinRoom(const std::string &id) {
 
 void leaveRoom() { set_room({}); }
 
+// Menu screens open right now (names of mRootWindow objects, from their open/close functions).
+std::mutex g_roots_mutex;
+std::multiset<std::string> g_roots;
+std::uint32_t g_top_root = 0;   // last TopRoot opened (title screen or GT Mode's map)
+
+bool root_open(const char *name) { return g_roots.count(name) != 0; }
+
+// TopRoot serves both the title screen and GT Mode's map; the title's script has initialize_optionmenu.
+bool top_is_title() {
+    const std::uint32_t desc = rd32(g_top_root + 0x1C);
+    return rdstr(rd32(rd32(desc + 0x20) + 0x2C), 40) == "initialize_optionmenu";
+}
+
+std::string root_name(std::uint32_t root);
+
+struct Drive {
+    bool active = false;
+    bool host = false;
+    int players = 2;
+    std::string status;
+    std::deque<std::pair<std::uint16_t, int>> keys;   // (buttons, frames); 0 = pause
+    std::string last_screen;
+    unsigned waited = 0;      // frames since the last step without a screen change
+    unsigned total = 0;       // frames since the start
+    bool quit_gt = false;     // Triangle pressed on GT Mode's map: the next ConfirmDialog is "Quit GT Mode?"
+};
+std::mutex g_drive_mutex;
+Drive g_drive;
+
+constexpr std::uint16_t kUp = 1u << 4, kRight = 1u << 5, kDown = 1u << 6, kLeft = 1u << 7,
+                        kTriangle = 1u << 12, kCross = 1u << 14;
+
+void tap(Drive &d, std::uint16_t b) {
+    d.keys.push_back({b, 6});
+    d.keys.push_back({0, 30});
+}
+
+void drive_frame() {
+    std::lock_guard<std::mutex> lock(g_drive_mutex);
+    Drive &d = g_drive;
+    if (!d.active) return;
+    ++d.total;
+    if (!d.keys.empty()) {
+        auto &k = d.keys.front();
+        ps2::set_pad_override(k.first);
+        if (--k.second <= 0) d.keys.pop_front();
+        return;
+    }
+    ps2::set_pad_override(0);
+    std::string screen;
+    {
+        std::lock_guard<std::mutex> rl(g_roots_mutex);
+        if (root_open("MatchingRoot")) screen = "lobby";
+        else if (root_open("ConnectingRoot") || root_open("ConnectRoot")) screen = "connecting";
+        else if (root_open("ConfirmDialog")) screen = "dialog";
+        else if (root_open("GameRoot")) screen = "arcade";
+        else if (root_open("HomeRoot")) screen = "home";
+        else if (root_open("TopRoot")) screen = top_is_title() ? "title" : "gtmap";
+        else if (root_open("MovieRoot")) screen = "movie";
+    }
+    if (screen == "lobby") {
+        d.status = d.host ? "Lobby open - waiting for players" : "In the lobby - waiting for the host";
+        std::fprintf(stderr, "[drive] lobby reached after %u frames\n", d.total);
+        d.active = false;
+        return;
+    }
+    if (d.total > 60 * 150) {
+        d.status = "Could not reach the LAN lobby (open the GT4 title screen and try again)";
+        std::fprintf(stderr, "[drive] gave up on screen '%s'\n", screen.c_str());
+        d.active = false;
+        return;
+    }
+    if (screen == d.last_screen && ++d.waited < 240) return;   // the last step still takes effect
+    if (screen != d.last_screen) std::fprintf(stderr, "[drive] f%llu screen %s\n",
+                                              static_cast<unsigned long long>(ps2::frame_count()), screen.c_str());
+    d.last_screen = screen;
+    d.waited = 0;
+    if (screen == "connecting") { d.status = "Connecting..."; return; }
+    if (screen == "movie") { d.status = "Skipping the intro..."; tap(d, 1u << 3); return; }
+    if (screen == "home") { d.status = "Leaving GT Mode..."; tap(d, kTriangle); return; }
+    if (screen == "gtmap") { d.status = "Leaving GT Mode..."; d.quit_gt = true; tap(d, kTriangle); return; }
+    if (screen == "dialog") {
+        if (d.quit_gt) tap(d, kCross);   // "Quit GT Mode?" - OK is preselected
+        return;
+    }
+    if (screen == "title") {
+        d.status = "Opening Arcade Mode...";
+        for (int i = 0; i < 4; ++i) tap(d, kUp);   // Arcade Mode is the end of the list
+        tap(d, kCross);
+        return;
+    }
+    if (screen == "arcade") {
+        d.status = "Opening Multi-LAN Race...";
+        setLanSettings(d.host, d.players);
+        for (int i = 0; i < 3; ++i) tap(d, kUp);
+        for (int i = 0; i < 3; ++i) tap(d, kLeft);
+        tap(d, kDown);
+        tap(d, kRight);
+        tap(d, kCross);
+        return;
+    }
+    d.status = "Waiting for a menu...";
+}
+
 bool setLanSettings(bool host, int players) {
     if (rd32(kLanSettings) != kLanSettingsVtable || players < 1 || players > 6) return false;
     const std::uint32_t h = host ? 1u : 0u, n = static_cast<std::uint32_t>(players);
@@ -492,6 +596,42 @@ bool setLanSettings(bool host, int players) {
     std::memcpy(ps2::g_ram + kLanSettings + 0xA0, &n, 4);
     std::fprintf(stderr, "[results] LAN settings set: host %s, %d players\n", host ? "yes" : "no", players);
     return true;
+}
+
+// GT4's menu screens are mRootWindow objects (vtable 0x665418); the name sits at *(obj+0x1C)+0x2C
+// ("GameRoot", "MatchingRoot", ...). Measured on PC states 2026-11-07.
+std::string root_name(std::uint32_t root) {
+    if (rd32(root + 4) != 0x00665418u) return {};
+    return rdstr(rd32(rd32(root + 0x1C) + 0x2C), 48);
+}
+
+// PS2_GT4_ROOTLOG=1 (research): which screen each mRootWindow function runs on, logged when it changes.
+struct RootProbe { std::uint32_t pc; const char *name; };
+const RootProbe kRootProbes[] = {
+    {0x0022FA08u, "closePage"}, {0x00235680u, "onKeyPress"}, {0x00235A20u, "onEvent"},
+    {0x00233E38u, "v61"}, {0x00234790u, "v51"}, {0x00234940u, "v63"}, {0x00234A98u, "v64"},
+    {0x00234BC0u, "v67"}, {0x00235270u, "v68"}, {0x00234D60u, "v89"}, {0x002353A8u, "v90"},
+};
+
+void startLobbyDrive(bool host, int players) {
+    std::lock_guard<std::mutex> lock(g_drive_mutex);
+    g_drive = Drive{};
+    g_drive.active = true;
+    g_drive.host = host;
+    g_drive.players = std::clamp(players, 1, 6);
+    g_drive.status = "Starting...";
+    std::fprintf(stderr, "[drive] start: %s, %d players\n", host ? "host" : "join", g_drive.players);
+}
+
+void stopLobbyDrive() {
+    std::lock_guard<std::mutex> lock(g_drive_mutex);
+    g_drive = Drive{};
+    ps2::set_pad_override(0);
+}
+
+std::string lobbyDriveStatus() {
+    std::lock_guard<std::mutex> lock(g_drive_mutex);
+    return g_drive.status;
 }
 
 bool lanSettings(bool &host, int &players) {
@@ -541,6 +681,46 @@ void install() {
                 setLanSettings(host, players);
             }
         };
+    }
+    // Open menu screens (mRootWindow open/close = vtable slots 67/68), for the lobby drive.
+    ps2::set_probe_hook(0x00234BC0u, [](ps2::Cpu &c) {
+        const std::uint32_t obj = c.r[4].w[0];
+        const std::string n = root_name(obj);
+        if (n.empty()) return;
+        std::lock_guard<std::mutex> rl(g_roots_mutex);
+        g_roots.insert(n);
+        if (n == "TopRoot") g_top_root = obj;
+    });
+    ps2::set_probe_hook(0x00235270u, [](ps2::Cpu &c) {
+        const std::string n = root_name(c.r[4].w[0]);
+        std::lock_guard<std::mutex> rl(g_roots_mutex);
+        if (auto it = g_roots.find(n); it != g_roots.end()) g_roots.erase(it);
+    });
+    {
+        auto previous = ps2::g_options.on_vblank;
+        ps2::g_options.on_vblank = [previous] {
+            if (previous) previous();
+            drive_frame();
+        };
+    }
+    if (const char *a = std::getenv("PS2_LAN_AUTO"); a && *a)
+        startLobbyDrive(std::strcmp(a, "join") != 0, std::getenv("PS2_LAN_PLAYERS") ? std::atoi(std::getenv("PS2_LAN_PLAYERS")) : 2);
+    if (std::getenv("PS2_GT4_ROOTLOG")) {
+        for (const RootProbe &rp : kRootProbes) {
+            ps2::set_probe_hook(rp.pc, [&rp](ps2::Cpu &c) {
+                static std::uint32_t last[32] = {};
+                static unsigned long long count[32] = {};
+                const std::size_t i = static_cast<std::size_t>(&rp - kRootProbes);
+                const std::uint32_t obj = rp.pc == 0x0022FA08u ? c.r[5].w[0] : c.r[4].w[0];
+                ++count[i];
+                if (obj != last[i]) {
+                    last[i] = obj;
+                    std::fprintf(stderr, "[root] f%llu %s %08X %s (calls %llu)\n",
+                                 static_cast<unsigned long long>(ps2::frame_count()), rp.name, obj,
+                                 root_name(obj).c_str(), count[i]);
+                }
+            });
+        }
     }
     for (const Probe &p : kProbes) {
         ps2::set_probe_hook(p.pc, [&p](ps2::Cpu &c) {

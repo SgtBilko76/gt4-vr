@@ -65,6 +65,7 @@ Pad g_pads[2];
 // which ports the host has a controller in; kept out of save states so loading one does not unplug a pad
 bool g_plugged[2] = {true, false};
 Feel g_feel[2];
+std::uint16_t g_override[2] = {};
 Card g_card, g_card2;  // slot 1 (SIO2 port 2) and slot 2 (port 3)
 Dma g_dma[2];
 
@@ -85,7 +86,7 @@ void controller(int port, std::size_t at, std::uint32_t out_size) {
     put(0, 0xFF);
     put(1, p.config ? kConfig : p.mode);
     put(2, 0x5A);
-    const std::uint16_t raw = static_cast<std::uint16_t>(~p.buttons);
+    const std::uint16_t raw = static_cast<std::uint16_t>(~(p.buttons | g_override[port & 1]));
     auto data = [&]() {
         put(3, static_cast<std::uint8_t>(raw));
         put(4, static_cast<std::uint8_t>(raw >> 8));
@@ -410,6 +411,10 @@ void arm_dma(int channel, std::uint32_t madr, std::uint32_t block_words, std::ui
     d.madr = madr;
     d.block_words = block_words;
     d.blocks = blocks;
+}
+
+void set_override(int pad, std::uint16_t pressed_mask) {
+    if (pad >= 0 && pad < 2) g_override[pad] = pressed_mask;
 }
 
 void set_buttons(int pad, std::uint16_t pressed_mask) {

@@ -1,0 +1,32 @@
+# GT4 Online (retail SCUS-97328) lap results: race conductor line crossings (quest/host/gt4_results.cpp)
+357b10
+357b90
+357d00
+347928
+3479b8
+3f5028
+3f5780
+3f59f8
+357b98
+347230
+3f5150
+3f5b80
+3f6c28
+357e00
+357e80
+# 3D on in races only: race renderer after applyProjection (A-Spec II 0x1EB1F4), gt4_camera.cpp installSceneDetector
+33ebb4
+# VR view (both stick clicks): race renderer after applyModelview (A-Spec II 0x1EB234), gt4_camera.cpp install(retail)
+33ebf4
+# Menu screen research (PS2_GT4_ROOTLOG): mRenderContext::closePage, mRootWindow onKeyPress/onEvent/virtuals
+22fa08
+235680
+235a20
+233e38
+234790
+234940
+234a98
+234bc0
+235270
+234d60
+2353a8

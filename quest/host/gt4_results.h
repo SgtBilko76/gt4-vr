@@ -43,4 +43,12 @@ void leaveRoom();
 bool setLanSettings(bool host, int players);
 bool lanSettings(bool &host, int &players);
 
+// Drives GT4's menus to the Multi-LAN lobby on its own (from GT Mode's map or Home, the title
+// screen or the Arcade menu): sets Host/players, then presses the buttons screen by screen,
+// checking which screen is open before every step. createRoom()/joinRoom() start it; the status
+// line is for the online panel ("" when idle). Test: PS2_LAN_AUTO=host|join.
+void startLobbyDrive(bool host, int players = 2);
+void stopLobbyDrive();
+std::string lobbyDriveStatus();
+
 }
