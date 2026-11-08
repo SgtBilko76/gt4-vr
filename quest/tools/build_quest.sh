@@ -22,13 +22,13 @@ variant() {
   # Retail USA v2.00 (owner 2026-11-05: online through his relay: lobby panel, leaderboard reports, ad hoc
   # Multi-LAN Race; 3D; no HD texture pack). The user's own ISO in /sdcard/GT4HD; the program is read from
   # it and checked (CRC A9D9C0A2), like Spec II.
-  gt4r) VARIANT=(-DGT4VR_DATA_DIR=/sdcard/GT4HD -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="Gran Turismo 4 VR (Online)"
+  gt4r) VARIANT=(-DGT4VR_DATA_DIR=/sdcard/GT4HD -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="Gran Turismo 4 3D VR (Online)"
                  -DGT4VR_NET_PRODUCT=SCUS97328 -DGT4VR_CAMERA_HOOKS=ON -DGT4VR_ONLINE=ON
                  -DGT4VR_ELF_CRC=A9D9C0A2 "-DGT4VR_DISC_NAME=Gran Turismo 4 (USA) v2.00" -DGT4VR_LIB_NAME=gt4vr_online)
         LIBNAME=gt4vr_online; SRC=gt4r ;;
   # Spec II 1.10 (owner 2026-11-06): the user brings his own patched ISO (any *.iso in /sdcard/GT4SpecII),
   # the app checks the program's CRC. Offline only (no network play options in Spec II).
-  gt4s) VARIANT=(-DGT4VR_DATA_DIR=/sdcard/GT4SpecII -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="Gran Turismo 4 VR (Spec II)"
+  gt4s) VARIANT=(-DGT4VR_DATA_DIR=/sdcard/GT4SpecII -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="Gran Turismo 4 3D VR (Spec II)"
                  -DGT4VR_NET_PRODUCT=SPEC2V110 -DGT4VR_CAMERA_HOOKS=ON -DGT4VR_ONLINE=OFF -DGT4VR_RELAY=OFF
                  -DGT4VR_ELF_CRC=646B2E29 "-DGT4VR_DISC_NAME=Gran Turismo 4 Spec II 1.10" -DGT4VR_LIB_NAME=gt4vr_specii)
         LIBNAME=gt4vr_specii; SRC=gt4s ;;
@@ -39,8 +39,8 @@ variant() {
 # (quest/android LauncherActivity). Package online.portroyale.gt4vr (the Spec II app's, keeps its saves).
 # GAME=gt4s / gt4r build an app with only that version (the selector then starts it directly).
 case "$GAME" in
-  gt4vr) GAMES=(gt4s gt4r); APP_ID=online.portroyale.gt4vr; APP_LABEL="Gran Turismo 4 VR" ;;
-  gt4s)  GAMES=(gt4s); APP_ID=online.portroyale.gt4vr; APP_LABEL="Gran Turismo 4 VR" ;;
+  gt4vr) GAMES=(gt4s gt4r); APP_ID=online.portroyale.gt4vr; APP_LABEL="Gran Turismo 4 3D VR" ;;
+  gt4s)  GAMES=(gt4s); APP_ID=online.portroyale.gt4vr; APP_LABEL="Gran Turismo 4 3D VR" ;;
   gt4r)  GAMES=(gt4r); APP_ID=online.portroyale.gt4hd; APP_LABEL="Gran Turismo 4 Online VR" ;;
   *) echo "unknown GAME=$GAME (gt4vr, gt4s, gt4r)" >&2; exit 2 ;;
 esac
