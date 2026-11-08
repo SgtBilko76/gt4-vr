@@ -13,6 +13,9 @@
 // emulation thread). PC test 2026-11-08: switching at boot frame ~34 (SCE screen) froze the game, so the
 // first switch waits for PS2_GT4_480P_FROM frames (default 1200, the title screen).
 // Modes 1, 3 and 5 are left alone (a player's 1080i choice stays). PS2_GT4_480P=0 = off.
+// Spec II also resets the GS to interlaced WITHOUT going through the request object (owner 2026-11-08 log:
+// SetGsCrt 1/0x2 while +0x9C still said 4), so the actual SetGsCrt state is watched too: mode 4 applied but
+// the GS interlaced again -> request 4 once more.
 #include "gt4_display.h"
 
 #include "ps2/memory.hpp"
@@ -75,7 +78,8 @@ void tick()
     g_last_mode = mode;
     g_last_pending = pending;
     g_video = video;
-    if (pending != 0 || mode != kInterlaced || video || g_frame < g_from)
+    const bool lost = mode == kProgressive && ps2::gs_crt_interlace() != 0;
+    if (pending != 0 || (mode != kInterlaced && !lost) || video || g_frame < g_from)
     {
         g_stable = 0;
         return;
@@ -86,8 +90,8 @@ void tick()
     wr32(g_object + kModeOffset, kProgressive);
     wr32(g_object + kPendingOffset, 1u);
     if (++g_switches <= 20)
-        std::fprintf(stderr, "[gt4display] frame %llu: mode 2 (interlaced) -> 4 (480p progressive) requested (%u)\n",
-                     static_cast<unsigned long long>(g_frame), g_switches);
+        std::fprintf(stderr, "[gt4display] frame %llu: %s -> 4 (480p progressive) requested (%u)\n",
+                     static_cast<unsigned long long>(g_frame), lost ? "GS reset to interlaced behind mode 4" : "mode 2 (interlaced)", g_switches);
 }
 
 } // namespace gt4::display

@@ -1,4 +1,5 @@
 #include "hw.hpp"
+#include "ps2/video.hpp"
 
 #include "dmac.hpp"
 #include "gs/gif.hpp"
@@ -309,4 +310,8 @@ void state(ps2::state::Stream &s) {
     s.pod(g_timers);
 }
 
+}
+
+namespace ps2 {
+std::uint32_t gs_crt_interlace() { return hw::g_crt[0]; }
 }
