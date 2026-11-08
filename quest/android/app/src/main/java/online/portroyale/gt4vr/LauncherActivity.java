@@ -14,6 +14,7 @@ import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
@@ -103,7 +104,21 @@ public class LauncherActivity extends Activity {
         root.setGravity(Gravity.CENTER);
         root.setBackgroundColor(Color.rgb(12, 16, 28));
         root.setPadding(48, 32, 48, 32);
+        // Owner's logo, name and website (Port Royale).
+        ImageView logo = new ImageView(this);
+        logo.setImageResource(R.drawable.logo_royale);
+        logo.setAdjustViewBounds(true);
+        root.addView(logo, new LinearLayout.LayoutParams(160, 160));
         root.addView(text("Gran Turismo 4 VR", 34, Color.WHITE, true));
+        TextView by = text("by Sgt.Bilko  ·  portroyale.online", 18, Color.rgb(200, 60, 60), false);
+        by.setPaintFlags(by.getPaintFlags() | android.graphics.Paint.UNDERLINE_TEXT_FLAG);
+        by.setOnClickListener(view -> {
+            try {
+                startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://portroyale.online")));
+            } catch (Exception ignored) {
+            }
+        });
+        root.addView(by);
         root.addView(text("Choose the game version", 18, Color.rgb(170, 180, 200), false));
         for (final Version v : VERSIONS) {
             if (!present(v)) continue;
@@ -119,6 +134,13 @@ public class LauncherActivity extends Activity {
             lp.topMargin = 28;
             root.addView(b, lp);
         }
+        // Recentring here (Meta button) fixes the screen height in the game that follows (owner 2026-11-08).
+        TextView tip = text("Tip: hold the Meta button to recenter before choosing - the game screen then sits at eye level.",
+                            16, Color.rgb(150, 160, 180), false);
+        LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
+                                                                     LinearLayout.LayoutParams.WRAP_CONTENT);
+        tp.topMargin = 28;
+        root.addView(tip, tp);
         setContentView(root);
     }
 }
