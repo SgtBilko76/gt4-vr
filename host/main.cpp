@@ -1,6 +1,7 @@
 #ifdef PS2_GT4_CAMERA
 #include "../quest/host/gt4_camera.h"
 #include "../quest/host/gt4_lan.h"
+#include "../quest/host/gt4_display.h"
 #include "../quest/host/gt4_results.h"
 #endif
 #include "ps2/system.hpp"
@@ -127,6 +128,15 @@ int main(int argc, char **argv) {
     else gt4::camera::install(nullptr, nullptr, std::getenv("PS2_GT4_RETAIL") != nullptr);
     if (std::getenv("PS2_GT4_SPEC2LAN")) gt4::lan::installSpecIIMenu(); // games/gt4s probes
     gt4::results::install();                // GT4 Online lap results (retail build probes)
+    // PS2_GT4_480P=1 on the PC (the Quest app has it on by default): GT4 switched to 480p progressive.
+    if (const char *p = std::getenv("PS2_GT4_480P"); p && p[0] == '1') {
+        gt4::display::install(std::getenv("PS2_GT4_RETAIL") != nullptr);
+        auto previous = ps2::g_options.on_vblank;
+        ps2::g_options.on_vblank = [previous] {
+            if (previous) previous();
+            gt4::display::tick();
+        };
+    }
 #endif
     const auto emulate = [&]() -> int {
         std::uint32_t entry = 0;

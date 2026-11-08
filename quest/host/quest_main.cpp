@@ -49,6 +49,7 @@ void register_generated_code();
 
 #include "gt4_camera.h"
 #include "gt4_lan.h"
+#include "gt4_display.h"
 #if GT4VR_ONLINE
 #include "gt4_results.h"
 #include "online_panel.h"
@@ -903,12 +904,16 @@ bool start_game(const fs::path &files) {
     ps2::g_options.on_vblank = [] {
         ps2::post_present();
         apply_pad();
+        gt4::display::tick();
         pace();
     };
     ps2::set_audio_sink(queue_audio);
     register_generated_code();
     register_generated_vu();
     const bool retail_program = std::strcmp(GT4VR_NET_PRODUCT, "SCUS97328") == 0;
+    // 480p progressive at start and after videos (owner 2026-11-08: far sharper in VR; GT4 itself starts
+    // interlaced every time). config.txt PS2_GT4_480P=0 = GT4's own behaviour.
+    gt4::display::install(retail_program);
     // Race camera hooks = the head-tracked VR view (both stick clicks). Spec II and, since
     // 2026-11-07 (owner), the retail online version too; they also feed the race scene detection.
     if (GT4VR_CAMERA_HOOKS) gt4::camera::install(quest_head, gt4::quest::noteHeadTrackedFrame, retail_program);

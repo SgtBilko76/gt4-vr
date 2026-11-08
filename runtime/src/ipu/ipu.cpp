@@ -5,6 +5,7 @@
 #include "../hw.hpp"
 
 #include "ps2/state.hpp"
+#include "ps2/video.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -683,6 +684,10 @@ void stats() {
                  g_in.size(), g_bit, g_out.size() - g_out_pos);
 }
 
+}
+
+namespace ps2 {
+std::uint64_t ipu_output_qwords() { return ipu::g_out_qwords; }
 }
 
 namespace ps2::ipu {
