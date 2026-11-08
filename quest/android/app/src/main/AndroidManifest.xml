@@ -105,6 +105,9 @@
             android:label="${appLabel}"
             android:enabled="${speciiLauncher}"
             android:exported="true">
+            <!-- NativeActivity reads lib_name from the LAUNCHED component: an alias needs its own copy. -->
+            <meta-data android:name="android.app.lib_name" android:value="gt4vr_specii" />
+            <meta-data android:name="com.oculus.vr.focusaware" android:value="true" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -118,6 +121,9 @@
             android:label="${appLabel}"
             android:enabled="${onlineLauncher}"
             android:exported="true">
+            <!-- NativeActivity reads lib_name from the LAUNCHED component: an alias needs its own copy. -->
+            <meta-data android:name="android.app.lib_name" android:value="gt4vr_online" />
+            <meta-data android:name="com.oculus.vr.focusaware" android:value="true" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
