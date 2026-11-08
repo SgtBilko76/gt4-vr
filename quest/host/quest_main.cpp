@@ -796,7 +796,11 @@ bool start_game(const fs::path &files) {
     // Owner 2026-11-06 (Spec II 1.10): CAS 50 looked \"very noisy and crispy\" -> off.
     setenv("RRV_PCSX2_GS_CAS", "0", 0);
     // Owner 2026-11-06 (Spec II): 16x anisotropic (his final pick after comparing 8x / 16x).
-    setenv("RRV_PCSX2_GS_ANISO", "16", 0);
+    // Owner 2026-11-08 (Quest 3 VR sharpness tuning): 8x - frees GPU time for the VR render scale.
+    setenv("RRV_PCSX2_GS_ANISO", "8", 0);
+    // Eye images the size of the VR game picture (3.25x4.75 of 640x448 ~ 2080x2016 at 90 deg) instead of
+    // recommended x 1.3 (~2680x2870): bigger eye images add no detail, only GPU cost.
+    setenv("RRV_VR_EYE", "2080x2016", 0);
     // Anti-aliasing (owner 2026-10-30: "3 times PS2 resolution and antialiasing, that works good at
     // Wipeout"): PCSX2's hardware renderer has no MSAA, FXAA on the presented frame is its edge
     // smoothing. RRV_PCSX2_GS_FXAA=0 in config.txt turns it off.
