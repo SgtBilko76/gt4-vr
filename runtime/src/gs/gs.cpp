@@ -1146,13 +1146,19 @@ void vblank(bool start) {
                                  ntsc ? 0x00c7800601a01801ull : g_syncv, g_dispfb[0], g_display[0], g_dispfb[1], g_display[1], g_extbuf, g_extdata,
                                  g_extwrite, g_bgcolor, g_csr | (g_odd_field ? 0x2000u : 0u), g_imr, g_busdir, g_siglblid},
                                 g_odd_field ? 1u : 0u, 0u, bridge::take_field_tag()};
-            static bool logged = false;
-            if (!logged && g_smode2) {
-                logged = true;
-                std::fprintf(stderr, "[gs] display: pmode %llX smode1 %llX smode2 %llX dispfb1 %llX display1 %llX dispfb2 %llX display2 %llX\n",
-                             (unsigned long long)g_pmode, (unsigned long long)field.regs[1], (unsigned long long)g_smode2,
-                             (unsigned long long)g_dispfb[0], (unsigned long long)g_display[0], (unsigned long long)g_dispfb[1],
-                             (unsigned long long)g_display[1]);
+            // Logged on every change of the display setup (owner 2026-11-08: 480p looks too bright /
+            // washed out - compare PMODE, SMODE1 and the DISPFB pixel formats between the modes).
+            static std::uint64_t last[7] = {};
+            static unsigned logged = 0;
+            const std::uint64_t now[7] = {g_pmode, g_smode1, g_smode2, g_dispfb[0], g_display[0], g_dispfb[1], g_display[1]};
+            if (g_smode2 && logged < 60 && std::memcmp(now, last, sizeof now) != 0) {
+                ++logged;
+                std::memcpy(last, now, sizeof now);
+                std::fprintf(stderr, "[gs] display: pmode %llX smode1 %llX (sent %llX) smode2 %llX (sent %llX) dispfb1 %llX display1 %llX dispfb2 %llX display2 %llX bgcolor %llX\n",
+                             (unsigned long long)g_pmode, (unsigned long long)g_smode1, (unsigned long long)field.regs[1],
+                             (unsigned long long)g_smode2, (unsigned long long)smode2, (unsigned long long)g_dispfb[0],
+                             (unsigned long long)g_display[0], (unsigned long long)g_dispfb[1], (unsigned long long)g_display[1],
+                             (unsigned long long)g_bgcolor);
             }
             queue::post(queue::kVblank, 0, 0, &field, sizeof field);
         }

@@ -3,7 +3,8 @@
 #pragma once
 
 namespace gt4::display {
-// retail = GT4 Online v2.00 (SCUS-97328), else A-Spec II. PS2_GT4_480P=0 turns it off.
+// retail = GT4 Online v2.00 (SCUS-97328), else A-Spec II. PS2_GT4_480P: 1 while racing (default),
+// 2 always, 0 off. Needs the race camera hooks (gt4::camera) for the race test.
 void install(bool retail);
 // Call once per vblank (emulation thread, between guest frames).
 void tick();
