@@ -802,17 +802,8 @@ private:
                 gt4::quest::requestClose();
                 break;
             case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:
-            {
-                // A recentre (Meta button, or Horizon's own when the game takes over from the 2D start
-                // screen) takes effect at changeTime: placing the screen before that used the old space
-                // and left it too high (owner 2026-11-08). Place it again once the change is in.
-                const auto &change = reinterpret_cast<const XrEventDataReferenceSpaceChangePending &>(event);
-                m_replace_after = change.changeTime;
-                m_replace_pending = true;
-                XR_LOG("reference space change pending (space type %d) - screen re-placed after it",
-                       static_cast<int>(change.referenceSpaceType));
+                m_screen_placed = false; // the user recentred with the Meta button
                 break;
-            }
             default:
                 break;
             }
@@ -1498,11 +1489,6 @@ private:
                 m_replaced_after_start = true;
                 m_screen_placed = false;
             }
-            if (m_replace_pending && frame_state.predictedDisplayTime > m_replace_after + 300000000LL)
-            {
-                m_replace_pending = false;
-                m_screen_placed = false;
-            }
             if (!m_screen_placed)
                 PlaceScreen(frame_state.predictedDisplayTime);
             XrPosef tracked_pose{};
@@ -1905,7 +1891,7 @@ private:
         m_screen_placed = true;
         if (m_first_place_time == 0)
             m_first_place_time = time;
-        XR_LOG("screen placed at head height %.3f m (offset %.2f m)%s", head.y, m_screen_vertical_offset_m,
+        XR_LOG("screen placed at head height %.2f m (offset %.2f m)%s", head.y, m_screen_vertical_offset_m,
                m_replaced_after_start ? "" : " - re-placed once more 4 s after start");
     }
 
@@ -2044,8 +2030,6 @@ private:
     Actions m_actions;
     bool m_has_refresh_rate_ext = false;
     bool m_has_bd_controller_ext = false;
-    bool m_replace_pending = false;
-    XrTime m_replace_after = 0;
     bool m_has_perf_settings_ext = false;
     bool m_has_cylinder_ext = false;
     bool m_has_image_layout_ext = false;
