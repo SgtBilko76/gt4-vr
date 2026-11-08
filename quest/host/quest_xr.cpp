@@ -159,6 +159,9 @@ constexpr float kImmersiveFovDeg = 90.0f;
 // Render scale in the head-tracked VR view only (owner 2026-11-08: distant objects soft in VR; the curved
 // screen keeps its 3x4). Live: debug.gt4vr.vrscalex / vrscaley (0 = keep the curved screen's value).
 // Switching drops PCSX2's cached render targets, so the first frame after a switch can lack effects.
+// GT4 480p is brighter than interlaced (owner 2026-11-08, both games): factor on GT4's own 480p
+// brightening (~2x). Live: debug.gt4vr.bright480 (0 = this default).
+constexpr float kBright480 = 0.85f;
 constexpr float kVrScaleX = 3.5f;
 constexpr float kVrScaleY = 4.5f;
 // The eye image stays sized for 110 deg (as before): the curved screen uses the same eye image and he
@@ -1314,6 +1317,36 @@ private:
     }
 
     // Immersive race: true-scale disparity (see kNearM); otherwise the screen settings.
+    // GT4 480p brightness factor (bridge rrv_pcsx2_gs_bridge_set_bright_gain), live property.
+    void ApplyBrightGain()
+    {
+        if (!m_set_bright_gain)
+        {
+            if (m_bright_gain_unavailable)
+                return;
+            void *image = dlopen("librrv-pcsx2-gs-bridge.so", RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+            if (!image)
+                return;
+            m_set_bright_gain = reinterpret_cast<void (*)(float)>(dlsym(image, "rrv_pcsx2_gs_bridge_set_bright_gain"));
+            dlclose(image);
+            if (!m_set_bright_gain)
+            {
+                m_bright_gain_unavailable = true;
+                XR_ERR("bridge has no 480p brightness factor");
+                return;
+            }
+        }
+        float g = ReadFloatProperty("debug.gt4vr.bright480", 0.0f);
+        if (!(g > 0.0f))
+            g = kBright480;
+        g = std::clamp(g, 0.25f, 2.0f);
+        if (g == m_bright_gain)
+            return;
+        m_bright_gain = g;
+        m_set_bright_gain(g);
+        XR_LOG("480p brightness factor %.2f", g);
+    }
+
     // Higher GS resolution while the VR view is shown, the start values on the curved screen.
     void ApplyVrScale(bool immersive)
     {
@@ -1554,6 +1587,7 @@ private:
                 m_set_present_aspect(m_present_aspect);
             }
             ApplyVrScale(immersive);
+            ApplyBrightGain();
             if (immersive != m_immersive_shown)
             {
                 m_immersive_shown = immersive;
@@ -2085,6 +2119,9 @@ private:
     bool m_has_refresh_rate_ext = false;
     bool m_has_bd_controller_ext = false;
     void (*m_set_render_scale)(float, float) = nullptr;
+    void (*m_set_bright_gain)(float) = nullptr;
+    bool m_bright_gain_unavailable = false;
+    float m_bright_gain = -1.0f;
     bool m_render_scale_unavailable = false;
     float m_base_scale_x = 0.0f, m_base_scale_y = 0.0f, m_applied_scale_x = -1.0f, m_applied_scale_y = -1.0f;
     bool m_has_perf_settings_ext = false;
