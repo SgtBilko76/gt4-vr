@@ -624,11 +624,6 @@ private:
         res = xrCreateReferenceSpace(m_session, &space_info, &m_local_space);
         if (XR_FAILED(res))
             return Fail("LOCAL space failed", res);
-        // STAGE is gravity-levelled: used only to keep the screen level when LOCAL comes up tilted
-        // (Spec II started from the 2D selector: screen too high until a Meta recentre, owner 2026-11-08).
-        space_info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
-        if (XR_FAILED(xrCreateReferenceSpace(m_session, &space_info, &m_stage_space)))
-            m_stage_space = XR_NULL_HANDLE;
         space_info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
         res = xrCreateReferenceSpace(m_session, &space_info, &m_view_space);
         if (XR_FAILED(res))
@@ -774,8 +769,6 @@ private:
             xrDestroySwapchain(m_badge_swapchain);
         if (m_local_space != XR_NULL_HANDLE)
             xrDestroySpace(m_local_space);
-        if (m_stage_space != XR_NULL_HANDLE)
-            xrDestroySpace(m_stage_space);
         if (m_view_space != XR_NULL_HANDLE)
             xrDestroySpace(m_view_space);
         if (m_actions.set != XR_NULL_HANDLE)
@@ -1895,44 +1888,20 @@ private:
         const XrSpaceLocationFlags needed = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
         if ((location.locationFlags & needed) != needed)
             return;
-        // True "up" in LOCAL: LOCAL should be level, but after the 2D selector it can come up tilted;
-        // STAGE (floor) is levelled by the system. level = rotation taking LOCAL's +y onto true up.
-        XrQuaternionf level{0.0f, 0.0f, 0.0f, 1.0f};
-        float tilt_deg = 0.0f;
-        if (m_stage_space != XR_NULL_HANDLE)
-        {
-            XrSpaceLocation stage{XR_TYPE_SPACE_LOCATION};
-            if (XR_SUCCEEDED(xrLocateSpace(m_stage_space, m_local_space, time, &stage)) &&
-                (stage.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT))
-            {
-                const XrVector3f up = QuatRotate(stage.pose.orientation, {0.0f, 1.0f, 0.0f});
-                const float c = std::clamp(up.y, -1.0f, 1.0f);
-                tilt_deg = std::acos(c) * 57.29578f;
-                // axis = y x up = (up.z, 0, -up.x); half-angle quaternion
-                const float ax = up.z, az = -up.x, n = std::sqrt(ax * ax + az * az);
-                if (n > 1e-5f && tilt_deg > 0.2f && tilt_deg < 45.0f)
-                {
-                    const float h = std::acos(c) * 0.5f;
-                    level = {ax / n * std::sin(h), 0.0f, az / n * std::sin(h), std::cos(h)};
-                }
-            }
-        }
-        const XrVector3f f = QuatRotate(QuatConj(level), QuatRotate(location.pose.orientation, {0.0f, 0.0f, -1.0f}));
-        const float yaw = std::atan2(-f.x, -f.z);
+        const XrQuaternionf &q = location.pose.orientation;
+        const float fx = -2.0f * (q.x * q.z + q.w * q.y);
+        const float fz = -(1.0f - 2.0f * (q.x * q.x + q.y * q.y));
+        const float yaw = std::atan2(-fx, -fz);
         const XrVector3f &head = location.pose.position;
-        const XrQuaternionf orientation = QuatMul(level, {0.0f, std::sin(yaw * 0.5f), 0.0f, std::cos(yaw * 0.5f)});
-        auto at = [&](float ahead) {
-            const XrVector3f d = QuatRotate(orientation, {0.0f, m_screen_vertical_offset_m, -ahead});
-            return XrVector3f{head.x + d.x, head.y + d.y, head.z + d.z};
-        };
-        m_screen_pose.orientation = orientation;
-        m_screen_pose.position = at(0.0f);
-        m_flat_screen_pose.orientation = orientation;
-        m_flat_screen_pose.position = at(m_screen_distance_m);
-        m_hud_pose.orientation = orientation;
-        m_hud_pose.position = at(m_hud_dist_m);
-        XR_LOG("LOCAL tilted %.2f deg against the floor%s", tilt_deg,
-               level.w < 0.99999f ? " - screen levelled" : "");
+        const XrQuaternionf yaw_orientation{0.0f, std::sin(yaw * 0.5f), 0.0f, std::cos(yaw * 0.5f)};
+        const float screen_y = head.y + m_screen_vertical_offset_m;
+        m_screen_pose.orientation = yaw_orientation;
+        m_screen_pose.position = {head.x, screen_y, head.z};
+        m_flat_screen_pose.orientation = yaw_orientation;
+        m_flat_screen_pose.position = {head.x - std::sin(yaw) * m_screen_distance_m, screen_y,
+                                       head.z - std::cos(yaw) * m_screen_distance_m};
+        m_hud_pose.orientation = yaw_orientation;
+        m_hud_pose.position = {head.x - std::sin(yaw) * m_hud_dist_m, screen_y, head.z - std::cos(yaw) * m_hud_dist_m};
         m_screen_placed = true;
         if (m_first_place_time == 0)
             m_first_place_time = time;
@@ -2071,7 +2040,6 @@ private:
     XrSystemId m_system = XR_NULL_SYSTEM_ID;
     XrSession m_session = XR_NULL_HANDLE;
     XrSpace m_local_space = XR_NULL_HANDLE;
-    XrSpace m_stage_space = XR_NULL_HANDLE;
     XrSpace m_view_space = XR_NULL_HANDLE;
     Actions m_actions;
     bool m_has_refresh_rate_ext = false;
