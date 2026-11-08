@@ -197,7 +197,7 @@ public class LauncherActivity extends Activity {
         logo.setImageResource(R.drawable.logo_royale);
         logo.setAdjustViewBounds(true);
         root.addView(logo, new LinearLayout.LayoutParams(160, 160));
-        root.addView(text("Gran Turismo 4 3D VR", 34, Color.WHITE, true));
+        root.addView(text("Gran Turismo 4 3D/VR", 34, Color.WHITE, true));
         TextView by = text("by Sgt.Bilko  ·  portroyale.online", 18, Color.rgb(200, 60, 60), false);
         by.setPaintFlags(by.getPaintFlags() | android.graphics.Paint.UNDERLINE_TEXT_FLAG);
         by.setOnClickListener(view -> {
