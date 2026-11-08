@@ -155,7 +155,7 @@ constexpr float kFovMargin = 1.08f;
 // Owner choice 2026-10-30: 90 (sharper; no black border visible in the headset).
 // Owner 2026-11-06 (Spec II head-view VR): 80 - sharper than 90 / 110 (one game picture spread over
 // fewer degrees), the black rim around it is fine for him.
-constexpr float kImmersiveFovDeg = 80.0f;
+constexpr float kImmersiveFovDeg = 90.0f;
 // Render scale in the head-tracked VR view only (owner 2026-11-08: distant objects soft in VR; the curved
 // screen keeps its 3x4). Live: debug.gt4vr.vrscalex / vrscaley (0 = keep the curved screen's value).
 // Switching drops PCSX2's cached render targets, so the first frame after a switch can lack effects.
