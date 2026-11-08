@@ -812,6 +812,9 @@ bool start_game(const fs::path &files) {
     // Owner 2026-11-06 (Spec II, 3x4): FXAA tried again against flickering edges - too slow, off.
     // Owner 2026-11-08 with GT4 at 480p progressive: picture "very crispy" -> FXAA on, // with 3x4 and aniso 4 "much better" at 60 fps.
     setenv("RRV_PCSX2_GS_FXAA", "1", 0);
+    // Dithering "force 32-bit" (owner 2026-11-08: with 480p in races, the mirror fix and this, the
+    // picture is OK). GT4's 480p frame buffer is 16-bit. config.txt RRV_PCSX2_GS_DITHER=0..3 overrides.
+    setenv("RRV_PCSX2_GS_DITHER", "3", 0);
     // Flicker with a light source in view (owner 2026-11-01 video): the bridge's field skipping
     // dropped whole fields when the GS fell behind, GT4's brightness / glare post-processing passes
     // included, so the picture pulsed 3-4 times a second. Off, the flicker is gone (owner tested);
