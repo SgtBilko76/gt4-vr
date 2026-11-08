@@ -160,7 +160,7 @@ constexpr float kImmersiveFovDeg = 80.0f;
 // screen keeps its 3x4). Live: debug.gt4vr.vrscalex / vrscaley (0 = keep the curved screen's value).
 // Switching drops PCSX2's cached render targets, so the first frame after a switch can lack effects.
 constexpr float kVrScaleX = 4.0f;
-constexpr float kVrScaleY = 4.0f;
+constexpr float kVrScaleY = 3.5f;
 // The eye image stays sized for 110 deg (as before): the curved screen uses the same eye image and he
 // is happy with its sharpness - a smaller one (80 deg -> 1920x1440) would soften it.
 constexpr float kEyeImageFovDeg = 110.0f;
