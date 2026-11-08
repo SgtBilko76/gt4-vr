@@ -66,6 +66,8 @@ constexpr int32_t kScreenHeightDefaultPx = 1440;
 constexpr float kEyeSupersample = 1.3f;
 constexpr float kHeadsetTan = 1.40f; // Quest 3 eye: tan 1.376 x 1.428 (108 x 110 deg)
 constexpr float kScreenAspect = 16.0f / 9.0f;
+// "Online" badge raised above its old place right under the screen (metres, live debug.gt4vr.badgeup).
+constexpr float kBadgeUpM = 0.5f;
 // The HUD layer (owner 2026-10-30: "take our Wipeout Rewrite mod for perfect HUD VR settings"):
 // below the eyes the surface has a 16:9 strip the GS draws the race HUD into, on transparent
 // black (GSStereo::hud_layer). In the immersive race view it is a flat screen of its own in front
@@ -1057,6 +1059,7 @@ private:
         m_hud_half_width = std::clamp(ReadFloatProperty("debug.gt4vr.hudw", kHudHalfWidth), 0.2f, 2.0f);
         m_hud_panel = ReadFloatProperty("debug.gt4vr.hudpanel", 0.0f) != 0.0f;
         m_hud_layer_on = ReadFloatProperty("debug.gt4vr.hudlayer", 1.0f) != 0.0f;
+        m_badge_up = std::clamp(ReadFloatProperty("debug.gt4vr.badgeup", kBadgeUpM), -1.0f, 3.0f);
         // Headless testing without the user: hold pad buttons (HostPadButton mask, decimal) and
         // add a yaw (degrees, positive = head turned left) to the head the game camera sees.
         const uint32_t hold = static_cast<uint32_t>(ReadFloatProperty("debug.gt4vr.padhold", 0.0f));
@@ -1814,10 +1817,15 @@ private:
         const float bw = std::clamp(W * 0.09f, 0.18f, 0.5f), bh = bw * gt4::panel::kBadgeHeight / gt4::panel::kBadgeWidth;
         *size = {bw, bh};
         const XrQuaternionf &q = m_flat_screen_pose.orientation;
-        const float x_off = -W * 0.5f + bw * 0.5f;           // along the screen, from its centre
-        const float y_off = -H * 0.5f - bh * 0.5f - 0.03f;   // below its bottom edge
+        // Curved: the cylinder's arc is R * centralAngle, shorter than W (owner 2026-11-08: the badge sat
+        // left of and too far below the screen). Left edge = that arc; height raised by m_badge_up
+        // (live debug.gt4vr.badgeup, metres; owner: "a little bit higher, left under the screen").
+        const bool curved = m_curved && m_has_cylinder_ext;
+        const float arc = curved ? 2.0f * m_screen_distance_m * std::atan((W * 0.5f) / m_screen_distance_m) : W;
+        const float x_off = -arc * 0.5f + bw * 0.5f;         // along the screen, from its centre
+        const float y_off = -H * 0.5f - bh * 0.5f - 0.03f + m_badge_up; // below its bottom edge, raised
         float lateral = x_off, depth = 0.0f, yaw_extra = 0.0f;
-        if (m_curved && m_has_cylinder_ext)
+        if (curved)
         {
             const float R = m_screen_distance_m, a = x_off / R; // arc length -> angle
             lateral = R * std::sin(a);
@@ -2133,6 +2141,7 @@ private:
     XrSwapchain m_badge_swapchain = XR_NULL_HANDLE;
     std::vector<XrSwapchainImageOpenGLESKHR> m_badge_images;
     bool m_badge_failed = false;
+    float m_badge_up = kBadgeUpM;
     uint64_t m_dhcp_seen = 0;
     double m_dhcp_last = -1e9;
     int m_panel_prop = -1;
