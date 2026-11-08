@@ -797,7 +797,7 @@ bool start_game(const fs::path &files) {
     setenv("RRV_PCSX2_GS_CAS", "0", 0);
     // Owner 2026-11-06 (Spec II): 16x anisotropic (his final pick after comparing 8x / 16x).
     // Owner 2026-11-08 (Quest 3 VR sharpness tuning): 8x - frees GPU time for the VR render scale.
-    setenv("RRV_PCSX2_GS_ANISO", "8", 0);
+    setenv("RRV_PCSX2_GS_ANISO", "4", 0); // owner 2026-11-08 with 480p: 8x too crispy
     // Eye images the size of the VR game picture (3.25x4.75 of 640x448 ~ 2080x2016 at 90 deg) instead of
     // recommended x 1.3 (~2680x2870): bigger eye images add no detail, only GPU cost.
     setenv("RRV_VR_EYE", "2080x2016", 0);
@@ -809,7 +809,8 @@ bool start_game(const fs::path &files) {
     // Owner now: picture unsharp again -> turn anti-aliasing back on to optimise the sharpness.
     // Owner 2026-11-02 (release): off again for GPU headroom on heavy tracks (with 2.5x).
     // Owner 2026-11-06 (Spec II, 3x4): FXAA tried again against flickering edges - too slow, off.
-    setenv("RRV_PCSX2_GS_FXAA", "0", 0);
+    // Owner 2026-11-08 with GT4 at 480p progressive: picture "very crispy" -> FXAA on, // with 3x4 and aniso 4 "much better" at 60 fps.
+    setenv("RRV_PCSX2_GS_FXAA", "1", 0);
     // Flicker with a light source in view (owner 2026-11-01 video): the bridge's field skipping
     // dropped whole fields when the GS fell behind, GT4's brightness / glare post-processing passes
     // included, so the picture pulsed 3-4 times a second. Off, the flicker is gone (owner tested);
