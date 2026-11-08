@@ -816,12 +816,8 @@ private:
                 const auto &change = reinterpret_cast<const XrEventDataReferenceSpaceChangePending &>(event);
                 m_replace_after = change.changeTime;
                 m_replace_pending = true;
-                const XrPosef &pp = change.poseInPreviousSpace;
-                XR_LOG("reference space change pending (space type %d, pose valid %d: pos %.3f %.3f %.3f, "
-                       "rot %.3f %.3f %.3f %.3f) - screen re-placed after it",
-                       static_cast<int>(change.referenceSpaceType), change.poseValid ? 1 : 0, pp.position.x,
-                       pp.position.y, pp.position.z, pp.orientation.x, pp.orientation.y, pp.orientation.z,
-                       pp.orientation.w);
+                XR_LOG("reference space change pending (space type %d) - screen re-placed after it",
+                       static_cast<int>(change.referenceSpaceType));
                 break;
             }
             default:
@@ -1169,25 +1165,7 @@ private:
         {
             m_head_log_countdown = 0;
             const float yaw = std::atan2(2.0f * (rel.w * rel.y + rel.x * rel.z), 1.0f - 2.0f * (rel.y * rel.y + rel.x * rel.x));
-            const float pitch = std::asin(std::clamp(2.0f * (rel.w * rel.x - rel.y * rel.z), -1.0f, 1.0f));
-            // Height diagnosis (screen too high in Spec II after the 2D selector, owner 2026-11-08):
-            // head vs screen centre in the screen's frame, and where the floor (STAGE) is in LOCAL.
-            const XrVector3f d = QuatRotate(QuatConj(m_screen_pose.orientation),
-                                            {location.pose.position.x - m_screen_pose.position.x,
-                                             location.pose.position.y - m_screen_pose.position.y,
-                                             location.pose.position.z - m_screen_pose.position.z});
-            float floor_y = 0.0f;
-            if (m_stage_space != XR_NULL_HANDLE)
-            {
-                XrSpaceLocation st{XR_TYPE_SPACE_LOCATION};
-                if (XR_SUCCEEDED(xrLocateSpace(m_stage_space, m_local_space, key, &st)) &&
-                    (st.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT))
-                    floor_y = st.pose.position.y;
-            }
-            XR_LOG("head: yaw %.1f pitch %.1f deg (positive = left/up) tracked=%d | head-screen x %.2f y %.2f z %.2f m, "
-                   "head y %.2f, screen y %.2f, floor y %.2f (LOCAL)",
-                   yaw * 57.29578f, pitch * 57.29578f, m_head_tracked ? 1 : 0, d.x, d.y, d.z, location.pose.position.y,
-                   m_screen_pose.position.y, floor_y);
+            XR_LOG("head: yaw %.1f deg (positive = left) tracked=%d", yaw * 57.29578f, m_head_tracked ? 1 : 0);
         }
         gt4::quest::HeadPose head;
         {
