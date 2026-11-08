@@ -154,6 +154,11 @@ constexpr float kFovMargin = 1.08f;
 // Owner 2026-11-06 (Spec II head-view VR): 80 - sharper than 90 / 110 (one game picture spread over
 // fewer degrees), the black rim around it is fine for him.
 constexpr float kImmersiveFovDeg = 80.0f;
+// Render scale in the head-tracked VR view only (owner 2026-11-08: distant objects soft in VR; the curved
+// screen keeps its 3x4). Live: debug.gt4vr.vrscalex / vrscaley (0 = keep the curved screen's value).
+// Switching drops PCSX2's cached render targets, so the first frame after a switch can lack effects.
+constexpr float kVrScaleX = 4.0f;
+constexpr float kVrScaleY = 4.0f;
 // The eye image stays sized for 110 deg (as before): the curved screen uses the same eye image and he
 // is happy with its sharpness - a smaller one (80 deg -> 1920x1440) would soften it.
 constexpr float kEyeImageFovDeg = 110.0f;
@@ -1306,6 +1311,46 @@ private:
     }
 
     // Immersive race: true-scale disparity (see kNearM); otherwise the screen settings.
+    // Higher GS resolution while the VR view is shown, the start values on the curved screen.
+    void ApplyVrScale(bool immersive)
+    {
+        if (!m_set_render_scale)
+        {
+            if (m_render_scale_unavailable)
+                return;
+            void *image = dlopen("librrv-pcsx2-gs-bridge.so", RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+            if (!image)
+                return;
+            m_set_render_scale = reinterpret_cast<void (*)(float, float)>(dlsym(image, "rrv_pcsx2_gs_bridge_set_render_scale"));
+            dlclose(image);
+            if (!m_set_render_scale)
+            {
+                m_render_scale_unavailable = true;
+                XR_ERR("bridge has no live render scale: VR keeps the curved screen's resolution");
+                return;
+            }
+            const char *sx = std::getenv("RRV_PCSX2_GS_SCALE_X"), *sy = std::getenv("RRV_PCSX2_GS_SCALE");
+            m_base_scale_y = sy ? static_cast<float>(std::atof(sy)) : 0.0f;
+            m_base_scale_x = sx ? static_cast<float>(std::atof(sx)) : m_base_scale_y;
+        }
+        float x = m_base_scale_x, y = m_base_scale_y;
+        if (immersive)
+        {
+            const float vx = ReadFloatProperty("debug.gt4vr.vrscalex", kVrScaleX);
+            const float vy = ReadFloatProperty("debug.gt4vr.vrscaley", kVrScaleY);
+            if (vx > 0.0f)
+                x = std::clamp(vx, 1.0f, 8.0f);
+            if (vy > 0.0f)
+                y = std::clamp(vy, 1.0f, 8.0f);
+        }
+        if (x == m_applied_scale_x && y == m_applied_scale_y)
+            return;
+        m_applied_scale_x = x;
+        m_applied_scale_y = y;
+        m_set_render_scale(x, y);
+        XR_LOG("render scale %.2f x %.2f (%s)", x, y, immersive ? "VR view" : "curved screen");
+    }
+
     void UpdateTrueStereo(bool immersive, float tan_x)
     {
         if (!m_set_stereo || !m_set_depth_scale)
@@ -1505,6 +1550,7 @@ private:
                 m_present_aspect = immersive ? 1 : 0;
                 m_set_present_aspect(m_present_aspect);
             }
+            ApplyVrScale(immersive);
             if (immersive != m_immersive_shown)
             {
                 m_immersive_shown = immersive;
@@ -2030,6 +2076,9 @@ private:
     Actions m_actions;
     bool m_has_refresh_rate_ext = false;
     bool m_has_bd_controller_ext = false;
+    void (*m_set_render_scale)(float, float) = nullptr;
+    bool m_render_scale_unavailable = false;
+    float m_base_scale_x = 0.0f, m_base_scale_y = 0.0f, m_applied_scale_x = -1.0f, m_applied_scale_y = -1.0f;
     bool m_has_perf_settings_ext = false;
     bool m_has_cylinder_ext = false;
     bool m_has_image_layout_ext = false;
