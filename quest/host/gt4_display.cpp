@@ -17,6 +17,7 @@
 // mode 4 (SetGsCrt watched): then 4 is requested again. 2 s after driving stops (finish, replay,
 // menus) mode 2 is requested back if this file had switched. PS2_GT4_480P=2 = always (menus too, from
 // frame 1200 - switching in the first boot frames froze the game on the PC), 0 = off.
+// PS2_GT4_RACE_MODE=5: 1080i instead of 480p in races (owner test 2026-11-08); default 4.
 #include "gt4_display.h"
 
 #include "gt4_camera.h"
@@ -39,6 +40,7 @@ constexpr std::uint64_t kRaceIdleFrames = 20;   // race camera builds this recen
 constexpr std::uint64_t kRaceOverFrames = 120;  // not driving this long = back to interlaced
 
 int g_policy = 1; // 0 off, 1 races, 2 always
+std::uint32_t g_target = kProgressive; // mode requested while racing (4 = 480p, 5 = 1080i)
 std::uint32_t g_object = 0;
 std::uint64_t g_from = 1200;
 std::uint32_t g_last_mode = 0xFFFFFFFFu, g_last_pending = 0xFFFFFFFFu;
@@ -69,9 +71,11 @@ void install(bool retail)
     if (const char *f = std::getenv("PS2_GT4_480P_FROM"))
         g_from = std::strtoull(f, nullptr, 10);
     g_object = retail ? 0x006D6708u : 0x00734848u;
+    if (const char *m = std::getenv("PS2_GT4_RACE_MODE"); m && (m[0] == '4' || m[0] == '5') && m[1] == '\0')
+        g_target = static_cast<std::uint32_t>(m[0] - '0');
     static const char *const kPolicy[] = {"off", "while racing", "always"};
-    std::fprintf(stderr, "[gt4display] 480p progressive %s (PS2_GT4_480P=%d; %s, request object 0x%06X)\n", kPolicy[g_policy], g_policy,
-                 retail ? "retail v2.00" : "A-Spec II", g_object);
+    std::fprintf(stderr, "[gt4display] %s %s (PS2_GT4_480P=%d; %s, request object 0x%06X)\n", g_target == 5u ? "1080i" : "480p progressive",
+                 kPolicy[g_policy], g_policy, retail ? "retail v2.00" : "A-Spec II", g_object);
 }
 
 void tick()
@@ -118,12 +122,12 @@ void tick()
     {
         // Back to interlaced only if this file switched (a player's own 480p/1080i choice stays).
         g_stable = 0;
-        if (g_ours && mode == kProgressive)
+        if (g_ours && mode == g_target)
             request(kInterlaced, "not driving");
         g_ours = false;
         return;
     }
-    const bool lost = mode == kProgressive && ps2::gs_crt_interlace() != 0;
+    const bool lost = g_target == kProgressive && mode == kProgressive && ps2::gs_crt_interlace() != 0;
     if (mode != kInterlaced && !lost)
     {
         g_stable = 0;
@@ -133,7 +137,7 @@ void tick()
         return;
     g_stable = 0;
     g_ours = true;
-    request(kProgressive, lost ? "GS reset to interlaced behind mode 4" : (g_policy == 2 ? "interlaced" : "driving, interlaced"));
+    request(g_target, lost ? "GS reset to interlaced behind mode 4" : (g_policy == 2 ? "interlaced" : "driving, interlaced"));
 }
 
 } // namespace gt4::display
