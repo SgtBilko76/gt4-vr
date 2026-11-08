@@ -51,6 +51,7 @@
         <activity
             android:name=".LauncherActivity"
             android:label="${appLabel}"
+            android:enabled="${selectorEnabled}"
             android:exported="true"
             android:excludeFromRecents="false">
             <intent-filter>
@@ -97,5 +98,32 @@
                 <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
             </intent-filter>
         </activity>
+        <!-- Single-version apps: the library entry starts the game's VR activity directly. -->
+        <activity-alias
+            android:name=".SpecIILauncher"
+            android:targetActivity=".SpecIIActivity"
+            android:label="${appLabel}"
+            android:enabled="${speciiLauncher}"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="com.oculus.intent.category.VR" />
+                <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".OnlineLauncher"
+            android:targetActivity=".OnlineActivity"
+            android:label="${appLabel}"
+            android:enabled="${onlineLauncher}"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="com.oculus.intent.category.VR" />
+                <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
+            </intent-filter>
+        </activity-alias>
     </application>
 </manifest>

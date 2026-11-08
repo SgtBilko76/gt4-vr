@@ -35,13 +35,15 @@ variant() {
   *) echo "unknown GAME=$1" >&2; exit 2 ;;
   esac
 }
-# "Gran Turismo 4 VR" (owner 2026-11-08): ONE app with both versions; a 2D selector at start picks one
-# (quest/android LauncherActivity). Package online.portroyale.gt4vr (the Spec II app's, keeps its saves).
-# GAME=gt4s / gt4r build an app with only that version (the selector then starts it directly).
+# Owner 2026-11-08 (final): TWO apps again, each starting its game directly (no 2D selector):
+#   GAME=gt4s "Gran Turismo 4 Spec II 3D/VR" (online.portroyale.gt4vr, /sdcard/GT4SpecII)
+#   GAME=gt4r "Gran Turismo 4 Online 3D/VR"  (online.portroyale.gt4hd, /sdcard/GT4HD)
+# The launcher entry is an activity-alias of the version's NativeActivity (LAUNCHER = gtLauncher).
+# GAME=gt4vr = the shelved combined app (both versions + LauncherActivity selector), kept buildable.
 case "$GAME" in
-  gt4vr) GAMES=(gt4s gt4r); APP_ID=online.portroyale.gt4vr; APP_LABEL="Gran Turismo 4 3D/VR" ;;
-  gt4s)  GAMES=(gt4s); APP_ID=online.portroyale.gt4vr; APP_LABEL="Gran Turismo 4 3D/VR" ;;
-  gt4r)  GAMES=(gt4r); APP_ID=online.portroyale.gt4hd; APP_LABEL="Gran Turismo 4 Online VR" ;;
+  gt4vr) GAMES=(gt4s gt4r); APP_ID=online.portroyale.gt4vr; APP_LABEL="Gran Turismo 4 3D/VR"; LAUNCHER=selector ;;
+  gt4s)  GAMES=(gt4s); APP_ID=online.portroyale.gt4vr; APP_LABEL="Gran Turismo 4 Spec II 3D/VR"; LAUNCHER=specii ;;
+  gt4r)  GAMES=(gt4r); APP_ID=online.portroyale.gt4hd; APP_LABEL="Gran Turismo 4 Online 3D/VR"; LAUNCHER=online ;;
   *) echo "unknown GAME=$GAME (gt4vr, gt4s, gt4r)" >&2; exit 2 ;;
 esac
 BRIDGE_BUILD=${BRIDGE_BUILD:-$HOME/Projekte/fukami-wt-bridge/build-android-bridge}
@@ -133,7 +135,7 @@ ls -la "$STAGE/jniLibs/arm64-v8a"
 [ "${1:-}" = "--no-apk" ] && exit 0
 cd "$ROOT/quest/android"
 [ -f local.properties ] || echo "sdk.dir=$HOME/workspace/android-sdk" > local.properties
-JAVA_HOME=$(ls -d "$HOME"/tools/jdk-17* | head -1) ./gradlew --no-daemon -q --offline assembleRelease -PgtAppId="$APP_ID" -PgtAppLabel="$APP_LABEL" \
+JAVA_HOME=$(ls -d "$HOME"/tools/jdk-17* | head -1) ./gradlew --no-daemon -q --offline assembleRelease -PgtAppId="$APP_ID" -PgtAppLabel="$APP_LABEL" -PgtLauncher="$LAUNCHER" \
   -PgtVersionName="${VERSION_NAME:-0.1.0-beta}" -PgtVersionCode="${VERSION_CODE:-2}"
 mkdir -p "$ROOT/build/apk"
 cp app/build/outputs/apk/release/app-release.apk "$ROOT/build/apk/$GAME.apk"

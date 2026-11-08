@@ -12,7 +12,13 @@ android {
     defaultConfig {
         // quest/tools/build_quest.sh GAME=gt4r: the retail LAN build installs next to A-Spec II.
         applicationId project.findProperty('gtAppId') ?: 'online.portroyale.gt4vr'
-        manifestPlaceholders = [appLabel: project.findProperty('gtAppLabel') ?: 'GT4 Spec II HD 3D']
+        // gtLauncher: which entry the app library shows - specii / online (that version's game starts
+        // directly) or selector (the combined app's 2D version picker).
+        def launcher = project.findProperty('gtLauncher') ?: 'specii'
+        manifestPlaceholders = [appLabel: project.findProperty('gtAppLabel') ?: 'Gran Turismo 4 Spec II 3D/VR',
+                                selectorEnabled: (launcher == 'selector').toString(),
+                                speciiLauncher: (launcher == 'specii').toString(),
+                                onlineLauncher: (launcher == 'online').toString()]
         minSdk 29
         targetSdk 32
         // Private A-Spec II release 0.1.0-beta (owner 2026-11-02): no public download.
