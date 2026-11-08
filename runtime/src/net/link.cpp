@@ -15,10 +15,13 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <unistd.h>
 
 #ifndef __EMSCRIPTEN__
+#include <cerrno>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -38,8 +41,17 @@ constexpr std::size_t kInitSize = 24, kPdpHeader = 14;
 constexpr std::uint16_t kFramePort = 0x4754;
 constexpr std::size_t kRxQueueMax = 512;
 
+struct Server {
+    std::string host;
+    std::string ctl_port = "27312", relay_port = "27313";
+};
+
 struct Config {
     bool enabled = false;
+    // PS2_NET_SERVER=main[:port][,backup[:port]...]: the first is used whenever it answers; the others only
+    // when it can't be reached (owner 2026-11-08: backup relay, no load balancing - players on different
+    // relays can't see each other). Every reconnect starts with the first again.
+    std::vector<Server> servers;
     std::string host;
     std::string ctl_port = "27312", relay_port = "27313";
     std::string group = "GT4LAN", name, product = "SCUS97436";
@@ -52,15 +64,32 @@ const Config &config() {
         const char *server = std::getenv("PS2_NET_SERVER");
         if (!server || !*server || std::strcmp(server, "off") == 0) return c;
         c.enabled = true;
-        c.host = server;
-        if (const auto colon = c.host.rfind(':'); colon != std::string::npos) {
-            const int port = std::atoi(c.host.c_str() + colon + 1);
-            c.host.resize(colon);
-            if (port > 0 && port < 65535) {
-                c.ctl_port = std::to_string(port);
-                c.relay_port = std::to_string(port + 1);
+        std::string list = server;
+        for (std::size_t at = 0; at <= list.size();) {
+            const std::size_t comma = std::min(list.find(',', at), list.size());
+            Server s;
+            s.host = list.substr(at, comma - at);
+            at = comma + 1;
+            while (!s.host.empty() && s.host.front() == ' ') s.host.erase(0, 1);
+            while (!s.host.empty() && s.host.back() == ' ') s.host.pop_back();
+            if (s.host.empty()) continue;
+            if (const auto colon = s.host.rfind(':'); colon != std::string::npos) {
+                const int port = std::atoi(s.host.c_str() + colon + 1);
+                s.host.resize(colon);
+                if (port > 0 && port < 65535) {
+                    s.ctl_port = std::to_string(port);
+                    s.relay_port = std::to_string(port + 1);
+                }
             }
+            c.servers.push_back(s);
         }
+        if (c.servers.empty()) {
+            c.enabled = false;
+            return c;
+        }
+        c.host = c.servers.front().host;
+        c.ctl_port = c.servers.front().ctl_port;
+        c.relay_port = c.servers.front().relay_port;
         if (const char *g = std::getenv("PS2_NET_GROUP"); g && *g) c.group = std::string(g).substr(0, kGroupLength);
         if (const char *p = std::getenv("PS2_NET_PRODUCT"); p && std::strlen(p) == kProductLength) c.product = p;
         if (const char *n = std::getenv("PS2_NET_NAME"); n && *n) c.name = n;
@@ -160,7 +189,19 @@ int dial(const std::string &host, const std::string &port) {
     for (addrinfo *a = list; a; a = a->ai_next) {
         s = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
         if (s < 0) continue;
-        if (connect(s, a->ai_addr, a->ai_addrlen) == 0) break;
+        // Connect with a 5 s limit: a server that is down (no RST, packets dropped) would otherwise
+        // block for minutes and the backup would never be tried.
+        const int flags = fcntl(s, F_GETFL, 0);
+        fcntl(s, F_SETFL, flags | O_NONBLOCK);
+        int rc = connect(s, a->ai_addr, a->ai_addrlen);
+        if (rc != 0 && errno == EINPROGRESS) {
+            pollfd p{s, POLLOUT, 0};
+            int err = 0;
+            socklen_t len = sizeof err;
+            rc = (poll(&p, 1, 5000) == 1 && getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0) ? 0 : -1;
+        }
+        fcntl(s, F_SETFL, flags);
+        if (rc == 0) break;
         close(s);
         s = -1;
     }
@@ -185,13 +226,23 @@ bool send_all(int s, const std::string &data) {
 void run() {
     const Config &c = config();
     for (;;) {
-        const int ctl = dial(c.host, c.ctl_port);
-        int relay = ctl >= 0 ? dial(c.host, c.relay_port) : -1;
-        if (ctl < 0 || relay < 0) {
-            std::fprintf(stderr, "[net] cannot reach the ad hoc server %s:%s, retrying\n", c.host.c_str(),
-                         c.ctl_port.c_str());
+        // Main server first, then the backups in order.
+        int ctl = -1, relay = -1;
+        const Server *used = nullptr;
+        for (const Server &s : c.servers) {
+            ctl = dial(s.host, s.ctl_port);
+            relay = ctl >= 0 ? dial(s.host, s.relay_port) : -1;
+            if (ctl >= 0 && relay >= 0) {
+                used = &s;
+                break;
+            }
+            std::fprintf(stderr, "[net] cannot reach the ad hoc server %s:%s%s\n", s.host.c_str(), s.ctl_port.c_str(),
+                         &s != &c.servers.back() ? " - trying the backup" : ", retrying");
             if (ctl >= 0) close(ctl);
             if (relay >= 0) close(relay);
+            ctl = relay = -1;
+        }
+        if (!used) {
             std::this_thread::sleep_for(std::chrono::seconds(3));
             continue;
         }
@@ -216,7 +267,7 @@ void run() {
             g_relay = relay;
         }
         std::fprintf(stderr, "[net] %s to %s:%s as %s (%02x:%02x:%02x:%02x:%02x:%02x), group %s\n",
-                     ok ? "connected" : "login failed", c.host.c_str(), c.ctl_port.c_str(), c.name.c_str(), c.mac[0],
+                     ok ? "connected" : "login failed", used->host.c_str(), used->ctl_port.c_str(), c.name.c_str(), c.mac[0],
                      c.mac[1], c.mac[2], c.mac[3], c.mac[4], c.mac[5], group.c_str());
         std::string in;
         auto last_ping = std::chrono::steady_clock::now();

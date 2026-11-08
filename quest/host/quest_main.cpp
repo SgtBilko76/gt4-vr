@@ -868,7 +868,9 @@ bool start_game(const fs::path &files) {
 #if GT4VR_ONLINE || GT4VR_RELAY
     // Online builds: ad hoc play through the owner's relay (GT4 Server, TCP 27312/27313) by default.
     // config.txt PS2_NET_SERVER=host[:port] picks another relay, PS2_NET_SERVER=off turns the adapter off.
-    setenv("PS2_NET_SERVER", "217.154.211.69", 0);
+    // Main relay + backup (owner 2026-11-08: 85.215.158.219, used only when the main one can't be reached;
+    // the leaderboard stays on the main server).
+    setenv("PS2_NET_SERVER", "217.154.211.69,85.215.158.219", 0);
 #endif
     // Every headset reports "localhost" as its host name, so the link's defaults (nickname = host
     // name, MAC = hash of it) would give two headsets the same MAC and they would never see each
