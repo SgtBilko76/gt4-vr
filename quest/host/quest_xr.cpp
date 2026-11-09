@@ -67,7 +67,7 @@ constexpr float kEyeSupersample = 1.3f;
 constexpr float kHeadsetTan = 1.40f; // Quest 3 eye: tan 1.376 x 1.428 (108 x 110 deg)
 constexpr float kScreenAspect = 16.0f / 9.0f;
 // "Online" badge raised above its old place right under the screen (metres, live debug.gt4vr.badgeup).
-constexpr float kBadgeUpM = 0.0f;
+constexpr float kBadgeUpM = 0.80f; // owner-tuned live in the headset 2026-11-09
 // The HUD layer (owner 2026-10-30: "take our Wipeout Rewrite mod for perfect HUD VR settings"):
 // below the eyes the surface has a 16:9 strip the GS draws the race HUD into, on transparent
 // black (GSStereo::hud_layer). In the immersive race view it is a flat screen of its own in front
