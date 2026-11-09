@@ -67,7 +67,7 @@ constexpr float kEyeSupersample = 1.3f;
 constexpr float kHeadsetTan = 1.40f; // Quest 3 eye: tan 1.376 x 1.428 (108 x 110 deg)
 constexpr float kScreenAspect = 16.0f / 9.0f;
 // "Online" badge raised above its old place right under the screen (metres, live debug.gt4vr.badgeup).
-constexpr float kBadgeUpM = 0.5f;
+constexpr float kBadgeUpM = 0.0f;
 // The HUD layer (owner 2026-10-30: "take our Wipeout Rewrite mod for perfect HUD VR settings"):
 // below the eyes the surface has a 16:9 strip the GS draws the race HUD into, on transparent
 // black (GSStereo::hud_layer). In the immersive race view it is a flat screen of its own in front
@@ -1860,7 +1860,10 @@ private:
         const bool curved = m_curved && m_has_cylinder_ext;
         const float arc = curved ? 2.0f * m_screen_distance_m * std::atan((W * 0.5f) / m_screen_distance_m) : W;
         const float x_off = -arc * 0.5f + bw * 0.5f;         // along the screen, from its centre
-        const float y_off = -H * 0.5f - bh * 0.5f - 0.03f + m_badge_up; // below its bottom edge, raised
+        // The cylinder layer's height is arc / aspectRatio (not W / aspect): with H the badge sat far too
+        // low (owner 2026-11-09: "directly under the screen border on the left edge").
+        const float screen_h = curved ? arc * m_eye_h / m_eye_w : H;
+        const float y_off = -screen_h * 0.5f - bh * 0.5f - 0.01f + m_badge_up; // right under its bottom edge
         float lateral = x_off, depth = 0.0f, yaw_extra = 0.0f;
         if (curved)
         {
