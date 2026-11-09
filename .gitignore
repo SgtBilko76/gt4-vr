@@ -23,3 +23,6 @@ quest/android/app/build/
 quest/android/.gradle/
 quest/android/local.properties
 quest/assets/textures
+
+# Local backups (memory cards)
+/backup/

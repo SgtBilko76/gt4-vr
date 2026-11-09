@@ -1,3 +1,22 @@
+# GT4 VR (Meta Quest / Pico)
+
+A standalone VR port of Gran Turismo 4 for Meta Quest 3 and Pico headsets, built by SgtBilko76
+([portroyale.online](https://portroyale.online)). Two Android apps come out of this source:
+
+- **GT4 Spec II VR** (`online.portroyale.gt4vr`): the Spec II 1.10 mod.
+- **GT4 Online VR** (`online.portroyale.gt4hd`): GT4 USA v2.00 with online races and a leaderboard.
+
+Both show the game on a curved 3D screen and switch to a head-tracked VR view while you drive.
+No game data is included: players bring their own disc image.
+
+The port is based on **[ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) by snuri00**
+(MIT License), the PS2 static recompiler and runtime described below; its full history is kept
+in this repository. The Quest code lives in `quest/` (`quest/tools/build_quest.sh` builds the
+APKs). The graphics come from a PCSX2-based GS bridge and PCSX2 fork that are not part of this
+repository.
+
+---
+
 # PS2 Web Recomp
 
 PlayStation 2 games running in the browser through static recompilation. The game's Emotion Engine machine code is translated ahead of time into C++ and compiled to WebAssembly, so the main CPU is never interpreted; the rest of the console, its operating system and hardware, is emulated by a runtime that draws with WebGPU.
