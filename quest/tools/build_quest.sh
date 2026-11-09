@@ -5,7 +5,7 @@
 # usage: quest/tools/build_quest.sh [--no-apk]
 #   GAME=gt4vr    "Gran Turismo 4 VR": Spec II 1.10 (/sdcard/GT4SpecII) + retail v2.00 online (/sdcard/GT4HD)
 #                 in one APK, selector at start (default). gt4s / gt4r = one version only.
-#   VERSION_NAME  versionName (default 0.1.0-beta), VERSION_CODE versionCode (default 2)
+#   VERSION_NAME  versionName (default 0.2.0-beta), VERSION_CODE versionCode (default 3)
 #   JOBS=N        parallel compile jobs (default 4: generated units take ~1 GB each)
 #   BRIDGE_BUILD  PCSX2 GS bridge build dir (default: the Ridge Racer V port's Android bridge)
 #
@@ -137,7 +137,7 @@ ls -la "$STAGE/jniLibs/arm64-v8a"
 cd "$ROOT/quest/android"
 [ -f local.properties ] || echo "sdk.dir=$HOME/workspace/android-sdk" > local.properties
 JAVA_HOME=$(ls -d "$HOME"/tools/jdk-17* | head -1) ./gradlew --no-daemon -q --offline assembleRelease -PgtAppId="$APP_ID" -PgtAppLabel="$APP_LABEL" -PgtLauncher="$LAUNCHER" \
-  -PgtVersionName="${VERSION_NAME:-0.1.0-beta}" -PgtVersionCode="${VERSION_CODE:-2}"
+  -PgtVersionName="${VERSION_NAME:-0.2.0-beta}" -PgtVersionCode="${VERSION_CODE:-3}"
 mkdir -p "$ROOT/build/apk"
 cp app/build/outputs/apk/release/app-release.apk "$ROOT/build/apk/$GAME.apk"
 ls -la app/build/outputs/apk/release/ "$ROOT/build/apk/$GAME.apk"

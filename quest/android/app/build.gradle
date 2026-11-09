@@ -22,8 +22,8 @@ android {
         minSdk 29
         targetSdk 32
         // Private A-Spec II release 0.1.0-beta (owner 2026-11-02): no public download.
-        versionCode((project.findProperty('gtVersionCode') ?: '2') as int)
-        versionName project.findProperty('gtVersionName') ?: '0.1.0-beta'
+        versionCode((project.findProperty('gtVersionCode') ?: '3') as int)
+        versionName project.findProperty('gtVersionName') ?: '0.2.0-beta'
         ndk { abiFilters 'arm64-v8a' }
     }
 
