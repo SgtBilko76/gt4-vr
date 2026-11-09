@@ -142,7 +142,7 @@ if(PS2_GENERATED)
         # product code the ad hoc server groups players by, and the A-Spec II race camera hooks.
         set(GT4VR_DATA_DIR "/sdcard/GT4VR" CACHE STRING "Data folder on the headset")
         set(GT4VR_OLD_DATA_DIR "/sdcard/GT4" CACHE STRING "Fallback folder for disc.iso / memcard.ps2")
-        set(GT4VR_TITLE "Gran Turismo 4 VR" CACHE STRING "Name in the log")
+        set(GT4VR_TITLE "GT4 VR" CACHE STRING "App name (log, OpenXR application name)")
         set(GT4VR_NET_PRODUCT "SCUS97436" CACHE STRING "Ad hoc server product code")
         option(GT4VR_CAMERA_HOOKS "A-Spec II race camera hooks (VR view)" ON)
         # Ad hoc play through the owner's relay by default (Multi-LAN Race). On in every online build;

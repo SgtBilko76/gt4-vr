@@ -582,7 +582,10 @@ private:
         android_info.applicationActivity = m_activity;
         XrInstanceCreateInfo create_info{XR_TYPE_INSTANCE_CREATE_INFO};
         create_info.next = &android_info;
-        std::strncpy(create_info.applicationInfo.applicationName, "Gran Turismo 4 3D/VR", XR_MAX_APPLICATION_NAME_SIZE - 1);
+        #ifndef GT4VR_TITLE
+#define GT4VR_TITLE "GT4 VR"
+#endif
+        std::strncpy(create_info.applicationInfo.applicationName, GT4VR_TITLE, XR_MAX_APPLICATION_NAME_SIZE - 1);
         create_info.applicationInfo.applicationVersion = 1;
         std::strncpy(create_info.applicationInfo.engineName, "GT4VR", XR_MAX_ENGINE_NAME_SIZE - 1);
         create_info.applicationInfo.engineVersion = 1;

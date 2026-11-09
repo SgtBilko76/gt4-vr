@@ -102,7 +102,7 @@ namespace fs = std::filesystem;
 #ifndef GT4VR_DATA_DIR
 #define GT4VR_DATA_DIR "/sdcard/GT4VR"
 #define GT4VR_OLD_DATA_DIR "/sdcard/GT4"
-#define GT4VR_TITLE "Gran Turismo 4 VR"
+#define GT4VR_TITLE "GT4 VR"
 #define GT4VR_NET_PRODUCT "SCUS97436"
 #define GT4VR_CAMERA_HOOKS 1
 #endif

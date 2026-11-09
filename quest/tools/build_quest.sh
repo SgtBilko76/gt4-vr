@@ -22,13 +22,13 @@ variant() {
   # Retail USA v2.00 (owner 2026-11-05: online through his relay: lobby panel, leaderboard reports, ad hoc
   # Multi-LAN Race; 3D; no HD texture pack). The user's own ISO in /sdcard/GT4HD; the program is read from
   # it and checked (CRC A9D9C0A2), like Spec II.
-  gt4r) VARIANT=(-DGT4VR_DATA_DIR=/sdcard/GT4HD -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="Gran Turismo 4 3D/VR (Online)"
+  gt4r) VARIANT=(-DGT4VR_DATA_DIR=/sdcard/GT4HD -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="GT4 Online VR"
                  -DGT4VR_NET_PRODUCT=SCUS97328 -DGT4VR_CAMERA_HOOKS=ON -DGT4VR_ONLINE=ON
                  -DGT4VR_ELF_CRC=A9D9C0A2 "-DGT4VR_DISC_NAME=Gran Turismo 4 (USA) v2.00" -DGT4VR_LIB_NAME=gt4vr_online)
         LIBNAME=gt4vr_online; SRC=gt4r ;;
   # Spec II 1.10 (owner 2026-11-06): the user brings his own patched ISO (any *.iso in /sdcard/GT4SpecII),
   # the app checks the program's CRC. Offline only (no network play options in Spec II).
-  gt4s) VARIANT=(-DGT4VR_DATA_DIR=/sdcard/GT4SpecII -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="Gran Turismo 4 3D/VR (Spec II)"
+  gt4s) VARIANT=(-DGT4VR_DATA_DIR=/sdcard/GT4SpecII -DGT4VR_OLD_DATA_DIR= -DGT4VR_TITLE="GT4 Spec II VR"
                  -DGT4VR_NET_PRODUCT=SPEC2V110 -DGT4VR_CAMERA_HOOKS=ON -DGT4VR_ONLINE=OFF -DGT4VR_RELAY=OFF
                  -DGT4VR_ELF_CRC=646B2E29 "-DGT4VR_DISC_NAME=Gran Turismo 4 Spec II 1.10" -DGT4VR_LIB_NAME=gt4vr_specii)
         LIBNAME=gt4vr_specii; SRC=gt4s ;;
@@ -36,14 +36,15 @@ variant() {
   esac
 }
 # Owner 2026-11-08 (final): TWO apps again, each starting its game directly (no 2D selector):
-#   GAME=gt4s "Gran Turismo 4 Spec II 3D/VR" (online.portroyale.gt4vr, /sdcard/GT4SpecII)
-#   GAME=gt4r "Gran Turismo 4 Online 3D/VR"  (online.portroyale.gt4hd, /sdcard/GT4HD)
+#   GAME=gt4s "GT4 Spec II VR" (online.portroyale.gt4vr, /sdcard/GT4SpecII)
+#   GAME=gt4r "GT4 Online VR"  (online.portroyale.gt4hd, /sdcard/GT4HD)
 # The launcher entry is an activity-alias of the version's NativeActivity (LAUNCHER = gtLauncher).
 # GAME=gt4vr = the shelved combined app (both versions + LauncherActivity selector), kept buildable.
 case "$GAME" in
-  gt4vr) GAMES=(gt4s gt4r); APP_ID=online.portroyale.gt4vr; APP_LABEL="Gran Turismo 4 3D/VR"; LAUNCHER=selector ;;
-  gt4s)  GAMES=(gt4s); APP_ID=online.portroyale.gt4vr; APP_LABEL="Gran Turismo 4 Spec II 3D/VR"; LAUNCHER=specii ;;
-  gt4r)  GAMES=(gt4r); APP_ID=online.portroyale.gt4hd; APP_LABEL="Gran Turismo 4 Online 3D/VR"; LAUNCHER=online ;;
+  # App names without the full trademark (owner 2026-11-09): "GT4 ... VR". Package ids unchanged.
+  gt4vr) GAMES=(gt4s gt4r); APP_ID=online.portroyale.gt4vr; APP_LABEL="GT4 VR"; LAUNCHER=selector ;;
+  gt4s)  GAMES=(gt4s); APP_ID=online.portroyale.gt4vr; APP_LABEL="GT4 Spec II VR"; LAUNCHER=specii ;;
+  gt4r)  GAMES=(gt4r); APP_ID=online.portroyale.gt4hd; APP_LABEL="GT4 Online VR"; LAUNCHER=online ;;
   *) echo "unknown GAME=$GAME (gt4vr, gt4s, gt4r)" >&2; exit 2 ;;
 esac
 BRIDGE_BUILD=${BRIDGE_BUILD:-$HOME/Projekte/fukami-wt-bridge/build-android-bridge}

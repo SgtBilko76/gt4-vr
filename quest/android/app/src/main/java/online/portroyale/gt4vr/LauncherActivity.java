@@ -37,9 +37,9 @@ public class LauncherActivity extends Activity {
     }
 
     static final Version[] VERSIONS = {
-        new Version("Gran Turismo 4 Spec II", "Spec II 1.10 mod, single player", "gt4vr_specii",
+        new Version("GT4 Spec II", "Spec II 1.10 mod, single player", "gt4vr_specii",
                     "/sdcard/GT4SpecII", ":specii", SpecIIActivity.class),
-        new Version("Gran Turismo 4 Online", "USA v2.00, online races and leaderboard", "gt4vr_online",
+        new Version("GT4 Online", "USA v2.00, online races and leaderboard", "gt4vr_online",
                     "/sdcard/GT4HD", ":online", OnlineActivity.class),
     };
 
@@ -197,7 +197,7 @@ public class LauncherActivity extends Activity {
         logo.setImageResource(R.drawable.logo_royale);
         logo.setAdjustViewBounds(true);
         root.addView(logo, new LinearLayout.LayoutParams(160, 160));
-        root.addView(text("Gran Turismo 4 3D/VR", 34, Color.WHITE, true));
+        root.addView(text("GT4 VR", 34, Color.WHITE, true));
         TextView by = text("by Sgt.Bilko  ·  portroyale.online", 18, Color.rgb(200, 60, 60), false);
         by.setPaintFlags(by.getPaintFlags() | android.graphics.Paint.UNDERLINE_TEXT_FLAG);
         by.setOnClickListener(view -> {
