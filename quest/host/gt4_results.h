@@ -32,6 +32,11 @@ struct Room {
 };
 Room room();
 void createRoom();
+// Round trip time to the gt4-results server in ms (-1 = not measured yet). The relay runs on the same
+// host, so it is also the player's ping to the relay. Measured from TCP handshakes (one round trip
+// each) of the status reports and the online panel's requests: median of the last 5.
+int pingMs();
+void notePing(int ms);
 void joinRoom(const std::string &id);
 void leaveRoom();
 

@@ -20,6 +20,18 @@ Room room() { return g_room; }
 void createRoom() { g_room = {"Rpreview", true}; }
 void joinRoom(const std::string &id) { g_room = {id, false}; }
 void leaveRoom() { g_room = {}; }
+// Ping as in gt4_results.cpp: median of the last 5 handshakes to the server.
+static std::vector<int> g_ping;
+int pingMs() {
+    if (g_ping.empty()) return -1;
+    std::vector<int> s = g_ping;
+    std::nth_element(s.begin(), s.begin() + s.size() / 2, s.end());
+    return s[s.size() / 2];
+}
+void notePing(int ms) {
+    g_ping.push_back(ms);
+    if (g_ping.size() > 5) g_ping.erase(g_ping.begin());
+}
 }
 
 int main(int argc, char **argv) {

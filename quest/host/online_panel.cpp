@@ -54,7 +54,11 @@ bool http_get(const std::string &path, std::string &body) {
         timeval tv{5, 0};
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        const auto t0 = std::chrono::steady_clock::now();
         if (connect(fd, a->ai_addr, a->ai_addrlen) == 0) {
+            // TCP handshake = one round trip to the server (= the relay's host): the lobby's ping.
+            gt4::results::notePing(static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count()));
             const std::string req = "GET " + path + " HTTP/1.1\r\nHost: " + g_host + "\r\nConnection: close\r\n\r\n";
             if (send(fd, req.data(), req.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(req.size())) {
                 char buf[16384];
@@ -319,7 +323,8 @@ constexpr int kRowH = 46, kTableTop = 244, kRows = 10, kBody = 28;
 // A table: header row, then the rows (vector of cell strings), the player's rows in gold.
 // A row whose cells after the first are all empty is one wide cell (the Races tab's action row).
 void table(Canvas &cv, const std::vector<Column> &cols, const std::vector<std::vector<std::string>> &rows,
-           const std::vector<bool> &own, int &scroll, const char *empty, int selected = -1, int top = kTableTop) {
+           const std::vector<bool> &own, int &scroll, const char *empty, int selected = -1, int top = kTableTop,
+           Color first = kDim) {
     const int fit = std::min(kRows, (kHeight - 56 - 50 - top) / kRowH);
     for (const Column &c : cols) cv.text(c.title, c.x, top - 14, 22, kDim, c.w, c.align);
     cv.rect(40, top - 4, kWidth - 80, 2, kLine);
@@ -349,7 +354,7 @@ void table(Canvas &cv, const std::vector<Column> &cols, const std::vector<std::v
         }
         const Color c = own[r] ? kGold : kText;
         for (std::size_t k = 0; k < cols.size() && k < rows[r].size(); ++k)
-            cv.text(rows[r][k], cols[k].x, y + 32, kBody, k == 0 && !own[r] ? kDim : c, cols[k].w, cols[k].align);
+            cv.text(rows[r][k], cols[k].x, y + 32, kBody, k == 0 && !own[r] ? first : c, cols[k].w, cols[k].align);
     }
     if (static_cast<int>(rows.size()) > fit) {
         char b[48];
@@ -368,24 +373,31 @@ struct RaceRow {
 std::vector<RaceRow> race_rows(const Data &d, const gt4::results::Room &cur) {
     std::vector<RaceRow> rows;
     if (cur.id.empty())
-        rows.push_back({{"+  Create a race", "", "", "", "", ""}, "", false});
+        rows.push_back({{"+  Create a race", "", "", "", "", "", ""}, "", false});
     else
-        rows.push_back({{std::string("x  Leave race ") + cur.id, "", "", "", "", ""}, "", true});
+        rows.push_back({{std::string("x  Leave race ") + cur.id, "", "", "", "", "", ""}, "", true});
+    // Ping to the race = own round trip to the relay + the host's (all traffic goes through the relay).
+    const int own_ping = gt4::results::pingMs();
     if (d.rooms.type == json::Value::Array)
         for (const json::Value &v : d.rooms.arr) {
             const std::string id = str(v.get("room"));
             if (id.empty()) continue;
             const long long n = num(v.get("count"), 1);
-            std::string players;
+            // Who: the host first (the green Host column marks him), then the others.
+            const std::string host = str(v.get("host"));
+            std::string players = host;
             if (const json::Value *p = v.get("players"); p && p->type == json::Value::Array)
-                for (const json::Value &name : p->arr) players += (players.empty() ? "" : ", ") + str(&name);
+                for (const json::Value &name : p->arr)
+                    if (str(&name) != host) players += ", " + str(&name);
             const long long max = num(v.get("max_players"));
             std::string state = str(v.get("state")) == "racing" ? "racing" : "waiting";
             if (state == "waiting" && max > 0 && n >= max) state = "full";
             std::string track = str(v.get("track"));
             if (track.empty()) track = "-";
             const std::string count = max > 0 ? std::to_string(n) + " / " + std::to_string(max) : std::to_string(n);
-            rows.push_back({{str(v.get("host")), id, track, count, players, state}, id, id == cur.id});
+            const long long host_ping = num(v.get("host_ping"), -1);
+            const std::string ping = own_ping >= 0 && host_ping >= 0 ? std::to_string(own_ping + host_ping) + " ms" : "-";
+            rows.push_back({{host, id, track, count, players, ping, state}, id, id == cur.id});
         }
     return rows;
 }
@@ -409,6 +421,10 @@ void draw(std::vector<std::uint8_t> &px, const Data &d, const Context &ctx) {
         std::tm t{};
         localtime_r(&d.fetched, &t);
         std::strftime(status, sizeof status, "online  ·  updated %H:%M:%S", &t);
+        if (const int ms = gt4::results::pingMs(); ms >= 0) {
+            const std::size_t len = std::strlen(status);
+            std::snprintf(status + len, sizeof status - len, "  ·  ping %d ms", ms);
+        }
     }
     cv.text(status, kWidth - 440, 80, 20, d.fetched && !d.reached ? kAccent : kGreen, 400, 1);
     // Tabs
@@ -433,20 +449,26 @@ void draw(std::vector<std::uint8_t> &px, const Data &d, const Context &ctx) {
         }
         if (cur.id.empty()) {
             cv.text("You are in the open lobby: Multi-LAN Race finds everyone who is not in a race.", 40, 192, 22, kDim, kWidth - 80);
-            cv.text("Create a race, or pick one below and press A to join it.", 40, 218, 22, kDim, kWidth - 80);
+            cv.text("Create a race, or pick one below and press A to join it. Ping = round trip to the race's host.", 40, 218,
+                    22, kDim, kWidth - 80);
         } else if (cur.host) {
-            cv.text("Your race " + cur.id + " is open. In GT4: Options > LAN Settings > Host: Yes, No. of Players = seats,", 40,
-                    192, 22, kGold, kWidth - 80);
-            cv.text("then Arcade > Multi-LAN Race > Connect. The race starts when all seats are taken.", 40, 218, 22, kGold,
+            cv.text("You are the HOST of race " + cur.id + ". In GT4: Options > LAN Settings > Host: Yes, No. of Players = seats,",
+                    40, 192, 22, kGreen, kWidth - 80);
+            cv.text("then Arcade > Multi-LAN Race > Connect. The race starts when all seats are taken.", 40, 218, 22, kGreen,
                     kWidth - 80);
         } else {
-            cv.text("You joined race " + cur.id + ". In GT4: Options > LAN Settings > Host: No,", 40, 192, 22, kGold, kWidth - 80);
+            // The joined race's host, from the room list.
+            std::string host = "?";
+            for (const RaceRow &row : rr)
+                if (row.join == cur.id && !row.cells.empty()) host = row.cells[0];
+            cv.text("You joined race " + cur.id + " - HOST: " + host + ". In GT4: Options > LAN Settings > Host: No,", 40, 192,
+                    22, kGold, kWidth - 80);
             cv.text("then Arcade > Multi-LAN Race > Connect and wait for the host to start.", 40, 218, 22, kGold, kWidth - 80);
         }
         constexpr int kRacesTop = kTableTop + 34;
-        table(cv, {{"Host", 50, 180, 0}, {"Race", 240, 130, 0}, {"Track", 380, 330, 0}, {"Players", 720, 110, 0},
-                   {"Who", 840, 260, 0}, {"Status", 1110, 130, 1}},
-              rows, mine, g_scroll[kRaces], "", g_sel, kRacesTop);
+        table(cv, {{"Host", 50, 170, 0}, {"Race", 230, 110, 0}, {"Track", 350, 290, 0}, {"Players", 650, 100, 0},
+                   {"Who", 760, 220, 0}, {"Ping", 990, 110, 1}, {"Status", 1110, 130, 1}},
+              rows, mine, g_scroll[kRaces], "", g_sel, kRacesTop, kGreen);
         if (rr.size() == 1)
             cv.text("No open races right now", 40, kRacesTop + kRowH + 60, 28, kDim, kWidth - 80, 2);
         break;

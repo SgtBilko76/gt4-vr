@@ -39,6 +39,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace gt4::results {
 
@@ -193,6 +194,10 @@ std::string g_host, g_port = "27314";
 std::string g_device = "Quest";
 std::string g_lap_log;
 
+// Ping to the server (gt4::results::pingMs): the last 5 TCP handshake times.
+std::mutex g_ping_mutex;
+std::deque<int> g_ping_samples;
+
 // One POST; returns the HTTP status (0 = no connection or no answer).
 int post(const std::string &body) {
     addrinfo hints{}, *res = nullptr;
@@ -206,7 +211,10 @@ int post(const std::string &body) {
         timeval tv{5, 0};
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        const auto t0 = std::chrono::steady_clock::now();
         if (connect(fd, a->ai_addr, a->ai_addrlen) == 0) {
+            notePing(static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count()));
             const std::string req = "POST /api/report HTTP/1.1\r\nHost: " + g_host +
                                     "\r\nContent-Type: application/json\r\nContent-Length: " +
                                     std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
@@ -275,10 +283,14 @@ std::string new_race_id() {
 std::mutex g_room_mutex;
 Room g_room;
 
+// In a room: room id, host flag and this player's ping (the lobby shows host + viewer ping per race;
+// older servers ignore the field).
 std::string room_fields() {
     std::lock_guard<std::mutex> lock(g_room_mutex);
     if (g_room.id.empty()) return {};
-    return ",\"room\":" + json_str(g_room.id) + ",\"host\":" + (g_room.host ? "true" : "false");
+    std::string o = ",\"room\":" + json_str(g_room.id) + ",\"host\":" + (g_room.host ? "true" : "false");
+    if (const int ms = pingMs(); ms >= 0) o += ",\"ping\":" + std::to_string(ms);
+    return o;
 }
 
 std::string base_fields(const Race &r) {
@@ -341,6 +353,25 @@ void heartbeat() {
         enqueue(body + "}", false);
     }
 }
+
+} // namespace
+
+int pingMs() {
+    std::lock_guard<std::mutex> lock(g_ping_mutex);
+    if (g_ping_samples.empty()) return -1;
+    std::vector<int> s(g_ping_samples.begin(), g_ping_samples.end());
+    std::nth_element(s.begin(), s.begin() + s.size() / 2, s.end());
+    return s[s.size() / 2];
+}
+
+void notePing(int ms) {
+    if (ms < 0 || ms > 9999) return;
+    std::lock_guard<std::mutex> lock(g_ping_mutex);
+    g_ping_samples.push_back(ms);
+    while (g_ping_samples.size() > 5) g_ping_samples.pop_front();
+}
+
+namespace {
 
 void set_room(Room room) {
     {
