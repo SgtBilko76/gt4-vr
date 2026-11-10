@@ -45,6 +45,7 @@ add_library(ps2runtime STATIC
     runtime/src/vu_micro.cpp
     runtime/src/vu_jit.cpp
     runtime/src/vu_jit_web.cpp
+    runtime/src/vu_jit_a64.cpp
     runtime/src/ipu/ipu.cpp
     runtime/src/gs/gs.cpp
     runtime/src/gs/gif.cpp

@@ -873,6 +873,21 @@ void check_jit_against_interpreter(ProgramFn jit, std::uint32_t pc) {
     ++calls;
     if (jit_escape >= 0) ++escapes;
     else if (std::memcmp(&after, &g_vu1, sizeof after) != 0 || std::memcmp(jit_mem, g_vu1_mem, sizeof jit_mem) != 0) {
+        // PS2_VU_SNAP=<dir>: save the state before the call for tests/vu_jit_a64_test.cpp
+        // (code, data memory, registers, entry, TOP/ITOP), up to 8 snapshots.
+        static const char *snap = std::getenv("PS2_VU_SNAP");
+        if (snap && mismatches < 8) {
+            char name[96];
+            std::snprintf(name, sizeof name, "%s/snap_%llu_%04X.bin", snap, static_cast<unsigned long long>(mismatches), pc & 16383u);
+            if (std::FILE *f = std::fopen(name, "wb")) {
+                const std::uint32_t head[4] = {pc & 16383u, g_top[1], g_itop[1], static_cast<std::uint32_t>(sizeof before)};
+                std::fwrite(head, sizeof head, 1, f);
+                std::fwrite(g_vu1_code, sizeof g_vu1_code, 1, f);
+                std::fwrite(before_mem, sizeof before_mem, 1, f);
+                std::fwrite(&before, sizeof before, 1, f);
+                std::fclose(f);
+            }
+        }
         if (++mismatches <= 20) {
             int vf = -1, vi = -1, word = -1;
             for (int i = 0; i < 32 && vf < 0; ++i)

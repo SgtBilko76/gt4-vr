@@ -193,7 +193,7 @@ struct Code : Out {
 enum : std::uint8_t {
     kOpDrop = 0x1A, kOpSelect = 0x1B, kOpEq = 0x46, kOpNe = 0x47, kOpLtS = 0x48, kOpGtS = 0x4A, kOpLeS = 0x4C, kOpGeS = 0x4E, kOpGeU = 0x4F,
     kOpAdd = 0x6A, kOpSub = 0x6B, kOpMul = 0x6C, kOpAnd = 0x71, kOpOr = 0x72, kOpXor = 0x73, kOpShl = 0x74, kOpShrU = 0x76, kOpExt16 = 0xC1, kOpBr = 0x0C,
-    kOpI64Add = 0x7C, kOpI64Or = 0x84, kOpI64Shl = 0x86, kOpI64ShrU = 0x88, kOpF64Sqrt = 0x9F, kOpF64Div = 0xA3, kOpWrap = 0xA7, kOpExtendU = 0xAD,
+    kOpI64Add = 0x7C, kOpI64And = 0x83, kOpI64Or = 0x84, kOpI64Shl = 0x86, kOpI64ShrU = 0x88, kOpF64Sqrt = 0x9F, kOpF64Div = 0xA3, kOpWrap = 0xA7, kOpExtendU = 0xAD,
     kOpI64FromF64 = 0xBD, kOpF64FromI64 = 0xBF,
 };
 
@@ -845,8 +845,21 @@ private:
         c_.op(kOpF64FromI64);
     }
 
-    void from_double() {
+    // nearest: round the double to 24 bits (ties to even) first, as fp::from_double_nearest / fp::div
+    // (DIV); otherwise chop as fp::from_double (SQRT, RSQRT). A carry runs into the exponent correctly.
+    void from_double(bool nearest = false) {
         c_.op(kOpI64FromF64);
+        if (nearest) {
+            c_.tee(kBits);
+            c_.get(kBits);
+            c_.i64c(29);
+            c_.op(kOpI64ShrU);
+            c_.i64c(1);
+            c_.op(kOpI64And);
+            c_.op(kOpI64Add);
+            c_.i64c(0x0FFFFFFFull);
+            c_.op(kOpI64Add);
+        }
         c_.tee(kBits);
         c_.i64c(32);
         c_.op(kOpI64ShrU);
@@ -1307,7 +1320,7 @@ bool Translator::lower(std::uint32_t w, std::uint32_t pc) {
                     to_double(kTmp);
                     to_double(kTmp2);
                     c_.op(kOpF64Div);
-                    from_double();
+                    from_double(true);
                     c_.get(kTmp);
                     c_.get(kTmp2);
                     c_.op(kOpXor);

@@ -23,6 +23,14 @@ int mode() {
         if (std::strcmp(env, "all") == 0) return 2;
         if (std::strcmp(env, "check") == 0) return 3;
         return std::strcmp(env, "0") == 0 ? 0 : 1;
+#elif defined(__aarch64__)
+        // ARM64 (Quest / Pico): on unless PS2_VU_JIT=0; "all" also replaces precompiled programs,
+        // "check" runs both and compares against the interpreter.
+        const char *env = std::getenv("PS2_VU_JIT");
+        if (!env) return 1;
+        if (std::strcmp(env, "all") == 0) return 2;
+        if (std::strcmp(env, "check") == 0) return 3;
+        return std::strcmp(env, "0") == 0 ? 0 : 1;
 #else
         return 0;
 #endif
@@ -66,6 +74,10 @@ ProgramFn compile(const std::uint8_t *code, std::uint32_t entry) {
     if (!index) return nullptr;
     return reinterpret_cast<ProgramFn>(static_cast<std::uintptr_t>(index));
 }
+
+#elif defined(__aarch64__)
+
+ProgramFn compile(const std::uint8_t *code, std::uint32_t entry) { return compile_a64(code, entry); }
 
 #else
 
