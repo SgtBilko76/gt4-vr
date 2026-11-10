@@ -1013,7 +1013,12 @@ void run_entry(int unit, std::uint32_t pc) {
     if (unit == 1) g_interpreted_calls.fetch_add(1, std::memory_order_relaxed);
     if (count && unit == 1) {
         ++misses[pc];
-        if (++interpreted % 5000 == 0) {
+        // PS2_VU_COUNT=N (N > 1): report every N interpreted calls (default 5000).
+        static const std::uint64_t every = [] {
+            const long n = std::atol(std::getenv("PS2_VU_COUNT"));
+            return n > 1 ? static_cast<std::uint64_t>(n) : 5000u;
+        }();
+        if (++interpreted % every == 0) {
             std::fprintf(stderr, "[vu1] compiled %llu interpreted %llu:", static_cast<unsigned long long>(compiled), static_cast<unsigned long long>(interpreted));
             for (const auto &[a, n] : misses) std::fprintf(stderr, " %04X:%llu", a, static_cast<unsigned long long>(n));
             std::fprintf(stderr, "\n");

@@ -391,6 +391,9 @@ private:
     int delay_mode_ = 0;
     unsigned delay_reg_ = 0;
     bool any_status_ = false, any_flags_ = false, any_clip_ = false;
+    // Some program in VU1 code memory reads MAC/status (the interpreter's scan_flags rule): then the
+    // flags at this program's exits are live too - a later program may read them before setting any.
+    bool code_flags_ = false;
 
     std::uint32_t word(std::uint32_t at) const {
         std::uint32_t v;
@@ -1722,7 +1725,7 @@ void Translator::fsset(std::uint32_t w) {
 void Translator::instruction(std::uint32_t pc, std::uint32_t following) {
     const std::uint32_t lo = word(pc), hi = word(pc + 4);
     const Up u = decode_upper(hi);
-    const bool flags_live = any_status_ ? true : (any_flags_ && out_live(pc));
+    const bool flags_live = any_status_ ? true : ((any_flags_ || code_flags_) && out_live(pc));
     const LowerInfo &li = lowers_[pc];
 
     c_.get(kT);
@@ -1899,6 +1902,13 @@ void Translator::prologue() {
 bool Translator::run(std::vector<std::uint8_t> &out) {
     pcs_ = reachable(code_, kMask, entry_);
     if (pcs_.empty() || branch_in_delay_slot(code_, kMask, entry_)) return false;
+    for (std::uint32_t pc = 0; pc <= kMask && !code_flags_; pc += 8) {
+        if (word(pc + 4) & 0x80000000u) continue;
+        switch (word(pc) >> 25) {
+        case 0x14: case 0x15: case 0x16: case 0x17: case 0x18: case 0x1A: case 0x1B: code_flags_ = true; break;
+        default: break;
+        }
+    }
     in_.insert(pcs_.begin(), pcs_.end());
     for (std::uint32_t pc : pcs_) {
         LowerInfo l;

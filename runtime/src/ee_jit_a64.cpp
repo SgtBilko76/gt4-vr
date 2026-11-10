@@ -100,6 +100,7 @@ std::uint32_t *reserve(std::size_t bytes) {
         void *p = mmap(nullptr, kChunk, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p == MAP_FAILED) return nullptr;
         g_chunks.push_back({static_cast<std::uint8_t *>(p), kChunk, 0});
+        std::fprintf(stderr, "[ee-jit] code chunk %p-%p\n", p, static_cast<void *>(static_cast<std::uint8_t *>(p) + kChunk));
     }
     Chunk &k = g_chunks.back();
     return reinterpret_cast<std::uint32_t *>(k.base + k.used);

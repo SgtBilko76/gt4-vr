@@ -93,6 +93,7 @@ std::uint32_t *place(const std::vector<std::uint32_t> &code) {
         if (p == MAP_FAILED) return nullptr;
         g_chunk = static_cast<std::uint8_t *>(p);
         g_chunk_size = size;
+        std::fprintf(stderr, "[vu-jit] code chunk %p-%p\n", p, static_cast<void *>(g_chunk + size));
         g_chunk_used = 0;
     }
     auto *dst = reinterpret_cast<std::uint32_t *>(g_chunk + g_chunk_used);
