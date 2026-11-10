@@ -678,7 +678,9 @@ void kick(bool draw) {
     const int needed = prim == 0 ? 1 : (prim == 1 || prim == 2 || prim == 6) ? 2 : prim == 7 ? 1 : 3;
     if (s.count < needed) return;
     if (draw) {
-        if (cpu_raster()) raster::draw(s, s.queue, needed);
+        // PS2_GS_NULL=1: no software drawing (CPU timing measurements only; pictures are empty).
+        static const bool null_gs = std::getenv("PS2_GS_NULL") != nullptr;
+        if (cpu_raster() && !null_gs) raster::draw(s, s.queue, needed);
 #ifdef PS2_GPU
         if (gpu_on()) gpu::draw(s, s.queue, needed);
 #endif

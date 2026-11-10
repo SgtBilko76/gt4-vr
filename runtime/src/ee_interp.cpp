@@ -7,10 +7,8 @@
 // returns with c.pc = the return address; anything else in c.pc (a thread switch, kUnwind, an
 // exception) makes every frame return to the main loop, which dispatches c.pc again. `jr $ra` sets
 // c.pc and returns. Jumps and branches stay in this frame.
-#include "ps2/generated.hpp"
+#include "ee_core.hpp"
 #include "ps2/system.hpp"
-
-#include "../../recomp/r5900.hpp"
 
 #include <bit>
 #include <cstdint>
@@ -18,9 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace ps2 {
-
-bool probe_at(std::uint32_t pc);
+namespace ps2::ee {
 
 namespace {
 
@@ -38,7 +34,7 @@ struct Slot {
 constexpr std::uint32_t kSlots = 1u << 16;
 Slot g_slots[kSlots];
 
-inline const Insn &fetch(std::uint32_t pc) {
+inline const Insn &fetch_cached(std::uint32_t pc) {
     const std::uint32_t word = ld32(pc);
     Slot &s = g_slots[(pc >> 2) & (kSlots - 1)];
     if (s.pc != pc || s.word != word) [[unlikely]] {
@@ -56,7 +52,7 @@ inline void setw(Cpu &c, unsigned r, std::uint32_t v) { if (r) set32(c.r[r], v);
 inline void setd(Cpu &c, unsigned r, std::uint64_t v) { if (r) c.r[r].d[0] = v; }
 inline std::uint32_t addr(const Cpu &c, const Insn &i) { return W(c, i.rs()) + static_cast<std::uint32_t>(i.simm()); }
 
-bool condition(Cpu &c, const Insn &i) {
+bool condition_impl(Cpu &c, const Insn &i) {
     switch (i.op) {
     case Beq: case Beql: return D(c, i.rs()) == D(c, i.rt());
     case Bne: case Bnel: return D(c, i.rs()) != D(c, i.rt());
@@ -75,7 +71,7 @@ bool condition(Cpu &c, const Insn &i) {
 }
 
 // One instruction without control flow (codegen.cpp simple()). False = the CPU stopped.
-bool simple(Cpu &c, const Insn &i) {
+bool simple_impl(Cpu &c, const Insn &i) {
     const unsigned rs = i.rs(), rt = i.rt(), rd = i.rd(), sa = i.sa();
     const unsigned fsf = (i.word >> 21) & 3u, ftf = (i.word >> 23) & 3u;
     Reg128 scratch;
@@ -387,9 +383,119 @@ bool simple(Cpu &c, const Insn &i) {
 
 }
 
-// Runs from c.pc until the code returns to its caller (c.pc = return address), a thread switch or
-// an unwind; same contract as a generated unit function.
+const Insn &fetch(std::uint32_t pc) { return fetch_cached(pc); }
+bool simple(Cpu &c, const Insn &i) { return simple_impl(c, i); }
+bool condition(Cpu &c, const Insn &i) { return condition_impl(c, i); }
+
+// One block (ee_core.hpp): the rules here are the JIT's contract, keep both in step.
+std::uint64_t interp_block(Cpu &c) {
+    std::uint32_t pc = c.pc;
+    std::int32_t cost = 0;
+    for (std::uint32_t n = 0;; ++n, pc += 4) {
+        if (n && (n >= kMaxBlock || probe_at(pc))) {
+            c.budget -= cost;
+            c.pc = pc;
+            return pack(kNext);
+        }
+        const Insn &i = fetch_cached(pc);
+        const Flow fl = recomp::flow(i.op);
+        if (fl == Flow::None) {
+            ++cost;
+            if (i.op == Syscall) {
+                c.budget -= cost;
+                c.pc = pc + 4;
+                return pack(kSyscall, pc);
+            }
+            if (!simple_impl(c, i)) return pack(kHalt);
+            continue;
+        }
+        if (i.op == Eret) {
+            c.budget -= cost;
+            return pack(kEret);
+        }
+        if (fl == Flow::Stop) {
+            stop(c, pc, recomp::name(i.op));
+            return pack(kHalt);
+        }
+        c.budget -= cost + 2;
+        const Insn ins = i;  // the delay slot's fetch may evict the cached entry
+        const Insn ds = fetch_cached(pc + 4);
+        if (ds.op == Invalid || recomp::has_delay_slot(ds.op) || ds.op == Syscall) {
+            stop(c, pc + 4, "unsupported delay slot");
+            return pack(kHalt);
+        }
+        const std::uint32_t ret = pc + 8, t = ins.branch_target_of();
+        const auto slot = [&] { return simple_impl(c, ds); };
+        const auto go = [&](std::uint32_t target) {
+            c.pc = target;
+            return pack(target <= pc ? kBack : kNext);
+        };
+        switch (ins.op) {
+        case Jal:
+            c.r[31].sd[0] = static_cast<std::int32_t>(ret);
+            if (!slot()) return pack(kHalt);
+            c.pc = t;
+            return pack(kCall, ret);
+        case Bltzal: case Bgezal: {
+            const bool taken = condition_impl(c, ins);
+            c.r[31].sd[0] = static_cast<std::int32_t>(ret);
+            if (!slot()) return pack(kHalt);
+            c.pc = taken ? t : ret;
+            return taken ? pack(kCall, ret) : pack(kNext);
+        }
+        case Bltzall: case Bgezall: {
+            const bool taken = condition_impl(c, ins);
+            c.r[31].sd[0] = static_cast<std::int32_t>(ret);
+            if (taken && !slot()) return pack(kHalt);
+            c.pc = taken ? t : ret;
+            return taken ? pack(kCall, ret) : pack(kNext);
+        }
+        case Jalr: {
+            const std::uint32_t target = W(c, ins.rs());
+            if (ins.rd()) c.r[ins.rd()].sd[0] = static_cast<std::int32_t>(ret);
+            if (!slot()) return pack(kHalt);
+            c.pc = target;
+            return pack(kCall, ret);
+        }
+        case Jr: {
+            const std::uint32_t target = W(c, ins.rs());
+            if (!slot()) return pack(kHalt);
+            c.pc = target;
+            return pack(ins.rs() == 31 ? kReturn : kJr);
+        }
+        case J:
+            if (!slot()) return pack(kHalt);
+            return go(t);
+        default:
+            break;
+        }
+        if (fl == Flow::Branch) {
+            const bool taken = condition_impl(c, ins);
+            if (!slot()) return pack(kHalt);
+            if (taken) return go(t);
+        } else if (fl == Flow::BranchLikely) {
+            if (condition_impl(c, ins)) {
+                if (!slot()) return pack(kHalt);
+                return go(t);
+            }
+        } else {
+            stop(c, pc, "unexpected control flow");
+            return pack(kHalt);
+        }
+        c.pc = ret;
+        return pack(kNext);
+    }
+}
+
+}
+
+namespace ps2 {
+
+// Same contract as a generated unit function: runs until the code returns to its caller (c.pc =
+// return address), a thread switch or an unwind. Calls nest through ps2::call like generated code.
 void interpret(Cpu &c, std::uint32_t, std::uint32_t depth) {
+    using namespace ee;
+    static const bool use_jit = jit_enabled();
     for (;;) {
         const std::uint32_t pc = c.pc;
         if ((pc & kUnwind) || pc == kHandlerReturn || pc == kIdle) return;
@@ -397,108 +503,43 @@ void interpret(Cpu &c, std::uint32_t, std::uint32_t depth) {
             c.pc = c.r[31].w[0];
             return;
         }
-        const Insn i = fetch(pc);
-        const Flow fl = recomp::flow(i.op);
-        if (fl == Flow::None) {
-            c.budget -= 1;
-            if (i.op == Syscall) {
-                c.pc = pc + 4;
-                syscall(c, pc);
-                if (c.pc != pc + 4) return;
-                continue;
-            }
-            if (!simple(c, i)) return;
-            c.pc = pc + 4;
+        const std::uint64_t r = use_jit ? jit_block(c) : interp_block(c);
+        const std::uint32_t at = static_cast<std::uint32_t>(r >> 32);
+        switch (static_cast<Exit>(r & 0xFFu)) {
+        case kNext:
+        case kJr:
             continue;
-        }
-        if (i.op == Eret) {
+        case kBack:
+            if (c.budget < 0 && preempt(c)) {
+                c.pc |= kUnwind;
+                return;
+            }
+            continue;
+        case kCall:
+            call(c, c.pc, depth + 1u);
+            if (c.pc != at) [[unlikely]] return;
+            continue;
+        case kReturn:
+            return;
+        case kSyscall:
+            syscall(c, at);
+            if (c.pc != at + 4) return;
+            continue;
+        case kEret:
             c.pc = eret(c);
             continue;
-        }
-        if (fl == Flow::Stop) {
-            stop(c, pc, recomp::name(i.op));
+        case kHalt:
             return;
         }
-
-        c.budget -= 2;
-        const Insn ds = fetch(pc + 4);
-        if (ds.op == Invalid || recomp::has_delay_slot(ds.op) || ds.op == Syscall) {
-            stop(c, pc + 4, "unsupported delay slot");
-            return;
-        }
-        const std::uint32_t ret = pc + 8;
-        const std::uint32_t t = i.branch_target_of();
-        bool call_now = false, jump_now = false;
-        std::uint32_t target = t;
-        switch (i.op) {
-        case Jal:
-            c.r[31].sd[0] = static_cast<std::int32_t>(ret);
-            if (!simple(c, ds)) return;
-            call_now = true;
-            break;
-        case Bltzal: case Bgezal: {
-            const bool taken = condition(c, i);
-            c.r[31].sd[0] = static_cast<std::int32_t>(ret);
-            if (!simple(c, ds)) return;
-            call_now = taken;
-            break;
-        }
-        case Bltzall: case Bgezall: {
-            const bool taken = condition(c, i);
-            c.r[31].sd[0] = static_cast<std::int32_t>(ret);
-            if (taken && !simple(c, ds)) return;
-            call_now = taken;
-            break;
-        }
-        case Jalr: {
-            target = W(c, i.rs());
-            if (i.rd()) c.r[i.rd()].sd[0] = static_cast<std::int32_t>(ret);
-            if (!simple(c, ds)) return;
-            call_now = true;
-            break;
-        }
-        case Jr: {
-            target = W(c, i.rs());
-            if (!simple(c, ds)) return;
-            c.pc = target;
-            if (i.rs() == 31) return;  // return to the caller frame
-            continue;                   // computed jump: stays in this frame
-        }
-        case J:
-            if (!simple(c, ds)) return;
-            jump_now = true;
-            break;
-        default:
-            if (fl == Flow::Branch) {
-                const bool taken = condition(c, i);
-                if (!simple(c, ds)) return;
-                jump_now = taken;
-            } else if (fl == Flow::BranchLikely) {
-                if (condition(c, i)) {
-                    if (!simple(c, ds)) return;
-                    jump_now = true;
-                }
-            } else {
-                stop(c, pc, "unexpected control flow");
-                return;
-            }
-            break;
-        }
-        if (call_now) {
-            call(c, target, depth + 1u);
-            if (c.pc != ret) [[unlikely]] return;
-            continue;
-        }
-        if (jump_now) {
-            if (target <= pc && c.budget < 0 && preempt(c)) {
-                c.pc = target | kUnwind;
-                return;
-            }
-            c.pc = target;
-            continue;
-        }
-        c.pc = ret;
     }
 }
+
+#if !defined(__aarch64__)
+namespace ee {
+bool jit_enabled() { return false; }
+std::uint64_t jit_block(Cpu &c) { return interp_block(c); }
+void jit_flush() {}
+}
+#endif
 
 }

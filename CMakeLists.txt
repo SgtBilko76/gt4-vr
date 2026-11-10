@@ -33,6 +33,7 @@ add_library(ps2runtime STATIC
     runtime/src/memory.cpp
     runtime/src/dispatch.cpp
     runtime/src/ee_interp.cpp
+    runtime/src/ee_jit_a64.cpp
     recomp/r5900.cpp
     runtime/src/system.cpp
     runtime/src/kernel.cpp

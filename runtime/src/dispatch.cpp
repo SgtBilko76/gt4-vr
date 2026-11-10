@@ -1,3 +1,4 @@
+#include "ee_core.hpp"
 #include "ps2/generated.hpp"
 #include "ps2/system.hpp"
 
@@ -253,6 +254,7 @@ bool probe_at(std::uint32_t pc) {
 
 void set_probe_hook(std::uint32_t pc, ProbeHook hook) {
     if (const std::uint32_t k = (pc & 0x1FFFFFFFu) >> 2; k < kRamSize / 4) g_probe_bits[k >> 6] |= 1ull << (k & 63);
+    ee::jit_flush();  // blocks compiled before may run through this address
     for (auto &h : g_probe_hooks)
         if (h.first == pc) {
             h.second = std::move(hook);
