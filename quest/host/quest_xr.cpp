@@ -38,6 +38,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -595,6 +596,19 @@ private:
         res = xrCreateInstance(&create_info, &m_instance);
         if (XR_FAILED(res))
             return Fail("xrCreateInstance failed", res);
+        {
+            XrInstanceProperties props{XR_TYPE_INSTANCE_PROPERTIES};
+            if (XR_SUCCEEDED(xrGetInstanceProperties(m_instance, &props)))
+            {
+                std::string name = props.runtimeName;
+                for (char &ch : name)
+                    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                m_runtime_pico = name.find("pico") != std::string::npos || name.find("bytedance") != std::string::npos;
+                XR_LOG("runtime: %s %u.%u.%u%s", props.runtimeName, XR_VERSION_MAJOR(props.runtimeVersion),
+                       XR_VERSION_MINOR(props.runtimeVersion), XR_VERSION_PATCH(props.runtimeVersion),
+                       m_runtime_pico ? " (Pico: no picture flip)" : "");
+            }
+        }
 
         XrSystemGetInfo system_info{XR_TYPE_SYSTEM_GET_INFO};
         system_info.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
@@ -930,6 +944,18 @@ private:
         XR_LOG("performance level BOOST: cpu %s, gpu %s", XR_SUCCEEDED(cpu) ? "ok" : "refused", XR_SUCCEEDED(gpu) ? "ok" : "refused");
     }
 
+    // Meta's compositor samples a surface swapchain GL-style (origin bottom-left): flipped back with
+    // XR_FB_composition_layer_image_layout. Pico's reads it top row first, and with the FB flip it
+    // showed the curved screen upside down and the VR race black (owner video/screenshot 2026-11-10):
+    // no flip there. Other runtimes without the extension: the GS draws upside down (GSStereo::flip_y)
+    // and the image rects count rows from the bottom. Live: debug.gt4vr.flipmode 0/1/2.
+    void ApplyStereoOptions(int reproject, float show_depth)
+    {
+        m_stereo_reproject_arg = reproject;
+        if (m_set_stereo_options)
+            m_set_stereo_options(reproject, show_depth, m_gs_flip ? 1 : 0);
+    }
+
     void PollTuning()
     {
         if (++m_tuning_countdown < 30)
@@ -1065,6 +1091,22 @@ private:
         m_hud_half_width = std::clamp(ReadFloatProperty("debug.gt4vr.hudw", kHudHalfWidth), 0.2f, 2.0f);
         m_hud_panel = ReadFloatProperty("debug.gt4vr.hudpanel", 0.0f) != 0.0f;
         m_hud_layer_on = ReadFloatProperty("debug.gt4vr.hudlayer", 1.0f) != 0.0f;
+        {
+            // 0 none (Pico samples the surface top row first), 1 compositor flip (Meta), 2 GS flip
+            // (runtimes sampling bottom-up without the FB extension). Live: debug.gt4vr.flipmode.
+            const int forced = static_cast<int>(ReadFloatProperty("debug.gt4vr.flipmode", -1.0f));
+            const int mode = forced >= 0 && forced <= 2 ? forced : m_runtime_pico ? 0 : m_has_image_layout_ext ? 1 : 2;
+            if (mode != m_flip_mode || !m_gs_flip_logged)
+            {
+                m_flip_mode = mode;
+                m_gs_flip = mode == 2;
+                m_gs_flip_logged = true;
+                XR_LOG("picture orientation: %s", mode == 0   ? "as drawn (runtime reads the surface top row first)"
+                                                  : mode == 1 ? "flipped by the compositor (FB image layout)"
+                                                              : "drawn upside down by the GS (no compositor flip)");
+                ApplyStereoOptions(m_stereo_reproject_arg, m_stereo_show_depth);
+            }
+        }
         m_badge_up = std::clamp(ReadFloatProperty("debug.gt4vr.badgeup", kBadgeUpM), -1.0f, 3.0f);
         // Headless testing without the user: hold pad buttons (HostPadButton mask, decimal) and
         // add a yaw (degrees, positive = head turned left) to the head the game camera sees.
@@ -1405,7 +1447,7 @@ private:
             const float depth_scale = 256.0f * near_units;                    // packed 1 = near
             const float separation = m_stereo_scale * (m_ipd_m * 0.5f) / (m_near_m * 2.0f * tan_x); // UV per eye at 1
             m_set_depth_scale(depth_scale);
-            m_set_stereo_options(1, m_stereo_show_depth, 0);
+            ApplyStereoOptions(1, m_stereo_show_depth);
             m_set_stereo(1, separation, 0.0f);
             XR_LOG("stereo: true scale (eyes %.1f mm, near %.2f m = %.0f units, %.0f units/m, scale %.2f): "
                    "depth x%.0f, separation %.4f", m_ipd_m * 1000.0f, m_near_m, near_units, m_units_per_m,
@@ -1501,7 +1543,7 @@ private:
             if (show_depth != m_stereo_show_depth)
             {
                 m_stereo_show_depth = show_depth;
-                m_set_stereo_options(1, show_depth, 0);
+                ApplyStereoOptions(1, show_depth);
             }
             return; // UpdateTrueStereo owns the settings in the immersive race
         }
@@ -1524,7 +1566,7 @@ private:
         m_stereo_conv = conv;
         m_stereo_show_depth = show_depth;
         // Always split into eyes (the surface is double-width); "off" only skips the reprojection.
-        m_set_stereo_options(stereo ? 1 : 0, show_depth, 0);
+        ApplyStereoOptions(stereo ? 1 : 0, show_depth);
         m_set_stereo(1, sep, conv);
         XR_LOG("stereo: %s separation=%.4f convergence=%.3f showdepth=%.1f", stereo ? "depth" : "flat", sep, conv, show_depth);
     }
@@ -1609,11 +1651,11 @@ private:
                     view.pose = shown->eyes[eye];
                     view.fov = {-ax, ax, up, down};
                     view.subImage.swapchain = m_screen_swapchain;
-                    view.subImage.imageRect.offset = {static_cast<int32_t>(eye) * m_eye_w, 0};
+                    view.subImage.imageRect.offset = {static_cast<int32_t>(eye) * m_eye_w, EyeRowOffset()};
                     view.subImage.imageRect.extent = {m_eye_w, m_eye_h};
                     view.subImage.imageArrayIndex = 0;
                 }
-                if (m_has_image_layout_ext)
+                if (m_flip_mode == 1)
                     projection.next = &image_layout;
                 projection.space = m_local_space;
                 projection.viewCount = 2;
@@ -1622,13 +1664,13 @@ private:
                 if (m_hud_layer_applied)
                 {
                     // The HUD strip as its own screen in front (Wipeout Rewrite VR), alpha-blended.
-                    if (m_has_image_layout_ext)
+                    if (m_flip_mode == 1)
                         hud_quad.next = &image_layout;
                     hud_quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
                     hud_quad.space = m_local_space;
                     hud_quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
                     hud_quad.subImage.swapchain = m_screen_swapchain;
-                    hud_quad.subImage.imageRect.offset = {0, m_eye_h};
+                    hud_quad.subImage.imageRect.offset = {0, m_gs_flip ? 0 : m_eye_h};
                     // The fork draws the HUD strip one eye wide (presentation width / 2 = m_eye_w), not
                     // kHudWidthPx: with eye images wider than 1920 the quad cut off the right edge
                     // (owner 2026-11-06: speedometer and menus incomplete in VR).
@@ -1651,12 +1693,12 @@ private:
                 for (uint32_t eye = 0; eye < 2; ++eye)
                 {
                     XrCompositionLayerQuad &quad = quads[eye];
-                    if (m_has_image_layout_ext)
+                    if (m_flip_mode == 1)
                         quad.next = &image_layout;
                     quad.space = m_local_space;
                     quad.eyeVisibility = eye == 0 ? XR_EYE_VISIBILITY_LEFT : XR_EYE_VISIBILITY_RIGHT;
                     quad.subImage.swapchain = m_screen_swapchain;
-                    quad.subImage.imageRect.offset = {static_cast<int32_t>(eye) * m_eye_w, 0};
+                    quad.subImage.imageRect.offset = {static_cast<int32_t>(eye) * m_eye_w, EyeRowOffset()};
                     quad.subImage.imageRect.extent = {m_eye_w, m_eye_h};
                     quad.pose = pose;
                     quad.size = {width, width * fov.tanHalfY / fov.tanHalfX};
@@ -1671,13 +1713,13 @@ private:
                 {
                     XrSwapchainSubImage sub_image{};
                     sub_image.swapchain = m_screen_swapchain;
-                    sub_image.imageRect.offset = {static_cast<int32_t>(eye) * m_eye_w, 0};
+                    sub_image.imageRect.offset = {static_cast<int32_t>(eye) * m_eye_w, EyeRowOffset()};
                     sub_image.imageRect.extent = {m_eye_w, m_eye_h};
                     const XrEyeVisibility visibility = eye == 0 ? XR_EYE_VISIBILITY_LEFT : XR_EYE_VISIBILITY_RIGHT;
                     if (m_curved && m_has_cylinder_ext)
                     {
                         XrCompositionLayerCylinderKHR &cylinder = cylinders[eye];
-                        if (m_has_image_layout_ext)
+                        if (m_flip_mode == 1)
                             cylinder.next = &image_layout;
                         cylinder.space = m_local_space;
                         cylinder.eyeVisibility = visibility;
@@ -1691,7 +1733,7 @@ private:
                     else
                     {
                         XrCompositionLayerQuad &quad = quads[eye];
-                        if (m_has_image_layout_ext)
+                        if (m_flip_mode == 1)
                             quad.next = &image_layout;
                         quad.space = m_local_space;
                         quad.eyeVisibility = visibility;
@@ -2133,6 +2175,12 @@ private:
     bool m_has_perf_settings_ext = false;
     bool m_has_cylinder_ext = false;
     bool m_has_image_layout_ext = false;
+    bool m_gs_flip = false, m_gs_flip_logged = false, m_runtime_pico = false;
+    int m_flip_mode = 1;
+    int m_stereo_reproject_arg = 0;
+    // Eye picture rows: on top of the surface (the HUD strip below). Read bottom-up (GS flip) the
+    // strip comes first.
+    int32_t EyeRowOffset() const { return m_gs_flip ? kHudRowsPx : 0; }
     SetPerformanceLevelFn m_set_performance_level = nullptr;
     CreateSurfaceSwapchainFn m_create_surface_swapchain = nullptr;
     EnumerateRefreshRatesFn m_enumerate_refresh_rates = nullptr;
