@@ -25,7 +25,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <map>
 #include <vector>
 
 namespace ps2::vu::jit {
@@ -105,9 +107,12 @@ std::uint32_t *place(const std::vector<std::uint32_t> &code) {
 
 enum Type : std::uint8_t { I32, I64, F64, V128 };
 enum Cond : std::uint32_t { EQ = 0, NE = 1, HS = 2, LO = 3, HI = 8, LS = 9, GE = 10, LT = 11, GT = 12, LE = 13 };
-constexpr unsigned SP = 31, X16 = 16, X17 = 17, BASE = 19;
+constexpr unsigned SP = 31, ZR = 31, X16 = 16, X17 = 17, BASE = 19;
 constexpr unsigned kIntRegs[] = {9, 10, 11, 12, 13, 14, 15, 2, 3, 4, 5, 6, 7, 8};
 constexpr unsigned kMaxDepth = 14;
+// Register locals (Compiler::allocate_locals). v0..v2 are scratch, v16..v31 the operand stack.
+constexpr unsigned kIntLocalRegs[] = {20, 21, 22, 23, 24, 25, 26, 27, 28};
+constexpr unsigned kVecLocalRegs[] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
 
 struct Reader {
     const std::uint8_t *p, *end;
@@ -173,9 +178,14 @@ public:
         }
         // literal pool
         while (code_.size() % 4) code_.push_back(0xD4200000u);  // brk (never reached)
+        std::map<std::array<std::uint32_t, 4>, std::size_t> pool;
         for (const auto &[at, bytes] : pool_refs_) {
-            const std::size_t word = code_.size();
-            for (int k = 0; k < 4; ++k) code_.push_back(bytes[k]);
+            auto found = pool.find(bytes);
+            if (found == pool.end()) {
+                found = pool.emplace(bytes, code_.size()).first;
+                for (int k = 0; k < 4; ++k) code_.push_back(bytes[k]);
+            }
+            const std::size_t word = found->second;
             const std::int64_t delta = static_cast<std::int64_t>(word) - static_cast<std::int64_t>(at);
             if (!fits(delta, 19)) range_error_ = true;
             code_[at] |= (static_cast<std::uint32_t>(delta) & 0x7FFFFu) << 5;
@@ -226,9 +236,58 @@ private:
             args_off_ = spill_off_ + kMaxDepth * 16u;
             frame_ = (args_off_ + 4u * 8u + 15u) & ~15u;
             rd_ = b;
+            allocate_locals();
             return true;
         }
         return false;
+    }
+
+    // Register locals: the most used integer locals live in x20..x28 (callee-saved, survive the
+    // import calls), the most used vector locals in v3..v15 (saved to their frame slots around calls;
+    // d8..d15 are saved in the prologue as the ABI requires). The rest stay in the frame.
+    void allocate_locals() {
+        std::vector<std::uint32_t> uses(local_type_.size(), 0);
+        Reader r = rd_;
+        unsigned depth = 0;
+        bool done = false;
+        while (!done && r.ok && r.p < r.end) {
+            const std::uint8_t op = r.byte();
+            switch (op) {
+            case 0x02: case 0x03: case 0x04: r.byte(); ++depth; break;
+            case 0x0B:
+                if (depth == 0) done = true;
+                else --depth;
+                break;
+            case 0x20: case 0x21: case 0x22: {
+                const std::uint32_t l = r.u32();
+                if (l < uses.size()) ++uses[l];
+                break;
+            }
+            default: skip_immediates_in(r, op); break;
+            }
+        }
+        std::vector<std::uint32_t> order(local_type_.size());
+        for (std::uint32_t i = 0; i < order.size(); ++i) order[i] = i;
+        std::stable_sort(order.begin(), order.end(), [&](std::uint32_t a, std::uint32_t b) { return uses[a] > uses[b]; });
+        local_reg_.assign(local_type_.size(), -1);
+        unsigned next_int = 0, next_vec = 0;
+        for (std::uint32_t l : order) {
+            if (!uses[l]) break;
+            if (local_type_[l] == I32 || local_type_[l] == I64) {
+                if (next_int < sizeof kIntLocalRegs / sizeof kIntLocalRegs[0]) local_reg_[l] = static_cast<int>(kIntLocalRegs[next_int++]);
+            } else if (next_vec < sizeof kVecLocalRegs / sizeof kVecLocalRegs[0]) {
+                local_reg_[l] = static_cast<int>(kVecLocalRegs[next_vec++]);
+                vec_locals_.push_back(l);
+            }
+        }
+    }
+    bool is_vec(Type t) const { return t == F64 || t == V128; }
+    // Vector register locals are caller-saved: store them before an import call, reload after.
+    void save_vec_locals() {
+        for (std::uint32_t l : vec_locals_) frame_st(V128, static_cast<unsigned>(local_reg_[l]), local_off_[l]);
+    }
+    void load_vec_locals() {
+        for (std::uint32_t l : vec_locals_) frame_ld(V128, static_cast<unsigned>(local_reg_[l]), local_off_[l]);
     }
 
     bool fail(const char *why) {
@@ -294,18 +353,42 @@ private:
         w(0xA9BF7BFDu);  // stp x29, x30, [sp, #-16]!
         w(0x910003FDu);  // mov x29, sp
         w(0xA9BF53F3u);  // stp x19, x20, [sp, #-16]!
+        w(0xA9BF5BF5u);  // stp x21, x22, [sp, #-16]!
+        w(0xA9BF63F7u);  // stp x23, x24, [sp, #-16]!
+        w(0xA9BF6BF9u);  // stp x25, x26, [sp, #-16]!
+        w(0xA9BF73FBu);  // stp x27, x28, [sp, #-16]!
+        w(0x6DBF27E8u);  // stp d8, d9, [sp, #-16]!
+        w(0x6DBF2FEAu);  // stp d10, d11, [sp, #-16]!
+        w(0x6DBF37ECu);  // stp d12, d13, [sp, #-16]!
+        w(0x6DBF3FEEu);  // stp d14, d15, [sp, #-16]!
         sub_sp(frame_);
         movx(BASE, g_base);
         w(0x6F00E400u);  // movi v0.2d, #0
         for (std::uint32_t off = 0; off < locals_size_; off += 16) frame_st(V128, 0, off);
+        for (std::uint32_t l = 0; l < local_reg_.size(); ++l) {
+            if (local_reg_[l] < 0) continue;
+            const unsigned reg = static_cast<unsigned>(local_reg_[l]);
+            if (is_vec(local_type_[l])) vmov(reg, 0);
+            else w(0xAA1F03E0u | reg);  // mov x, xzr
+        }
         // params as offsets from the base
         w(0xCB000000u | BASE << 16 | 0 << 5 | 0);  // sub x0, x0, x19
         w(0xCB000000u | BASE << 16 | 1 << 5 | 1);  // sub x1, x1, x19
-        frame_st(I32, 0, local_off_[0]);
-        frame_st(I32, 1, local_off_[1]);
+        for (unsigned p = 0; p < 2; ++p) {
+            if (local_reg_[p] >= 0) w(0x2A0003E0u | p << 16 | static_cast<unsigned>(local_reg_[p]));  // mov w, wp
+            else frame_st(I32, p, local_off_[p]);
+        }
     }
     void epilogue() {
         add_sp(frame_);
+        w(0x6CC13FEEu);  // ldp d14, d15, [sp], #16
+        w(0x6CC137ECu);  // ldp d12, d13, [sp], #16
+        w(0x6CC12FEAu);  // ldp d10, d11, [sp], #16
+        w(0x6CC127E8u);  // ldp d8, d9, [sp], #16
+        w(0xA8C173FBu);  // ldp x27, x28, [sp], #16
+        w(0xA8C16BF9u);  // ldp x25, x26, [sp], #16
+        w(0xA8C163F7u);  // ldp x23, x24, [sp], #16
+        w(0xA8C15BF5u);  // ldp x21, x22, [sp], #16
         w(0xA8C153F3u);  // ldp x19, x20, [sp], #16
         w(0xA8C17BFDu);  // ldp x29, x30, [sp], #16
         w(0xD65F03C0u);  // ret
@@ -480,6 +563,7 @@ private:
         for (std::size_t d = 0; d < base; ++d) frame_st(stack_[d], reg_of(d), spill_off_ + 16u * static_cast<std::uint32_t>(d));
         for (std::size_t k = 0; k < imp.params; ++k) frame_st(I64, ireg(base + k), args_off_ + 8u * static_cast<std::uint32_t>(k));
         for (std::size_t k = 0; k < imp.params; ++k) frame_ld(I32, static_cast<unsigned>(k), args_off_ + 8u * static_cast<std::uint32_t>(k));
+        save_vec_locals();
         movx(X16, reinterpret_cast<std::uint64_t>(imp.fn));
         w(0xD63F0000u | X16 << 5);  // blr x16
         stack_.resize(base);
@@ -487,6 +571,7 @@ private:
             epilogue();
             return true;
         }
+        load_vec_locals();
         for (std::size_t d = 0; d < base; ++d) frame_ld(stack_[d], reg_of(d), spill_off_ + 16u * static_cast<std::uint32_t>(d));
         if (imp.result) {
             if (!push(I32)) return false;
@@ -496,8 +581,8 @@ private:
     }
 
     // Skips one instruction's immediates (dead code after br / br_table / return).
-    bool skip_immediates(std::uint8_t op) {
-        Reader &r = rd_;
+    bool skip_immediates(std::uint8_t op) { return skip_immediates_in(rd_, op); }
+    static bool skip_immediates_in(Reader &r, std::uint8_t op) {
         switch (op) {
         case 0x02: case 0x03: case 0x04: r.byte(); return true;
         case 0x0C: case 0x0D: case 0x10: case 0x12: case 0x20: case 0x21: case 0x22: r.u32(); return true;
@@ -527,7 +612,665 @@ private:
         }
     }
 
+
+    // ---------- lazy operand stack
+    // An entry can stay un-materialised: a register local (Reg), a constant (Imm) or the result of a
+    // compare still in NZCV (Cond). Instructions with a fast path read such entries directly; all
+    // others get their operands materialised into the slot registers and use instruction_slots().
+    enum LazyKind : std::uint8_t { kSlot, kReg, kImm, kCond };
+    struct Lazy {
+        LazyKind kind = kSlot;
+        unsigned reg = 0;        // kReg: the local's register; kCond: the condition code (true when set)
+        std::uint64_t imm = 0;   // kImm
+    };
+    std::vector<Lazy> lz_;
+
+    void sync_lazy() { lz_.resize(stack_.size()); }
+    bool is_int(std::size_t d) const { return stack_[d] == I32 || stack_[d] == I64; }
+    void materialize(std::size_t d) {
+        Lazy &e = lz_[d];
+        switch (e.kind) {
+        case kSlot: return;
+        case kReg:
+            if (is_int(d)) w(0xAA0003E0u | e.reg << 16 | ireg(d));  // mov x, xl
+            else vmov(vreg(d), e.reg);
+            break;
+        case kImm:
+            if (stack_[d] == I64) movx(ireg(d), e.imm);
+            else movw(ireg(d), static_cast<std::uint32_t>(e.imm));
+            break;
+        case kCond: w(0x1A9F07E0u | (e.reg ^ 1u) << 12 | ireg(d)); break;  // cset
+        }
+        e = Lazy{};
+    }
+    void materialize_all() {
+        for (std::size_t d = 0; d < stack_.size(); ++d) materialize(d);
+    }
+    void materialize_cond() {
+        for (std::size_t d = 0; d < stack_.size(); ++d)
+            if (lz_[d].kind == kCond) materialize(d);
+    }
+    void materialize_reg(unsigned reg, std::size_t below) {
+        for (std::size_t d = 0; d < below && d < stack_.size(); ++d)
+            if (lz_[d].kind == kReg && lz_[d].reg == reg) materialize(d);
+    }
+    // Source register of an integer entry (constants go to `scratch`, conditions to their slot).
+    unsigned isrc(std::size_t d, unsigned scratch = X17) {
+        const Lazy &e = lz_[d];
+        if (e.kind == kReg) return e.reg;
+        if (e.kind == kImm) {
+            if (e.imm == 0) return ZR;
+            if (stack_[d] == I64) movx(scratch, e.imm);
+            else movw(scratch, static_cast<std::uint32_t>(e.imm));
+            return scratch;
+        }
+        if (e.kind == kCond) materialize(d);
+        return ireg(d);
+    }
+    // As isrc, but never xzr: for the immediate forms (cmp #imm, add #imm), where register 31 is sp.
+    unsigned isrc_nz(std::size_t d, unsigned scratch) {
+        if (lz_[d].kind == kImm && lz_[d].imm == 0) {
+            w(0xAA1F03E0u | scratch);  // mov x, xzr
+            return scratch;
+        }
+        return isrc(d, scratch);
+    }
+    unsigned vsrc(std::size_t d) const { return lz_[d].kind == kReg ? lz_[d].reg : vreg(d); }
+    void set_slot(std::size_t d) { lz_[d] = Lazy{}; }
+
+    static bool logical_imm(std::uint64_t imm, bool wide, std::uint32_t &out) {
+        if (!wide) imm = (imm & 0xFFFFFFFFull) | (imm << 32);
+        if (imm == 0 || imm == ~0ull) return false;
+        unsigned size = 64;
+        while (size > 2) {
+            size /= 2;
+            const std::uint64_t mask = (1ull << size) - 1;
+            if ((imm & mask) != ((imm >> size) & mask)) {
+                size *= 2;
+                break;
+            }
+        }
+        const std::uint64_t mask = size == 64 ? ~0ull : (1ull << size) - 1;
+        imm &= mask;
+        const auto is_mask = [](std::uint64_t v) { return v && ((v + 1) & v) == 0; };
+        const auto is_shifted_mask = [&](std::uint64_t v) { return v && is_mask((v - 1) | v); };
+        unsigned i, cto;
+        if (is_shifted_mask(imm)) {
+            i = static_cast<unsigned>(__builtin_ctzll(imm));
+            cto = static_cast<unsigned>(__builtin_ctzll(~(imm >> i)));
+        } else {
+            imm |= ~mask;
+            if (!is_shifted_mask(~imm)) return false;
+            const unsigned clo = static_cast<unsigned>(__builtin_clzll(~imm));
+            i = 64 - clo;
+            cto = clo + static_cast<unsigned>(__builtin_ctzll(~imm)) - (64 - size);
+        }
+        const unsigned immr = (size - i) & (size - 1);
+        std::uint64_t nimms = ~static_cast<std::uint64_t>(size - 1) << 1;
+        nimms |= (cto - 1);
+        const unsigned n = static_cast<unsigned>(((nimms >> 6) & 1) ^ 1);
+        out = n << 12 | immr << 6 | static_cast<unsigned>(nimms & 0x3F);
+        return true;
+    }
+
+    // Constant folding for the integer ops the translator emits.
+    static bool fold(std::uint8_t op, bool wide, std::uint64_t a, std::uint64_t b, std::uint64_t &out) {
+        if (!wide) {
+            const auto x = static_cast<std::uint32_t>(a), y = static_cast<std::uint32_t>(b);
+            std::uint32_t r;
+            switch (op) {
+            case 0x6A: r = x + y; break;
+            case 0x6B: r = x - y; break;
+            case 0x6C: r = x * y; break;
+            case 0x71: r = x & y; break;
+            case 0x72: r = x | y; break;
+            case 0x73: r = x ^ y; break;
+            case 0x74: r = x << (y & 31); break;
+            case 0x75: r = static_cast<std::uint32_t>(static_cast<std::int32_t>(x) >> (y & 31)); break;
+            case 0x76: r = x >> (y & 31); break;
+            default: return false;
+            }
+            out = r;
+            return true;
+        }
+        switch (op) {
+        case 0x7C: out = a + b; return true;
+        case 0x7D: out = a - b; return true;
+        case 0x83: out = a & b; return true;
+        case 0x84: out = a | b; return true;
+        case 0x85: out = a ^ b; return true;
+        case 0x86: out = a << (b & 63); return true;
+        case 0x88: out = a >> (b & 63); return true;
+        default: return false;
+        }
+    }
+
+    // i32 / i64 binary op with lazy operands. Returns false when the op isn't one of them.
+    bool lazy_binary(std::uint8_t op) {
+        std::uint32_t reg_enc = 0;
+        bool wide_op = false, commutative = false;
+        switch (op) {
+        case 0x6A: reg_enc = 0x0B000000u; commutative = true; break;
+        case 0x6B: reg_enc = 0x4B000000u; break;
+        case 0x6C: reg_enc = 0x1B007C00u; commutative = true; break;
+        case 0x71: reg_enc = 0x0A000000u; commutative = true; break;
+        case 0x72: reg_enc = 0x2A000000u; commutative = true; break;
+        case 0x73: reg_enc = 0x4A000000u; commutative = true; break;
+        case 0x74: reg_enc = 0x1AC02000u; break;
+        case 0x75: reg_enc = 0x1AC02800u; break;
+        case 0x76: reg_enc = 0x1AC02400u; break;
+        case 0x7C: reg_enc = 0x8B000000u; wide_op = true; commutative = true; break;
+        case 0x7D: reg_enc = 0xCB000000u; wide_op = true; break;
+        case 0x83: reg_enc = 0x8A000000u; wide_op = true; commutative = true; break;
+        case 0x84: reg_enc = 0xAA000000u; wide_op = true; commutative = true; break;
+        case 0x85: reg_enc = 0xCA000000u; wide_op = true; commutative = true; break;
+        case 0x86: reg_enc = 0x9AC02000u; wide_op = true; break;
+        case 0x88: reg_enc = 0x9AC02400u; wide_op = true; break;
+        default: return false;
+        }
+        if (!need(2)) return true;
+        std::size_t a = top() - 1, b = top();
+        const bool wide = stack_[a] == I64;
+        if (wide != wide_op) {
+            fail("binary op type");
+            return true;
+        }
+        Lazy la = lz_[a], lb = lz_[b];
+        if (la.kind == kImm && lb.kind == kImm) {
+            std::uint64_t v;
+            if (fold(op, wide, la.imm, lb.imm, v)) {
+                stack_.pop_back();
+                sync_lazy();
+                lz_[a] = Lazy{kImm, 0, v};
+                return true;
+            }
+        }
+        // constant on the left of a commutative op: use it as the right operand
+        bool swapped = false;
+        if (la.kind == kImm && lb.kind != kImm && commutative) {
+            std::swap(la, lb);
+            swapped = true;
+        }
+        const unsigned d = ireg(a);
+        const unsigned sf = wide ? 0x80000000u : 0u;
+        if (lb.kind == kImm) {
+            // the register operand: the non-constant one
+            const std::size_t src_d = swapped ? b : a;
+            const unsigned n = isrc_nz(src_d, X16);
+            const std::uint64_t imm = wide ? lb.imm : (lb.imm & 0xFFFFFFFFull);
+            bool done = false;
+            switch (op) {
+            case 0x6A: case 0x7C: case 0x6B: case 0x7D: {
+                const bool sub = op == 0x6B || op == 0x7D;
+                std::int64_t v = wide ? static_cast<std::int64_t>(imm) : static_cast<std::int32_t>(static_cast<std::uint32_t>(imm));
+                bool is_sub = sub;
+                if (v < 0) {
+                    v = -v;
+                    is_sub = !is_sub;
+                }
+                if (v >= 0 && v < 4096) {
+                    w((is_sub ? 0x51000000u : 0x11000000u) | sf | static_cast<std::uint32_t>(v) << 10 | n << 5 | d);
+                    done = true;
+                } else if (v >= 0 && (v & 0xFFF) == 0 && v < (1 << 24)) {
+                    w((is_sub ? 0x51400000u : 0x11400000u) | sf | static_cast<std::uint32_t>(v >> 12) << 10 | n << 5 | d);
+                    done = true;
+                }
+                break;
+            }
+            case 0x71: case 0x72: case 0x73: case 0x83: case 0x84: case 0x85: {
+                std::uint32_t bits;
+                if (logical_imm(imm, wide, bits)) {
+                    const std::uint32_t base = (op == 0x71 || op == 0x83) ? 0x12000000u : (op == 0x72 || op == 0x84) ? 0x32000000u : 0x52000000u;
+                    w(base | sf | bits << 10 | n << 5 | d);
+                    done = true;
+                }
+                break;
+            }
+            case 0x74: case 0x86: {
+                const unsigned size = wide ? 64 : 32, sh = static_cast<unsigned>(imm & (size - 1));
+                if (!sh) w((wide ? 0xAA0003E0u : 0x2A0003E0u) | n << 16 | d);
+                else w((wide ? 0xD3400000u : 0x53000000u) | ((size - sh) & (size - 1)) << 16 | (size - 1 - sh) << 10 | n << 5 | d);
+                done = true;
+                break;
+            }
+            case 0x76: case 0x88: {
+                const unsigned size = wide ? 64 : 32, sh = static_cast<unsigned>(imm & (size - 1));
+                if (!sh) w((wide ? 0xAA0003E0u : 0x2A0003E0u) | n << 16 | d);
+                else w((wide ? 0xD340FC00u : 0x53007C00u) | sh << 16 | n << 5 | d);
+                done = true;
+                break;
+            }
+            case 0x75: {
+                const unsigned sh = static_cast<unsigned>(imm & 31);
+                if (!sh) w(0x2A0003E0u | n << 16 | d);
+                else w(0x13007C00u | sh << 16 | n << 5 | d);
+                done = true;
+                break;
+            }
+            default: break;
+            }
+            if (!done) {
+                if (wide) movx(X17, imm);
+                else movw(X17, static_cast<std::uint32_t>(imm));
+                w(reg_enc | X17 << 16 | n << 5 | d);
+            }
+        } else {
+            const unsigned n = isrc(a, X16), m = isrc(b, X17);
+            w(reg_enc | m << 16 | n << 5 | d);
+        }
+        stack_.pop_back();
+        sync_lazy();
+        set_slot(a);
+        return true;
+    }
+
+    // Integer compares: leave the result in NZCV (kCond).
+    bool lazy_compare(std::uint8_t op) {
+        Cond c;
+        switch (op) {
+        case 0x46: c = EQ; break;
+        case 0x47: c = NE; break;
+        case 0x48: c = LT; break;
+        case 0x49: c = LO; break;
+        case 0x4A: c = GT; break;
+        case 0x4B: c = HI; break;
+        case 0x4C: c = LE; break;
+        case 0x4D: c = LS; break;
+        case 0x4E: c = GE; break;
+        case 0x4F: c = HS; break;
+        default: return false;
+        }
+        if (!need(2)) return true;
+        const std::size_t a = top() - 1, b = top();
+        const bool wide = stack_[a] == I64;
+        const unsigned n = isrc_nz(a, X16);
+        const Lazy lb = lz_[b];
+        const std::uint64_t imm = wide ? lb.imm : (lb.imm & 0xFFFFFFFFull);
+        if (lb.kind == kImm && imm < 4096) {
+            w((wide ? 0xF100001Fu : 0x7100001Fu) | static_cast<std::uint32_t>(imm) << 10 | n << 5);  // cmp n, #imm
+        } else {
+            const unsigned m = isrc(b, X17);
+            w((wide ? 0xEB00001Fu : 0x6B00001Fu) | m << 16 | n << 5);  // cmp n, m
+        }
+        stack_.pop_back();
+        sync_lazy();
+        stack_[a] = I32;
+        lz_[a] = Lazy{kCond, static_cast<unsigned>(c), 0};
+        return true;
+    }
+
+    // Integer memory access with a lazy address / value.
+    bool lazy_mem(bool store, unsigned size_log2, bool sign, std::uint32_t off) {
+        if (!need(store ? 2 : 1)) return true;
+        const std::size_t ad = store ? top() - 1 : top();
+        const std::uint32_t scale = 1u << size_log2;
+        unsigned basereg;
+        std::uint64_t disp;
+        if (lz_[ad].kind == kImm) {
+            basereg = BASE;
+            disp = (lz_[ad].imm & 0xFFFFFFFFull) + off;
+        } else {
+            address(isrc(ad, X16));
+            basereg = X16;
+            disp = off;
+        }
+        if (disp % scale || disp / scale >= 4096) {
+            add_imm_x(X16, basereg, static_cast<std::uint32_t>(disp));
+            basereg = X16;
+            disp = 0;
+        }
+        const auto field = static_cast<std::uint32_t>(disp / scale) << 10 | basereg << 5;
+        if (store) {
+            static const std::uint32_t kSt[4] = {0x39000000u, 0x79000000u, 0xB9000000u, 0xF9000000u};
+            const unsigned v = isrc(top(), X17);
+            w(kSt[size_log2] | field | v);
+            stack_.pop_back();
+            stack_.pop_back();
+            sync_lazy();
+            return true;
+        }
+        static const std::uint32_t kLd[4] = {0x39400000u, 0x79400000u, 0xB9400000u, 0xF9400000u};
+        static const std::uint32_t kLdS[2] = {0x39C00000u, 0x79C00000u};
+        w((sign ? kLdS[size_log2] : kLd[size_log2]) | field | ireg(ad));
+        stack_.back() = size_log2 == 3 ? I64 : I32;
+        set_slot(ad);
+        return true;
+    }
+
+    bool lazy_vmem(bool store, std::uint32_t off) {
+        if (!need(store ? 2 : 1)) return true;
+        const std::size_t ad = store ? top() - 1 : top();
+        unsigned basereg;
+        std::uint64_t disp;
+        if (lz_[ad].kind == kImm) {
+            basereg = BASE;
+            disp = (lz_[ad].imm & 0xFFFFFFFFull) + off;
+        } else {
+            address(isrc(ad, X16));
+            basereg = X16;
+            disp = off;
+        }
+        if (disp % 16 || disp / 16 >= 4096) {
+            add_imm_x(X16, basereg, static_cast<std::uint32_t>(disp));
+            basereg = X16;
+            disp = 0;
+        }
+        const auto field = static_cast<std::uint32_t>(disp / 16) << 10 | basereg << 5;
+        if (store) {
+            w(0x3D800000u | field | vsrc(top()));
+            stack_.pop_back();
+            stack_.pop_back();
+            sync_lazy();
+            return true;
+        }
+        stack_.back() = V128;
+        set_slot(ad);
+        w(0x3DC00000u | field | vreg(ad));
+        return true;
+    }
+
+    // Vector ops that read lazy register locals directly.
+    bool lazy_simd(std::uint32_t sub) {
+        static const struct {
+            std::uint32_t sub, enc;
+            bool swap;
+        } kBin[] = {
+            {0x37, 0x6EA08C00u, false}, {0x39, 0x4EA03400u, true},  {0x3B, 0x4EA03400u, false}, {0x3D, 0x4EA03C00u, true},
+            {0x3F, 0x4EA03C00u, false}, {0x41, 0x4E20E400u, false}, {0x43, 0x6EA0E400u, true},  {0x44, 0x6EA0E400u, false},
+            {0x45, 0x6E20E400u, true},  {0x46, 0x6E20E400u, false}, {0x4E, 0x4E201C00u, false}, {0x4F, 0x4E601C00u, false},
+            {0x50, 0x4EA01C00u, false}, {0x51, 0x6E201C00u, false}, {0xAE, 0x4EA08400u, false}, {0xB1, 0x6EA08400u, false},
+            {0xB6, 0x4EA06C00u, false}, {0xB8, 0x4EA06400u, false}, {0xE4, 0x4E20D400u, false}, {0xE5, 0x4EA0D400u, false},
+            {0xE6, 0x6E20DC00u, false},
+        };
+        for (const auto &op : kBin) {
+            if (op.sub != sub) continue;
+            if (!need(2)) return true;
+            const std::size_t a = top() - 1, b = top();
+            const unsigned va = vsrc(a), vb = vsrc(b);
+            const unsigned n = op.swap ? vb : va, m = op.swap ? va : vb;
+            w(op.enc | m << 16 | n << 5 | vreg(a));
+            stack_.pop_back();
+            sync_lazy();
+            set_slot(a);
+            return true;
+        }
+        Reader &r = rd_;
+        switch (sub) {
+        case 0x00: { r.u32(); return lazy_vmem(false, r.u32()); }
+        case 0x0B: { r.u32(); return lazy_vmem(true, r.u32()); }
+        case 0xA1: case 0xF8: case 0xFA: {
+            if (!need(1)) return true;
+            const std::uint32_t enc = sub == 0xA1 ? 0x6EA0B800u : sub == 0xF8 ? 0x4EA1B800u : 0x4E21D800u;
+            w(enc | vsrc(top()) << 5 | vreg(top()));
+            set_slot(top());
+            return true;
+        }
+        case 0x11: {  // i32x4.splat
+            if (!need(1)) return true;
+            const unsigned n = isrc(top(), X17);
+            w(0x4E040C00u | n << 5 | vreg(top()));
+            stack_.back() = V128;
+            set_slot(top());
+            return true;
+        }
+        case 0x1B: {  // i32x4.extract_lane
+            const std::uint32_t lane = r.byte();
+            if (!need(1) || lane > 3) return fail("extract lane");
+            w(0x0E003C00u | ((lane << 3) | 4u) << 16 | vsrc(top()) << 5 | ireg(top()));
+            stack_.back() = I32;
+            set_slot(top());
+            return true;
+        }
+        case 0x1C: {  // i32x4.replace_lane: writes into the vector's slot
+            const std::uint32_t lane = r.byte();
+            if (!need(2) || lane > 3) return fail("replace lane");
+            const std::size_t x = top(), v = top() - 1;
+            materialize(v);
+            w(0x4E001C00u | ((lane << 3) | 4u) << 16 | isrc(x, X17) << 5 | vreg(v));
+            stack_.pop_back();
+            sync_lazy();
+            return true;
+        }
+        case 0x52: {  // bitselect(a, b, c) = (a & c) | (b & ~c)
+            if (!need(3)) return true;
+            const std::size_t c = top(), b = top() - 1, a = top() - 2;
+            vmov(0, vsrc(c));
+            w(0x6E601C00u | vsrc(b) << 16 | vsrc(a) << 5 | 0);  // bsl v0, va, vb
+            vmov(vreg(a), 0);
+            stack_.pop_back();
+            stack_.pop_back();
+            sync_lazy();
+            set_slot(a);
+            return true;
+        }
+        default: return false;
+        }
+    }
+
+    // Number of operands an instruction reads from the stack in instruction_slots; -1 = all
+    // (control flow, calls, unknown): those are materialised before it runs.
+    int slot_reads(std::uint8_t op) {
+        switch (op) {
+        case 0x1A: return 0;
+        case 0x20: return 0;
+        case 0x21: case 0x22: return 1;
+        case 0x1B: return 3;
+        case 0x28: case 0x29: case 0x2C: case 0x2D: case 0x2E: case 0x2F: return 1;
+        case 0x36: case 0x37: case 0x3A: case 0x3B: return 2;
+        case 0x41: case 0x42: return 0;
+        case 0x45: case 0x9F: case 0xA7: case 0xAC: case 0xAD: case 0xBD: case 0xBF: case 0xC0: case 0xC1: return 1;
+        case 0xA3: return 2;
+        case 0xFD: {
+            Reader peek = rd_;
+            const std::uint32_t sub = peek.u32();
+            switch (sub) {
+            case 0x00: case 0x11: case 0x1B: case 0xA1: case 0xF8: case 0xFA: return 1;
+            case 0x0C: return 0;
+            case 0x52: return 3;
+            default: return 2;
+            }
+        }
+        default:
+            if (op >= 0x46 && op <= 0x8A) return 2;
+            return -1;
+        }
+    }
+
     bool instruction(std::uint8_t op) {
+        Reader &r = rd_;
+        if (dead_) {
+            const bool ok = instruction_slots(op);
+            sync_lazy();
+            return ok;
+        }
+        // NZCV only survives into the instructions that consume it.
+        const bool cond_top = !stack_.empty() && lz_[top()].kind == kCond;
+        if (!(cond_top && (op == 0x04 || op == 0x0D || op == 0x1B || op == 0x45))) materialize_cond();
+
+        switch (op) {
+        case 0x20: case 0x21: case 0x22: {
+            Reader peek = r;
+            const std::uint32_t l = peek.u32();
+            if (l >= local_type_.size()) return fail("local index");
+            const int lr = local_reg_[l];
+            const Type t = local_type_[l];
+            if (op == 0x20) {
+                if (lr < 0) break;  // frame local: slot load
+                r.u32();
+                if (!push(t)) return false;
+                sync_lazy();
+                lz_[top()] = Lazy{kReg, static_cast<unsigned>(lr), 0};
+                return true;
+            }
+            if (!need(1)) return false;
+            if (lr < 0) {
+                materialize(top());
+                break;
+            }
+            r.u32();
+            const auto reg = static_cast<unsigned>(lr);
+            const Lazy e = lz_[top()];
+            const bool self = e.kind == kReg && e.reg == reg;
+            if (!self) {
+                materialize_reg(reg, top());  // older reads of the local keep the old value
+                if (is_vec(t)) vmov(reg, vsrc(top()));
+                else if (e.kind == kImm) {
+                    if (t == I64) movx(reg, e.imm);
+                    else movw(reg, static_cast<std::uint32_t>(e.imm));
+                } else {
+                    w(0xAA0003E0u | isrc(top(), X17) << 16 | reg);  // mov xl, x
+                }
+            }
+            if (op == 0x21) {
+                stack_.pop_back();
+                sync_lazy();
+            } else {
+                lz_[top()] = Lazy{kReg, reg, 0};
+            }
+            return true;
+        }
+        case 0x41: {
+            const auto v = static_cast<std::uint32_t>(r.sleb(32));
+            if (!push(I32)) return false;
+            sync_lazy();
+            lz_[top()] = Lazy{kImm, 0, v};
+            return true;
+        }
+        case 0x42: {
+            const auto v = static_cast<std::uint64_t>(r.sleb(64));
+            if (!push(I64)) return false;
+            sync_lazy();
+            lz_[top()] = Lazy{kImm, 0, v};
+            return true;
+        }
+        case 0x45: {  // eqz
+            if (!need(1)) return false;
+            Lazy &e = lz_[top()];
+            if (e.kind == kCond) {
+                e.reg ^= 1u;
+                return true;
+            }
+            if (e.kind == kImm) {
+                e.imm = (stack_[top()] == I64 ? e.imm : (e.imm & 0xFFFFFFFFull)) == 0;
+                stack_.back() = I32;
+                return true;
+            }
+            const bool wide = stack_[top()] == I64;
+            w((wide ? 0xF100001Fu : 0x7100001Fu) | isrc(top()) << 5);  // cmp x, #0
+            stack_.back() = I32;
+            lz_[top()] = Lazy{kCond, EQ, 0};
+            return true;
+        }
+        case 0x04: {  // if
+            if (!need(1)) return false;
+            const Lazy e = lz_[top()];
+            if (e.kind != kCond && e.kind != kReg) break;
+            if (r.byte() != 0x40) return fail("if with a result");
+            for (std::size_t d = 0; d + 1 < stack_.size(); ++d) materialize(d);
+            stack_.pop_back();
+            sync_lazy();
+            Ctrl c{Ctrl::If, stack_.size()};
+            c.to_end.push_back({code_.size(), kCond19});
+            if (e.kind == kCond) w(0x54000000u | (e.reg ^ 1u));  // b.!cond end
+            else w(0x34000000u | e.reg);                         // cbz wl, end
+            ctrl_.push_back(std::move(c));
+            return true;
+        }
+        case 0x0D: {  // br_if
+            if (!need(1)) return false;
+            const Lazy e = lz_[top()];
+            if (e.kind != kCond && e.kind != kReg) break;
+            Reader peek = r;
+            const std::uint32_t depth = peek.u32();
+            if (ctrl_[ctrl_.size() - 1 - depth].kind == Ctrl::Function) return fail("br_if to the function");
+            r.u32();
+            for (std::size_t d = 0; d + 1 < stack_.size(); ++d) materialize(d);
+            stack_.pop_back();
+            sync_lazy();
+            if (e.kind == kCond) branch_to(depth, 0x54000000u | e.reg, kCond19);  // b.cond
+            else branch_to(depth, 0x35000000u | e.reg, kCond19);                  // cbnz
+            return true;
+        }
+        case 0x1B: {  // select
+            if (!need(3)) return false;
+            const std::size_t c = top(), b = top() - 1, a = top() - 2;
+            unsigned cond = NE;
+            if (lz_[c].kind == kCond) cond = lz_[c].reg;
+            else w(0x7100001Fu | isrc_nz(c, X17) << 5);  // cmp c, #0
+            if (is_vec(stack_[a])) {
+                w(0x5A9F03E0u | (cond ^ 1u) << 12 | 0);  // csetm w0, cond
+                w(0x4E040C00u | 0 << 5 | 0);             // dup v0.4s, w0
+                w(0x6E601C00u | vsrc(b) << 16 | vsrc(a) << 5 | 0);
+                vmov(vreg(a), 0);
+            } else {
+                const unsigned va = isrc(a, X16), vb = isrc(b, X17);
+                w((stack_[a] == I64 ? 0x9A800000u : 0x1A800000u) | vb << 16 | cond << 12 | va << 5 | ireg(a));
+            }
+            stack_.pop_back();
+            stack_.pop_back();
+            sync_lazy();
+            set_slot(a);
+            return true;
+        }
+        case 0x28: case 0x29: case 0x2C: case 0x2D: case 0x2E: case 0x2F: {
+            r.u32();
+            const std::uint32_t off = r.u32();
+            switch (op) {
+            case 0x28: return lazy_mem(false, 2, false, off);
+            case 0x29: return lazy_mem(false, 3, false, off);
+            case 0x2C: return lazy_mem(false, 0, true, off);
+            case 0x2D: return lazy_mem(false, 0, false, off);
+            case 0x2E: return lazy_mem(false, 1, true, off);
+            default: return lazy_mem(false, 1, false, off);
+            }
+        }
+        case 0x36: case 0x37: case 0x3A: case 0x3B: {
+            r.u32();
+            const std::uint32_t off = r.u32();
+            return lazy_mem(true, op == 0x36 ? 2 : op == 0x37 ? 3 : op == 0x3A ? 0 : 1, false, off);
+        }
+        case 0xA7: case 0xAD: {  // wrap / extend_u: 32-bit move (constants fold)
+            if (!need(1)) return false;
+            Lazy &e = lz_[top()];
+            if (e.kind == kImm) {
+                e.imm &= 0xFFFFFFFFull;
+                stack_.back() = op == 0xA7 ? I32 : I64;
+                return true;
+            }
+            const unsigned n = isrc(top());
+            w(0x2A0003E0u | n << 16 | ireg(top()));
+            stack_.back() = op == 0xA7 ? I32 : I64;
+            set_slot(top());
+            return true;
+        }
+        case 0xFD: {
+            Reader save = r;
+            const std::uint32_t sub = r.u32();
+            if (lazy_simd(sub)) return !*error_;
+            r = save;
+            break;
+        }
+        default:
+            if (lazy_binary(op)) return !*error_;
+            if (lazy_compare(op)) return !*error_;
+            break;
+        }
+
+        // Generic path: materialise what the slot translation reads, then run it.
+        const int n = slot_reads(op);
+        const std::size_t h0 = stack_.size();
+        if (n < 0) materialize_all();
+        else
+            for (std::size_t k = 0; k < static_cast<std::size_t>(n) && k < h0; ++k) materialize(h0 - 1 - k);
+        const bool ok = instruction_slots(op);
+        const std::size_t lo = n < 0 ? 0 : (h0 >= static_cast<std::size_t>(n) ? h0 - static_cast<std::size_t>(n) : 0);
+        sync_lazy();
+        for (std::size_t d = lo; d < stack_.size(); ++d) set_slot(d);
+        return ok;
+    }
+
+    // The slot-based translation of one instruction: operands in their stack slot registers.
+    bool instruction_slots(std::uint8_t op) {
         Reader &r = rd_;
         if (dead_) {
             switch (op) {
@@ -633,13 +1376,18 @@ private:
             const std::uint32_t l = r.u32();
             if (l >= local_type_.size()) return fail("local index");
             const Type t = local_type_[l];
+            const int lr = local_reg_[l];
             if (op == 0x20) {
                 if (!push(t)) return false;
-                frame_ld(t, reg_of(top()), local_off_[l]);
+                if (lr < 0) frame_ld(t, reg_of(top()), local_off_[l]);
+                else if (is_vec(t)) vmov(vreg(top()), static_cast<unsigned>(lr));
+                else w(0xAA0003E0u | static_cast<unsigned>(lr) << 16 | ireg(top()));  // mov x, xl
                 return true;
             }
             if (!need(1)) return false;
-            frame_st(t, reg_of(top()), local_off_[l]);
+            if (lr < 0) frame_st(t, reg_of(top()), local_off_[l]);
+            else if (is_vec(t)) vmov(static_cast<unsigned>(lr), vreg(top()));
+            else w(0xAA0003E0u | ireg(top()) << 16 | static_cast<unsigned>(lr));  // mov xl, x
             if (op == 0x21) stack_.pop_back();
             return true;
         }
@@ -843,6 +1591,8 @@ private:
     Reader rd_{nullptr, nullptr};
     std::vector<Type> local_type_;
     std::vector<std::uint32_t> local_off_;
+    std::vector<int> local_reg_;            // register of a local, -1 = in the frame
+    std::vector<std::uint32_t> vec_locals_;  // locals held in vector registers
     std::uint32_t locals_size_ = 0, spill_off_ = 0, args_off_ = 0, frame_ = 0;
     std::vector<std::uint32_t> code_;
     std::vector<std::pair<std::size_t, std::array<std::uint32_t, 4>>> pool_refs_;
@@ -889,6 +1639,15 @@ ProgramFn compile_a64(const std::uint8_t *code, std::uint32_t entry) {
         return nullptr;
     }
     std::uint32_t *fn = place(words);
+    // PS2_VU_JIT_DUMP=<dir>: raw ARM64 code of every compiled program (vu1_<entry>_<address>.bin).
+    if (const char *dir = std::getenv("PS2_VU_JIT_DUMP")) {
+        char name[512];
+        std::snprintf(name, sizeof name, "%s/vu1_%04X_%llx.bin", dir, entry, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(fn)));
+        if (std::FILE *f = std::fopen(name, "wb")) {
+            std::fwrite(words.data(), 4, words.size(), f);
+            std::fclose(f);
+        }
+    }
     return reinterpret_cast<ProgramFn>(fn);
 }
 
