@@ -37,7 +37,9 @@ namespace {
 vuops::FlagPipe g_fl;  // the flag pipe the translated programs use (Layout::flags)
 std::uintptr_t g_base = 0;
 bool g_base_ok = false;
-std::uint64_t kParamOffset[2] = {};  // regs(1) and g_vu1_mem relative to g_base (init_base)
+std::uint64_t kParamOffset[2] = {};
+const bool g_regbase = [] { const char *v = std::getenv("PS2_VU_JIT_REGBASE"); return !v || std::strcmp(v, "0") != 0; }();
+const bool g_retarget = [] { const char *v = std::getenv("PS2_VU_JIT_RETARGET"); return !v || std::strcmp(v, "0") != 0; }();  // regs(1) and g_vu1_mem relative to g_base (init_base)
 
 template <typename T>
 T *at(std::uint32_t offset) { return reinterpret_cast<T *>(g_base + offset); }
@@ -109,6 +111,9 @@ std::uint32_t *place(const std::vector<std::uint32_t> &code) {
 enum Type : std::uint8_t { I32, I64, F64, V128 };
 enum Cond : std::uint32_t { EQ = 0, NE = 1, HS = 2, LO = 3, HI = 8, LS = 9, GE = 10, LT = 11, GT = 12, LE = 13 };
 constexpr unsigned SP = 31, ZR = 31, X16 = 16, X17 = 17, BASE = 19;
+// x29 = the VU1 registers (regs(1) = x19 + kParamOffset[0]): the flag/register fields sit ~48 MB above
+// x19, so without it every access to them took mov/movk/add before the load (PS2_VU_JIT_REGBASE=0: off).
+constexpr unsigned REGS = 29;
 constexpr unsigned kIntRegs[] = {9, 10, 11, 12, 13, 14, 15, 2};
 constexpr unsigned kMaxDepth = 8;  // the translator's expressions need <= 7
 // Register locals (Compiler::allocate_locals). v0..v2 are scratch, v16..v23 the operand stack.
@@ -307,6 +312,54 @@ private:
         for (std::uint32_t l : scratch_int_locals_) frame_ld(I64, static_cast<unsigned>(local_reg_[l]), local_off_[l]);
     }
 
+    // Instructions that write all of Rd (bits 0-4) without reading it: an op followed by local.set can
+    // write the local's register directly instead of its stack slot + a mov (PS2_VU_JIT_RETARGET=0: off).
+    static bool writes_rd_only(std::uint32_t i, bool vec) {
+        if (vec) {
+            if ((i & 0x9F200400u) == 0x0E200400u) {  // AdvSIMD three same
+                const std::uint32_t opc = (i >> 11) & 0x1Fu, u = (i >> 29) & 1u, size = (i >> 22) & 3u;
+                if (opc == 0x03 && u && size) return false;              // bsl / bit / bif
+                if (opc == 0x19 || opc == 0x12 || opc == 0x0F) return false;  // fmla/fmls, mla/mls, saba
+                return true;
+            }
+            if ((i & 0x9F3E0C00u) == 0x0E200800u) {  // AdvSIMD two-reg misc: whole-register results only
+                switch ((i >> 12) & 0x1Fu) {
+                case 0x05: case 0x08: case 0x09: case 0x0A: case 0x0B: case 0x0C: case 0x0D: case 0x0E:
+                case 0x0F: case 0x18: case 0x19: case 0x1B: case 0x1C: case 0x1D: case 0x1F: return true;
+                default: return false;
+                }
+            }
+            if ((i & 0xBFE0FC00u) == 0x0E000400u) return true;  // dup (element)
+            if ((i & 0xBFE0FC00u) == 0x0E000C00u) return true;  // dup (general)
+            if ((i & 0xBFE09C00u) == 0x0E000000u) return true;  // tbl
+            if ((i & 0xFF000000u) == 0x9C000000u) return true;  // ldr q, literal
+            if ((i & 0xFFC00000u) == 0x3DC00000u) return true;  // ldr q, [x, #imm]
+            if ((i & 0xFFFFFFE0u) == 0x6F00E400u) return true;  // movi v.2d, #0
+            return false;
+        }
+        if ((i & 0x1F800000u) == 0x11000000u) return true;                                  // add/sub imm
+        if ((i & 0x1F000000u) == 0x0B000000u) return true;                                  // add/sub reg
+        if ((i & 0x1F000000u) == 0x0A000000u) return true;                                  // logical reg
+        if ((i & 0x1F800000u) == 0x12000000u) return true;                                  // logical imm
+        if ((i & 0x1F800000u) == 0x12800000u) return (i & 0x60000000u) != 0x60000000u;     // movn/movz, not movk
+        if ((i & 0x1F800000u) == 0x13000000u) return (i & 0x60000000u) != 0x20000000u;     // sbfm/ubfm, not bfm
+        if ((i & 0x5FE00000u) == 0x1AC00000u) return true;                                  // lslv/lsrv/asrv/rorv/div
+        if ((i & 0x1FE00000u) == 0x1A800000u) return true;                                  // csel family
+        if ((i & 0x1F000000u) == 0x1B000000u) return true;                                  // madd/msub/umulh
+        if ((i & 0x3F400000u) == 0x39400000u) return true;                                  // ldr*, unsigned offset
+        if ((i & 0xBFE0FC00u) == 0x0E003C00u) return true;                                  // umov
+        return false;
+    }
+    // Let the last instruction write `to` instead of `from` (its Rd), when nothing branches in between.
+    bool retarget_last(unsigned from, unsigned to, bool vec) {
+        if (!g_retarget || code_.size() <= barrier_ || code_.empty()) return false;
+        std::uint32_t &i = code_.back();
+        if ((i & 31u) != from || !writes_rd_only(i, vec)) return false;
+        i = (i & ~31u) | to;
+        ++retargeted_;
+        return true;
+    }
+
     bool fail(const char *why) {
         error_ = why;
         return false;
@@ -368,7 +421,7 @@ private:
 
     void prologue() {
         w(0xA9BF7BFDu);  // stp x29, x30, [sp, #-16]!
-        w(0x910003FDu);  // mov x29, sp
+        if (!g_regbase) w(0x910003FDu);  // mov x29, sp (no frame record with the register base)
         w(0xA9BF53F3u);  // stp x19, x20, [sp, #-16]!
         w(0xA9BF5BF5u);  // stp x21, x22, [sp, #-16]!
         w(0xA9BF63F7u);  // stp x23, x24, [sp, #-16]!
@@ -380,6 +433,7 @@ private:
         w(0x6DBF3FEEu);  // stp d14, d15, [sp, #-16]!
         sub_sp(frame_);
         movx(BASE, g_base);
+        if (g_regbase) movx(REGS, g_base + kParamOffset[0]);
         w(0x6F00E400u);  // movi v0.2d, #0
         for (std::uint32_t off = 0; off < locals_size_; off += 16) frame_st(V128, 0, off);
         for (std::uint32_t l = 0; l < local_reg_.size(); ++l) {
@@ -541,6 +595,7 @@ private:
     // ---------- control
     static bool fits(std::int64_t delta, int bits) { return delta >= -(std::int64_t{1} << (bits - 1)) && delta < (std::int64_t{1} << (bits - 1)); }
     void patch_here(const Patch &p) {
+        barrier_ = code_.size();
         const std::int64_t delta = static_cast<std::int64_t>(code_.size()) - static_cast<std::int64_t>(p.at);
         if (!fits(delta, p.kind == kB26 ? 26 : p.kind == kCond19 ? 19 : 30)) range_error_ = true;
         switch (p.kind) {
@@ -925,6 +980,19 @@ private:
         return true;
     }
 
+    // A constant address (offset from x19): x19 + disp when the scaled immediate fits, else x29 (the
+    // VU1 registers) + disp - kParamOffset[0] when that does.
+    void const_base(std::uint64_t disp, std::uint32_t scale, unsigned &basereg, std::uint64_t &d) const {
+        basereg = BASE;
+        d = disp;
+        if (!g_regbase || (disp % scale == 0 && disp / scale < 4096) || disp < kParamOffset[0]) return;
+        const std::uint64_t rel = disp - kParamOffset[0];
+        if ((rel % scale == 0 && rel / scale < 4096) || rel < 4096) {
+            basereg = REGS;
+            d = rel;
+        }
+    }
+
     // Integer memory access with a lazy address / value.
     bool lazy_mem(bool store, unsigned size_log2, bool sign, std::uint32_t off) {
         if (!need(store ? 2 : 1)) return true;
@@ -933,8 +1001,7 @@ private:
         unsigned basereg;
         std::uint64_t disp;
         if (lz_[ad].kind == kImm) {
-            basereg = BASE;
-            disp = (lz_[ad].imm & 0xFFFFFFFFull) + off;
+            const_base((lz_[ad].imm & 0xFFFFFFFFull) + off, scale, basereg, disp);
         } else {
             address(isrc(ad, X16));
             basereg = X16;
@@ -969,8 +1036,7 @@ private:
         unsigned basereg;
         std::uint64_t disp;
         if (lz_[ad].kind == kImm) {
-            basereg = BASE;
-            disp = (lz_[ad].imm & 0xFFFFFFFFull) + off;
+            const_base((lz_[ad].imm & 0xFFFFFFFFull) + off, 16, basereg, disp);
         } else {
             address(isrc(ad, X16));
             basereg = X16;
@@ -1191,7 +1257,12 @@ private:
             const auto reg = static_cast<unsigned>(lr);
             const Lazy e = lz_[top()];
             const bool self = e.kind == kReg && e.reg == reg;
-            if (!self) {
+            bool older_reads = false;
+            for (std::size_t d = 0; d < top(); ++d) older_reads = older_reads || (lz_[d].kind == kReg && lz_[d].reg == reg);
+            if (!self && e.kind == kSlot && !older_reads &&
+                retarget_last(is_vec(t) ? vreg(top()) : ireg(top()), reg, is_vec(t))) {
+                // the value was computed straight into the local's register
+            } else if (!self) {
                 materialize_reg(reg, top());  // older reads of the local keep the old value
                 if (is_vec(t)) vmov(reg, vsrc(top()));
                 else if (e.kind == kImm) {
@@ -1375,6 +1446,7 @@ private:
             if (r.byte() != 0x40) return fail("block with a result");
             Ctrl c{op == 0x02 ? Ctrl::Block : Ctrl::Loop, stack_.size()};
             c.loop_start = code_.size();
+            barrier_ = code_.size();
             ctrl_.push_back(std::move(c));
             return true;
         }
@@ -1421,6 +1493,7 @@ private:
             w(0xD61F0200u);                                     // br x16
             const std::size_t table = code_.size();
             for (std::uint32_t k = 0; k < n; ++k) table_entry(targets[k], table);
+            barrier_ = code_.size();  // table words are data, not instructions
             dead_ = true;
             return true;
         }
@@ -1681,8 +1754,10 @@ private:
     std::vector<Type> stack_;
     std::vector<Ctrl> ctrl_;
     bool dead_ = false;
+    std::size_t barrier_ = 0;     // code index of the last branch target: retarget_last never crosses it
     bool range_error_ = false;
 public:
+    std::size_t retargeted_ = 0;  // local.set movs saved (stats)
     std::size_t max_depth_ = 0;
     std::size_t locals_used_int_ = 0, locals_used_vec_ = 0;
 private:
@@ -1729,8 +1804,8 @@ ProgramFn compile_a64(const std::uint8_t *code, std::uint32_t entry) {
     std::uint32_t *fn = place(words);
     // PS2_VU_JIT_DUMP=<dir>: raw ARM64 code of every compiled program (vu1_<entry>_<address>.bin).
     if (const char *dir = std::getenv("PS2_VU_JIT_DUMP")) {
-        std::fprintf(stderr, "[vu-jit] %04X: %zu words, stack depth %zu, locals used %zu int / %zu vec\n", entry, words.size(),
-                     c.max_depth_, c.locals_used_int_, c.locals_used_vec_);
+        std::fprintf(stderr, "[vu-jit] %04X: %zu words, stack depth %zu, locals used %zu int / %zu vec, %zu movs saved\n", entry, words.size(),
+                     c.max_depth_, c.locals_used_int_, c.locals_used_vec_, c.retargeted_);
         char name[512];
         std::snprintf(name, sizeof name, "%s/vu1_%04X_%llx.bin", dir, entry, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(fn)));
         if (std::FILE *f = std::fopen(name, "wb")) {
