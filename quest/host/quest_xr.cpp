@@ -238,9 +238,9 @@ bool LoadFunction(XrInstance instance, const char *name, Fn &out)
 //   left stick = left analog stick (steering, menu pointer)      right stick = d-pad
 //   left / right stick click = L1 / R1                            Menu button = Start (pause)
 //   both stick clicks together = switch the race view (curved screen <-> VR), once per press
-//   (off while kVrModeAllowed is false; with the online menu it opens / closes the online lobby).
-//   Online builds: Menu held 0.6 s = online lobby (open / close); a short Menu press stays Start,
-//   sent on release.
+//   (nothing while kVrModeAllowed is false).
+//   Online builds: Menu held 0.6 s = online lobby (open / close), the only way to open it
+//   (owner 2026-11-10); a short Menu press stays Start, sent on release.
 // GT4 reads Cross/Square pressure, so the triggers give analog throttle and brake.
 struct ControllerInput
 {
@@ -285,8 +285,8 @@ public:
         if (in.leftStickClick && in.rightStickClick && !m_stickCombo)
         {
             m_stickCombo = true;
-            // GT4 Online: the online menu (owner 2026-11-02). The VR view switch only when VR mode is
-            // allowed again (debug.gt4vr.vrallow); otherwise (Spec II release) the combo does nothing.
+            // The VR view switch, only when VR mode is allowed (debug.gt4vr.vrallow). The online lobby
+            // is on the Menu button (long press) only.
             if (g_vr_allowed.load(std::memory_order_relaxed))
             {
                 if (g_racing.load(std::memory_order_relaxed))
@@ -294,8 +294,6 @@ public:
                 else
                     XR_LOG("VR view: not racing - stays on the curved screen");
             }
-            else if (gt4::panel::available())
-                gt4::panel::toggle();
         }
         else if (!in.leftStickClick && !in.rightStickClick)
         {
@@ -337,8 +335,8 @@ public:
             start = now < m_startUntil;
         }
 
-        // Online menu open: the right stick picks the tab (left/right) and scrolls (up/down), B closes
-        // it, and the game gets a released pad (pause GT4 first if a race is running).
+        // Online menu open: the right stick chooses (up/down), A selects, B or Menu closes it, and the
+        // game gets a released pad (pause GT4 first if a race is running).
         const bool panel_b = in.b && !m_panelB;
         m_panelB = in.b;
         const bool was_a = m_panelA;
