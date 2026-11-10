@@ -38,7 +38,10 @@ vuops::FlagPipe g_fl;  // the flag pipe the translated programs use (Layout::fla
 std::uintptr_t g_base = 0;
 bool g_base_ok = false;
 std::uint64_t kParamOffset[2] = {};
+static_assert(sizeof(vuops::FlagPipe::mh) == 4 && sizeof(vuops::FlagPipe::t) == 4 && offsetof(vuops::FlagPipe, clip_v) + 32 < 16384,
+              "flag_stub: 32-bit fields within ldr w immediates");
 const bool g_regbase = [] { const char *v = std::getenv("PS2_VU_JIT_REGBASE"); return !v || std::strcmp(v, "0") != 0; }();
+const bool g_flagstub = [] { const char *v = std::getenv("PS2_VU_JIT_FLAGSTUB"); return !v || std::strcmp(v, "0") != 0; }();
 const bool g_movi = [] { const char *v = std::getenv("PS2_VU_JIT_MOVI"); return !v || std::strcmp(v, "0") != 0; }();
 const bool g_retarget = [] { const char *v = std::getenv("PS2_VU_JIT_RETARGET"); return !v || std::strcmp(v, "0") != 0; }();  // regs(1) and g_vu1_mem relative to g_base (init_base)
 
@@ -184,6 +187,17 @@ public:
             if (!r.ok) return fail("truncated body");
             const std::uint8_t op = r.byte();
             if (!instruction(op)) return false;
+        }
+        // flag routines called by bl (mac / status / clip)
+        std::size_t stub_at[3] = {0, 0, 0};
+        for (const auto &[at, kind] : stub_calls_) {
+            if (!stub_at[kind]) {
+                stub_at[kind] = code_.size();
+                flag_stub(kind);
+            }
+            const std::int64_t delta = static_cast<std::int64_t>(stub_at[kind]) - static_cast<std::int64_t>(at);
+            if (!fits(delta, 26)) range_error_ = true;
+            code_[at] |= static_cast<std::uint32_t>(delta) & 0x3FFFFFFu;
         }
         // literal pool
         while (code_.size() % 4) code_.push_back(0xD4200000u);  // brk (never reached)
@@ -392,6 +406,39 @@ private:
             }
         }
         return false;
+    }
+
+    // FlagPipe::mac() / status() / clip() (vu_ops.hpp) for x0 = &FlagPipe, result in w0: the newest of the
+    // 8 history entries at least 4 cycles old, else the oldest. Uses x1, x16, x17 only.
+    void flag_stub(std::uint32_t kind) {
+        using vuops::FlagPipe;
+        const bool clip = kind == 2;
+        const std::uint32_t ts = clip ? offsetof(FlagPipe, clip_ts) : offsetof(FlagPipe, mac_ts);
+        const std::uint32_t val = kind == 0 ? offsetof(FlagPipe, mac_v) : kind == 1 ? offsetof(FlagPipe, status_v) : offsetof(FlagPipe, clip_v);
+        const auto ldr_w = [&](unsigned t, unsigned n, std::uint32_t off) { w(0xB9400000u | (off / 4) << 10 | n << 5 | t); };
+        ldr_w(17, 0, offsetof(FlagPipe, t));
+        if (clip) {
+            ldr_w(16, 0, offsetof(FlagPipe, stalls));
+            w(0x0B100231u);  // add w17, w17, w16 (now() = t + stalls)
+        }
+        ldr_w(1, 0, clip ? offsetof(FlagPipe, ch) : offsetof(FlagPipe, mh));
+        std::size_t hits[8];
+        for (std::size_t &h : hits) {
+            w(0x51000421u);  // sub w1, w1, #1
+            w(0x12000830u);  // and w16, w1, #7
+            w(0x8B304810u);  // add x16, x0, w16, uxtw #2
+            ldr_w(16, 16, ts);
+            w(0x11001210u);  // add w16, w16, #4
+            w(0x6B11021Fu);  // cmp w16, w17
+            h = code_.size();
+            w(0x54000000u | LS);  // b.ls found
+        }
+        const std::size_t found = code_.size();  // falls through with w1 = head - 8
+        for (std::size_t h : hits) code_[h] |= static_cast<std::uint32_t>(found - h) << 5;
+        w(0x12000830u);  // and w16, w1, #7
+        w(0x8B304810u);  // add x16, x0, w16, uxtw #2
+        ldr_w(0, 16, val);
+        w(0xD65F03C0u);  // ret
     }
 
     bool fail(const char *why) {
@@ -674,6 +721,18 @@ private:
         if (f >= kImports) return fail("call to a non-import");
         const Import &imp = kImportFns[f];
         if (!need(imp.params)) return false;
+        // mac / status / clip: a native routine at the program's end (flag_stub) that touches only x0, x1,
+        // x16, x17, x30 and NZCV, so neither the locals nor the operand stack need saving around it.
+        if (!tail && g_flagstub && f <= 2) {
+            const unsigned a = ireg(top());
+            w(0x8B204000u | a << 16 | BASE << 5 | 0);  // add x0, x19, wA, uxtw (the FlagPipe)
+            stub_calls_.push_back({code_.size(), f});
+            w(0x94000000u);                           // bl stub (patched in compile())
+            stack_.pop_back();
+            if (!push(I32)) return false;
+            w(0x2A0003E0u | 0 << 16 | ireg(top()));  // mov w, w0
+            return true;
+        }
         const std::size_t base = stack_.size() - imp.params;
         for (std::size_t d = 0; d < base; ++d) frame_st(stack_[d], reg_of(d), spill_off_ + 16u * static_cast<std::uint32_t>(d));
         for (std::size_t k = 0; k < imp.params; ++k) frame_st(I64, ireg(base + k), args_off_ + 8u * static_cast<std::uint32_t>(k));
@@ -1789,7 +1848,8 @@ private:
     std::vector<Type> stack_;
     std::vector<Ctrl> ctrl_;
     bool dead_ = false;
-    std::size_t barrier_ = 0;     // code index of the last branch target: retarget_last never crosses it
+    std::size_t barrier_ = 0;
+    std::vector<std::pair<std::size_t, std::uint32_t>> stub_calls_;  // bl positions + flag_stub kind     // code index of the last branch target: retarget_last never crosses it
     bool range_error_ = false;
 public:
     std::size_t retargeted_ = 0;  // local.set movs saved (stats)
