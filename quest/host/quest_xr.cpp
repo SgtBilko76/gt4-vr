@@ -1096,6 +1096,14 @@ private:
             // (runtimes sampling bottom-up without the FB extension). Live: debug.gt4vr.flipmode.
             const int forced = static_cast<int>(ReadFloatProperty("debug.gt4vr.flipmode", -1.0f));
             const int mode = forced >= 0 && forced <= 2 ? forced : m_runtime_pico ? 0 : m_has_image_layout_ext ? 1 : 2;
+            // VR race view as two quads instead of a projection layer (Pico shows that one black).
+            const int quads_prop = static_cast<int>(ReadFloatProperty("debug.gt4vr.vrquads", -1.0f));
+            const bool vr_quads = quads_prop >= 0 ? quads_prop != 0 : m_runtime_pico;
+            if (vr_quads != m_vr_quads || !m_gs_flip_logged)
+            {
+                m_vr_quads = vr_quads;
+                XR_LOG("VR race view: %s", vr_quads ? "one quad per eye" : "projection layer");
+            }
             if (mode != m_flip_mode || !m_gs_flip_logged)
             {
                 m_flip_mode = mode;
@@ -1645,6 +1653,34 @@ private:
                 // The window is moved down by m_view_shift (off-axis, same shift the camera used).
                 const float ax = std::atan(fov.tanHalfX);
                 const float up = std::atan(fov.tanHalfY - m_view_shift), down = -std::atan(fov.tanHalfY + m_view_shift);
+                if (m_vr_quads)
+                {
+                    // Pico: its compositor showed the projection layer black (owner's tester 2026-11-10)
+                    // while quads/cylinders of the same surface work. Each eye's half as a quad that
+                    // covers exactly that eye's window: at distance D in front of the eye pose, as
+                    // wide as 2 D tanX, as high as 2 D tanY, moved down by D * view shift (off-axis).
+                    constexpr float D = 10.0f;
+                    for (uint32_t eye = 0; eye < 2; ++eye)
+                    {
+                        XrCompositionLayerQuad &quad = quads[eye];
+                        if (m_flip_mode == 1)
+                            quad.next = &image_layout;
+                        quad.space = m_local_space;
+                        quad.eyeVisibility = eye == 0 ? XR_EYE_VISIBILITY_LEFT : XR_EYE_VISIBILITY_RIGHT;
+                        quad.subImage.swapchain = m_screen_swapchain;
+                        quad.subImage.imageRect.offset = {static_cast<int32_t>(eye) * m_eye_w, EyeRowOffset()};
+                        quad.subImage.imageRect.extent = {m_eye_w, m_eye_h};
+                        quad.subImage.imageArrayIndex = 0;
+                        XrPosef pose = shown->eyes[eye];
+                        const XrVector3f ahead = QuatRotate(pose.orientation, {0.0f, -D * m_view_shift, -D});
+                        pose.position = {pose.position.x + ahead.x, pose.position.y + ahead.y, pose.position.z + ahead.z};
+                        quad.pose = pose;
+                        quad.size = {2.0f * D * fov.tanHalfX, 2.0f * D * fov.tanHalfY};
+                        layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&quad);
+                    }
+                }
+                else
+                {
                 for (uint32_t eye = 0; eye < 2; ++eye)
                 {
                     XrCompositionLayerProjectionView &view = proj_views[eye];
@@ -1661,6 +1697,7 @@ private:
                 projection.viewCount = 2;
                 projection.views = proj_views;
                 layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&projection);
+                }
                 if (m_hud_layer_applied)
                 {
                     // The HUD strip as its own screen in front (Wipeout Rewrite VR), alpha-blended.
@@ -2175,7 +2212,7 @@ private:
     bool m_has_perf_settings_ext = false;
     bool m_has_cylinder_ext = false;
     bool m_has_image_layout_ext = false;
-    bool m_gs_flip = false, m_gs_flip_logged = false, m_runtime_pico = false;
+    bool m_gs_flip = false, m_gs_flip_logged = false, m_runtime_pico = false, m_vr_quads = false;
     int m_flip_mode = 1;
     int m_stereo_reproject_arg = 0;
     // Eye picture rows: on top of the surface (the HUD strip below). Read bottom-up (GS flip) the
