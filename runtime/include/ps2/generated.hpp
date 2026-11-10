@@ -39,6 +39,10 @@ void register_units(const UnitInfo *units, std::uint32_t count);
 void register_modules(const ModuleInfo *modules, std::uint32_t count);
 
 void dispatch(Cpu &c, std::uint32_t entry, std::uint32_t depth);
+// EE interpreter (ee_interp.cpp): same contract as a unit function. dispatch() uses it for every
+// address when no translated code is registered, or with PS2_EE_INTERP=1.
+void interpret(Cpu &c, std::uint32_t entry, std::uint32_t depth);
+bool interpreting();
 void call(Cpu &c, std::uint32_t target, std::uint32_t depth);
 void bad_entry(Cpu &c, std::uint32_t unit_base);
 bool preempt(Cpu &c);

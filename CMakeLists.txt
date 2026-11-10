@@ -32,6 +32,8 @@ add_library(ps2runtime STATIC
     runtime/src/gs/pcsx2_bridge.cpp
     runtime/src/memory.cpp
     runtime/src/dispatch.cpp
+    runtime/src/ee_interp.cpp
+    recomp/r5900.cpp
     runtime/src/system.cpp
     runtime/src/kernel.cpp
     runtime/src/hw.cpp

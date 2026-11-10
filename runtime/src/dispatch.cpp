@@ -138,7 +138,18 @@ void register_modules(const ModuleInfo *modules, std::uint32_t count) {
     for (std::uint32_t k = 0; k < count; ++k) g_module_span = std::max(g_module_span, modules[k].size);
 }
 
+// Interpreter mode: no translated main program (a build without the game's generated code), or
+// PS2_EE_INTERP=1 to run a translated build through the interpreter for comparison.
+bool interpreting() {
+    static const bool on = g_units.empty() || [] {
+        const char *e = std::getenv("PS2_EE_INTERP");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
 bool has_code(std::uint32_t pc) {
+    if (interpreting()) return pc < kRamSize || (pc >> 14) == (kScratchpadBase >> 14);
     const UnitInfo *u = unit_for(pc);
     if (u && u->entries[(pc - u->base) >> 2] != 0) return true;
     const Instance *m = instance_for(pc);
@@ -180,6 +191,10 @@ void dispatch(Cpu &c, std::uint32_t, std::uint32_t depth) {
     if (pc & kUnwind) return;
     if (pc == kHandlerReturn || pc == kIdle) return;
     trace_call(c, pc);
+    if (interpreting()) {
+        interpret(c, 0, depth);
+        return;
+    }
     const UnitInfo *u = unit_for(pc);
     const std::uint16_t id = u ? u->entries[(pc - u->base) >> 2] : 0;
     if (!id) {
@@ -227,8 +242,17 @@ void stop(Cpu &c, std::uint32_t pc, const char *what) {
 // Host hooks at guest addresses translated with `eerecomp --probes`: run before the instruction
 // there. Without a hook a probe logs its registers (PS2_PROBE_LOG=1).
 std::vector<std::pair<std::uint32_t, ProbeHook>> g_probe_hooks;
+// The interpreter has no probe calls compiled in: it asks this bitmap (one bit per word of RAM) at
+// every instruction whether a hook sits there.
+std::vector<std::uint64_t> g_probe_bits(kRamSize / 4 / 64);
+
+bool probe_at(std::uint32_t pc) {
+    const std::uint32_t k = (pc & 0x1FFFFFFFu) >> 2;
+    return k < kRamSize / 4 && (g_probe_bits[k >> 6] >> (k & 63)) & 1u;
+}
 
 void set_probe_hook(std::uint32_t pc, ProbeHook hook) {
+    if (const std::uint32_t k = (pc & 0x1FFFFFFFu) >> 2; k < kRamSize / 4) g_probe_bits[k >> 6] |= 1ull << (k & 63);
     for (auto &h : g_probe_hooks)
         if (h.first == pc) {
             h.second = std::move(hook);
