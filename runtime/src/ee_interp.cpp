@@ -87,7 +87,8 @@ bool simple_impl(Cpu &c, const Insn &i) {
     case Movz: if (rd && D(c, rt) == 0) c.r[rd].d[0] = D(c, rs); break;
     case Movn: if (rd && D(c, rt) != 0) c.r[rd].d[0] = D(c, rs); break;
     case Break: breakpoint(c, i.pc); break;
-    case Sync: case Cache: case Pref: break;
+    case Cache: code_may_change(); break;
+    case Sync: case Pref: break;
     case Mfhi: setd(c, rd, c.hi.d[0]); break;
     case Mflo: setd(c, rd, c.lo.d[0]); break;
     case Mfhi1: setd(c, rd, c.hi.d[1]); break;
@@ -387,6 +388,9 @@ const Insn &fetch(std::uint32_t pc) { return fetch_cached(pc); }
 bool simple(Cpu &c, const Insn &i) { return simple_impl(c, i); }
 bool condition(Cpu &c, const Insn &i) { return condition_impl(c, i); }
 
+std::uint32_t g_code_epoch = 1;
+std::uint32_t g_depth = 0;
+
 // One block (ee_core.hpp): the rules here are the JIT's contract, keep both in step.
 std::uint64_t interp_block(Cpu &c) {
     std::uint32_t pc = c.pc;
@@ -496,12 +500,17 @@ namespace ps2 {
 void interpret(Cpu &c, std::uint32_t, std::uint32_t depth) {
     using namespace ee;
     static const bool use_jit = jit_enabled();
+    g_depth = depth;
     for (;;) {
         const std::uint32_t pc = c.pc;
         if ((pc & kUnwind) || pc == kHandlerReturn || pc == kIdle) return;
-        if (probe_at(pc) && probe(c, pc)) [[unlikely]] {
-            c.pc = c.r[31].w[0];
-            return;
+        if (probe_at(pc)) [[unlikely]] {
+            const bool skip = probe(c, pc);
+            g_depth = depth;  // a hook may run guest code
+            if (skip) {
+                c.pc = c.r[31].w[0];
+                return;
+            }
         }
         const std::uint64_t r = use_jit ? jit_block(c) : interp_block(c);
         const std::uint32_t at = static_cast<std::uint32_t>(r >> 32);
@@ -510,21 +519,34 @@ void interpret(Cpu &c, std::uint32_t, std::uint32_t depth) {
         case kJr:
             continue;
         case kBack:
-            if (c.budget < 0 && preempt(c)) {
-                c.pc |= kUnwind;
-                return;
+            if (c.budget < 0) {
+                static std::uint64_t frame = 0;
+                if (frame_count() != frame) {
+                    frame = frame_count();
+                    code_may_change();
+                }
+                if (preempt(c)) {
+                    c.pc |= kUnwind;
+                    return;
+                }
             }
             continue;
         case kCall:
             call(c, c.pc, depth + 1u);
+            g_depth = depth;
             if (c.pc != at) [[unlikely]] return;
             continue;
         case kReturn:
             return;
-        case kSyscall:
+        case kSyscall: {
+            std::uint32_t n = c.r[3].w[0];
+            if (n & 0x80000000u) n = 0u - n;
+            if (n == 0x64 || n == 0x68 || n == 0x06 || n == 0x07) code_may_change();
             syscall(c, at);
+            g_depth = depth;
             if (c.pc != at + 4) return;
             continue;
+        }
         case kEret:
             c.pc = eret(c);
             continue;

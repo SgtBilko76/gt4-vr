@@ -72,6 +72,13 @@ std::vector<Case> cases = {
     {"mfc1", [] { return 0x44000000u | reg() << 16 | (rng() % 32) << 11; }},
     {"mtc1", [] { return 0x44800000u | reg() << 16 | (rng() % 32) << 11; }},
     {"mov.s", [] { return 0x46000006u | (rng() % 32) << 11 | (rng() % 32) << 6; }},
+    R("mult", 0x18), R("multu", 0x19),
+#define F(NAME, FN) {NAME, [] { return 0x46000000u | (rng() % 32) << 16 | (rng() % 32) << 11 | (rng() % 32) << 6 | FN; }}
+    F("add.s", 0x00), F("sub.s", 0x01), F("mul.s", 0x02), F("sqrt.s", 0x04), F("abs.s", 0x05), F("neg.s", 0x07),
+    F("adda.s", 0x18), F("suba.s", 0x19), F("mula.s", 0x1A), F("madd.s", 0x1C), F("msub.s", 0x1D), F("madda.s", 0x1E),
+    F("msuba.s", 0x1F), F("cvt.w.s", 0x24), F("max.s", 0x28), F("min.s", 0x29), F("c.eq.s", 0x32), F("c.lt.s", 0x34),
+    F("c.le.s", 0x36),
+    {"cvt.s.w", [] { return 0x46800020u | (rng() % 32) << 11 | (rng() % 32) << 6; }},
 };
 // memory: base register forced to a RAM address, offsets small
 #define M(NAME, OP) {NAME, [] { return enc_i(OP, 1 + rng() % 31, reg(), imm16() & 0x8FFFu); }}
@@ -93,7 +100,7 @@ std::vector<Case> branch_cases = {
     {"bc1f", [] { return 0x45000008u; }}, {"bc1t", [] { return 0x45010008u; }},
     {"bc1fl", [] { return 0x45020008u; }}, {"bc1tl", [] { return 0x45030008u; }},
     {"j", [] { return 0x08000000u | ((kBase + 0x40) >> 2); }}, {"jal", [] { return 0x0C000000u | ((kBase + 0x40) >> 2); }},
-    {"jr", [] { return enc_r(0, reg(), 0, 0, 0, 0x08); }}, {"jalr", [] { return enc_r(0, reg(), 0, reg(), 0, 0x09); }},
+    {"jr", [] { return enc_r(0, reg(), 0, 0, 0, 0x08); }}, {"jalr", [] { return enc_r(0, 1 + rng() % 31, 0, reg(), 0, 0x09); }},
 };
 
 void randomize(Cpu &c, bool ram_bases) {
@@ -104,6 +111,7 @@ void randomize(Cpu &c, bool ram_bases) {
     }
     c.hi.d[0] = rng64(), c.lo.d[0] = rng64(), c.hi.d[1] = rng64(), c.lo.d[1] = rng64();
     for (auto &f : c.f) f = static_cast<std::uint32_t>(rng());
+    c.facc = static_cast<std::uint32_t>(rng());
     c.fcr31 = static_cast<std::uint32_t>(rng()) & (1u << 23);
     c.budget = 1000;
     c.pc = kBase;
@@ -117,6 +125,7 @@ bool same(const Cpu &a, const Cpu &b, std::string &why) {
     if (std::memcmp(&a.hi, &b.hi, 16) || std::memcmp(&a.lo, &b.lo, 16)) { why = "hi/lo"; return false; }
     if (std::memcmp(a.f, b.f, sizeof a.f)) { why = "f"; return false; }
     if (a.pc != b.pc) { why = "pc"; return false; }
+    if (a.facc != b.facc || a.fcr31 != b.fcr31) { why = "facc/fcr31"; return false; }
     if (a.budget != b.budget) { why = "budget"; return false; }
     return true;
 }
@@ -134,14 +143,25 @@ void run(const std::vector<Case> &list, bool ram_bases, bool as_branch, int iter
             std::memcpy(g_ram + kBase + 4, &second, 4);
             const std::uint32_t jr = 0x03E00008u;  // jr ra (ends a non-branch block: kMaxBlock is far away)
             std::memcpy(g_ram + kBase + 8, &jr, 4);
+            // callees (branch target +0x24, jal target +0x40) return at once
+            std::memcpy(g_ram + kBase + 0x24, &jr, 4);
+            std::memcpy(g_ram + kBase + 0x40, &jr, 4);
             Cpu ci;
             randomize(ci, ram_bases);
+            if ((word >> 26) == 0 && (word & 0x3F) == 0x09) ci.r[(word >> 21) & 31].d[0] = kBase + 0x40;  // jalr
             Cpu cj = ci;
             std::memcpy(before.data(), g_ram + kData, before.size());
             ee::jit_flush();
-            const std::uint64_t ri = ee::interp_block(ci);
+            std::uint64_t ri = ee::interp_block(ci);
+            // the interpreter leaves calls to the frame loop, translated code makes them in place
+            if ((ri & 0xFF) == ee::kCall) {
+                const std::uint32_t ret = static_cast<std::uint32_t>(ri >> 32);
+                call(ci, ci.pc, 1);
+                ri = ci.pc == ret ? ee::pack(ee::kNext) : ee::pack(ee::kReturn);
+            }
             std::memcpy(after_i.data(), g_ram + kData, after_i.size());
             std::memcpy(g_ram + kData, before.data(), before.size());
+            ee::g_depth = 0;
             const std::uint64_t rj = ee::jit_block(cj);
             std::string why;
             const bool mem_ok = std::memcmp(after_i.data(), g_ram + kData, after_i.size()) == 0;

@@ -46,6 +46,30 @@ void ee_h_st128(std::uint32_t a, const Reg128 *v) { st128(a, *v); }
 std::uint64_t ee_h_simple(Cpu *c, const Insn *i) { return simple(*c, *i) ? 1u : 0u; }
 std::uint64_t ee_h_cond(Cpu *c, const Insn *i) { return condition(*c, *i) ? 1u : 0u; }
 void ee_h_stop(Cpu *c, std::uint32_t pc, const char *what) { stop(*c, pc, what); }
+void ee_h_cache() { code_may_change(); }
+// A call from translated code, nested like generated code's. 1 = it returned to `ret`.
+std::uint64_t ee_h_call(Cpu *c, std::uint32_t target, std::uint32_t ret) {
+    const std::uint32_t d = g_depth;
+    c->pc = target;
+    call(*c, target, d + 1u);
+    g_depth = d;
+    return c->pc == ret ? 1u : 0u;
+}
+std::uint32_t ee_fp_add(std::uint32_t a, std::uint32_t b) { return fp::add(a, b); }
+std::uint32_t ee_fp_sub(std::uint32_t a, std::uint32_t b) { return fp::sub(a, b); }
+std::uint32_t ee_fp_mul(std::uint32_t a, std::uint32_t b) { return fp::fpu_mul(a, b); }
+std::uint32_t ee_fp_madd(std::uint32_t acc, std::uint32_t a, std::uint32_t b) { return fp::add(acc, fp::fpu_mul(a, b)); }
+std::uint32_t ee_fp_msub(std::uint32_t acc, std::uint32_t a, std::uint32_t b) { return fp::sub(acc, fp::fpu_mul(a, b)); }
+std::uint32_t ee_fp_max(std::uint32_t a, std::uint32_t b) { return fp::max(a, b); }
+std::uint32_t ee_fp_min(std::uint32_t a, std::uint32_t b) { return fp::min(a, b); }
+std::uint32_t ee_fp_cvtws(std::uint32_t a) { return fp::cvt_w_s(a); }
+std::uint32_t ee_fp_cvtsw(std::uint32_t a) { return fp::cvt_s_w(a); }
+std::uint32_t ee_fp_sqrt(std::uint32_t a) { return fp::sqrt(a); }
+// c.cond.s: 0 eq, 1 lt, 2 le
+void ee_fp_cmp(Cpu *c, std::uint32_t a, std::uint32_t b, std::uint32_t mode) {
+    const std::int32_t x = fp::key(a), y = fp::key(b);
+    fpu_compare(*c, mode == 0 ? x == y : mode == 1 ? x < y : x <= y);
+}
 }
 
 constexpr std::uint32_t kOffR = offsetof(Cpu, r);
@@ -55,6 +79,8 @@ constexpr std::uint32_t kOffPc = offsetof(Cpu, pc);
 constexpr std::uint32_t kOffBudget = offsetof(Cpu, budget);
 constexpr std::uint32_t kOffF = offsetof(Cpu, f);
 constexpr std::uint32_t kOffFcr31 = offsetof(Cpu, fcr31);
+constexpr std::uint32_t kOffFacc = offsetof(Cpu, facc);
+constexpr std::uint32_t fr(unsigned r) { return kOffF + r * 4u; }
 constexpr std::uint32_t gr(unsigned r) { return kOffR + r * 16u; }
 
 enum Cond : std::uint32_t { EQ = 0, NE = 1, HS = 2, LO = 3, GE = 10, LT = 11, GT = 12, LE = 13 };
@@ -134,6 +160,13 @@ public:
     void and_w_not15(unsigned d, unsigned n) { w(0x121C6C00u | n << 5 | d); }  // and wd, wn, #0xFFFFFFF0 (28 ones, ror 28)
     void eor_w1(unsigned d, unsigned n) { w(0x52000000u | n << 5 | d); }        // eor wd, wn, #1
     void cmp_x(unsigned n, unsigned m) { w(0xEB00001Fu | m << 16 | n << 5); }
+    void cmp_w(unsigned n, unsigned m) { w(0x6B00001Fu | m << 16 | n << 5); }
+    std::uint32_t *bcond(Cond c) { w(0x54000000u | c); return p_ - 1; }
+    void br(unsigned n) { w(0xD61F0000u | n << 5); }
+    void smull(unsigned d, unsigned n, unsigned m) { w(0x9B207C00u | m << 16 | n << 5 | d); }
+    void umull(unsigned d, unsigned n, unsigned m) { w(0x9BA07C00u | m << 16 | n << 5 | d); }
+    void and_w_abs(unsigned d, unsigned n) { w(0x12007800u | n << 5 | d); }   // and wd, wn, #0x7FFFFFFF
+    void eor_w_sign(unsigned d, unsigned n) { w(0x52010000u | n << 5 | d); }  // eor wd, wn, #0x80000000
     void cset_w(unsigned d, Cond c) { w(0x1A9F07E0u | (c ^ 1u) << 12 | d); }
     void csel_x(unsigned d, unsigned n, unsigned m, Cond c) { w(0x9A800000u | m << 16 | c << 12 | n << 5 | d); }
     // memory with a 32-bit guest address zero-extended: [x20, wm, uxtw]
@@ -142,6 +175,7 @@ public:
     void blr(unsigned n) { w(0xD63F0000u | n << 5); }
     void ret() { w(0xD65F03C0u); }
     std::uint32_t *cbz_w(unsigned t) { w(0x34000000u | t); return p_ - 1; }
+    std::uint32_t *cbz_x(unsigned t) { w(0xB4000000u | t); return p_ - 1; }
     std::uint32_t *cbnz_w(unsigned t) { w(0x35000000u | t); return p_ - 1; }
     std::uint32_t *b() { w(0x14000000u); return p_ - 1; }
     void patch19(std::uint32_t *at) { *at |= (static_cast<std::uint32_t>(p_ - at) & 0x7FFFFu) << 5; }
@@ -160,11 +194,19 @@ constexpr std::uint32_t LDRB = 0x38604800u, LDRH = 0x78604800u, LDRW = 0xB860480
 constexpr std::uint32_t STRB = 0x38204800u, STRH = 0x78204800u, STRW = 0xB8204800u, STRX = 0xF8204800u;
 
 struct Block {
-    std::uint32_t pc = 0, words = 0;
+    // read by chained jumps from generated code: keep these three first
+    std::uint32_t pc = 0;
+    std::uint32_t checked = 0;   // code epoch the guest words were last proven in
+    const void *body = nullptr;  // entry after the prologue (chained jumps)
+    std::uint32_t words = 0;
     std::uint64_t (*fn)(Cpu *) = nullptr;
     std::unique_ptr<std::uint32_t[]> code;    // guest words, checked on entry (self-modifying code)
     std::unique_ptr<Insn[]> insns;           // decoded instructions the helpers get pointers to
 };
+
+// block table, direct mapped by pc (8 MB of code without conflicts); chained jumps read it too
+constexpr std::uint32_t kTable = 1u << 21;
+Block *g_table[kTable];
 
 class Compiler {
 public:
@@ -177,17 +219,65 @@ public:
         a_.stp_x(21, 22, 31, 32);
         a_.mov_x(C, 0);
         a_.imm64(RAM, reinterpret_cast<std::uint64_t>(g_ram));
+        b_.body = a_.here();
     }
 
-    // Leaves with c.pc = pc (or w21 when from_t) and returns the packed exit.
+    // Leaves with c.pc = pc (or w21 when from_t) and returns the packed exit. A next/back exit to a
+    // constant target first tries to continue straight in the target's translated block.
     void leave(std::uint64_t exit, std::uint32_t pc, bool from_t = false) {
         if (from_t) a_.str_w(T, C, kOffPc);
         else {
             a_.imm32(0, pc);
             a_.str_w(0, C, kOffPc);
+            const Exit e = static_cast<Exit>(exit & 0xFFu);
+            if (e == kNext || e == kBack) chain(e, pc);
         }
         a_.imm64(0, exit);
         epilogue();
+    }
+    // w0 = target. Jumps to the target block's body when it is in the table, for this pc, proven in
+    // the current code epoch, and (back jumps) the budget is not used up; else falls through.
+    void chain(Exit e, std::uint32_t target) {
+        if (target >= kRamSize - 4u * (kMaxBlock + 2) || (target & 3u) || probe_at(target)) return;
+        std::uint32_t *outs[4];
+        int n = 0;
+        if (e == kBack) {
+            a_.ldr_w(1, C, kOffBudget);
+            a_.cmp_w(1, ZR);
+            outs[n++] = a_.bcond(LT);
+        }
+        a_.imm64(1, reinterpret_cast<std::uint64_t>(&g_table[(target >> 2) & (kTable - 1)]));
+        a_.ldr_x(1, 1, 0);
+        outs[n++] = a_.cbz_x(1);
+        a_.ldr_w(2, 1, offsetof(Block, pc));
+        a_.cmp_w(2, 0);
+        outs[n++] = a_.bcond(NE);
+        a_.ldr_w(2, 1, offsetof(Block, checked));
+        a_.imm64(3, reinterpret_cast<std::uint64_t>(&g_code_epoch));
+        a_.ldr_w(3, 3, 0);
+        a_.cmp_w(2, 3);
+        outs[n++] = a_.bcond(NE);
+        a_.ldr_x(2, 1, offsetof(Block, body));
+        a_.br(2);
+        for (int k = 0; k < n; ++k) a_.patch19(outs[k]);
+    }
+    void fp2(std::uint32_t dst_off, unsigned fs, unsigned ft, const void *fn) {
+        a_.ldr_w(0, C, fr(fs));
+        a_.ldr_w(1, C, fr(ft));
+        a_.call(fn);
+        a_.str_w(0, C, dst_off);
+    }
+    void fp3(std::uint32_t dst_off, unsigned fs, unsigned ft, const void *fn) {
+        a_.ldr_w(0, C, kOffFacc);
+        a_.ldr_w(1, C, fr(fs));
+        a_.ldr_w(2, C, fr(ft));
+        a_.call(fn);
+        a_.str_w(0, C, dst_off);
+    }
+    void fp1(std::uint32_t dst_off, unsigned src, const void *fn) {
+        a_.ldr_w(0, C, fr(src));
+        a_.call(fn);
+        a_.str_w(0, C, dst_off);
     }
     void leave_keep_pc(std::uint64_t exit) {
         a_.imm64(0, exit);
@@ -461,7 +551,45 @@ public:
         case Mfc1: if (rt) { a_.ldr_w(0, C, kOffF + i.fs() * 4u); put32(rt, 0); } return;
         case Mtc1: a_.str_w(src(rt, 0), C, kOffF + i.fs() * 4u); return;
         case MovS: a_.ldr_w(0, C, kOffF + i.fs() * 4u); a_.str_w(0, C, kOffF + i.fd() * 4u); return;
-        case Sync: case Cache: case Pref: return;
+        case Mult: case Multu: {
+            const unsigned s = src(rs, 0), t = src(rt, 1);
+            if (i.op == Mult) a_.smull(2, s, t);
+            else a_.umull(2, s, t);
+            a_.sxtw(3, 2);
+            a_.sbfm_x(4, 2, 32, 63);
+            a_.str_x(3, C, kOffLo);
+            a_.str_x(4, C, kOffHi);
+            put(rd, 3);
+            return;
+        }
+#define FPF(name) reinterpret_cast<const void *>(&name)
+        case AddS: fp2(fr(i.fd()), i.fs(), i.ft(), FPF(ee_fp_add)); return;
+        case SubS: fp2(fr(i.fd()), i.fs(), i.ft(), FPF(ee_fp_sub)); return;
+        case MulS: fp2(fr(i.fd()), i.fs(), i.ft(), FPF(ee_fp_mul)); return;
+        case MaxS: fp2(fr(i.fd()), i.fs(), i.ft(), FPF(ee_fp_max)); return;
+        case MinS: fp2(fr(i.fd()), i.fs(), i.ft(), FPF(ee_fp_min)); return;
+        case AddaS: fp2(kOffFacc, i.fs(), i.ft(), FPF(ee_fp_add)); return;
+        case SubaS: fp2(kOffFacc, i.fs(), i.ft(), FPF(ee_fp_sub)); return;
+        case MulaS: fp2(kOffFacc, i.fs(), i.ft(), FPF(ee_fp_mul)); return;
+        case MaddS: fp3(fr(i.fd()), i.fs(), i.ft(), FPF(ee_fp_madd)); return;
+        case MsubS: fp3(fr(i.fd()), i.fs(), i.ft(), FPF(ee_fp_msub)); return;
+        case MaddaS: fp3(kOffFacc, i.fs(), i.ft(), FPF(ee_fp_madd)); return;
+        case MsubaS: fp3(kOffFacc, i.fs(), i.ft(), FPF(ee_fp_msub)); return;
+        case CvtWS: fp1(fr(i.fd()), i.fs(), FPF(ee_fp_cvtws)); return;
+        case CvtSW: fp1(fr(i.fd()), i.fs(), FPF(ee_fp_cvtsw)); return;
+        case SqrtS: fp1(fr(i.fd()), i.ft(), FPF(ee_fp_sqrt)); return;
+        case AbsS: a_.ldr_w(0, C, fr(i.fs())); a_.and_w_abs(0, 0); a_.str_w(0, C, fr(i.fd())); return;
+        case NegS: a_.ldr_w(0, C, fr(i.fs())); a_.eor_w_sign(0, 0); a_.str_w(0, C, fr(i.fd())); return;
+        case CEq: case CLt: case CLe:
+            a_.mov_x(0, C);
+            a_.ldr_w(1, C, fr(i.fs()));
+            a_.ldr_w(2, C, fr(i.ft()));
+            a_.imm32(3, i.op == CEq ? 0 : i.op == CLt ? 1 : 2);
+            a_.call(FPF(ee_fp_cmp));
+            return;
+        case Cache: a_.call(FPF(ee_h_cache)); return;
+#undef FPF
+        case Sync: case Pref: return;
         default:
             a_.mov_x(0, C);
             a_.imm64(1, reinterpret_cast<std::uint64_t>(stored));
@@ -496,6 +624,19 @@ public:
         }
     }
 
+    // Calls the function at `target` (or w21) in place; continues at ret when it returned there,
+    // else leaves this frame like generated code's `if (c.pc != ret) return;`.
+    void call_in_place(std::uint32_t target, std::uint32_t ret, bool from_t = false) {
+        a_.mov_x(0, C);
+        if (from_t) a_.mov_x(1, T);
+        else a_.imm32(1, target);
+        a_.imm32(2, ret);
+        a_.call(reinterpret_cast<const void *>(&ee_h_call));
+        std::uint32_t *ok = a_.cbnz_w(0);
+        leave_keep_pc(pack(kReturn));
+        a_.patch19(ok);
+        leave(pack(kNext), ret);
+    }
     void link(std::uint32_t reg, std::uint32_t ret) {
         a_.imm64(0, static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(ret))));
         a_.str_x(0, C, gr(reg));
@@ -578,14 +719,14 @@ public:
         case Jal:
             link(31, ret);
             op(ds, sds);
-            leave(pack(kCall, ret), t);
+            call_in_place(t, ret);
             return;
         case Bltzal: case Bgezal: {
             cond(i, si);
             link(31, ret);
             op(ds, sds);
             std::uint32_t *no = a_.cbz_w(T);
-            leave(pack(kCall, ret), t);
+            call_in_place(t, ret);
             a_.patch19(no);
             leave(pack(kNext), ret);
             return;
@@ -595,7 +736,7 @@ public:
             link(31, ret);
             std::uint32_t *no = a_.cbz_w(T);
             op(ds, sds);
-            leave(pack(kCall, ret), t);
+            call_in_place(t, ret);
             a_.patch19(no);
             leave(pack(kNext), ret);
             return;
@@ -605,7 +746,7 @@ public:
             if (!i.rs()) a_.imm32(T, 0);
             if (i.rd()) link(i.rd(), ret);
             op(ds, sds);
-            leave(pack(kCall, ret), 0, true);
+            call_in_place(0, ret, true);
             return;
         case Jr:
             a_.ldr_w(T, C, gr(i.rs()));
@@ -642,9 +783,7 @@ private:
     Block &b_;
 };
 
-// ---- block cache: direct mapped by pc, backed by a map so conflicting blocks aren't recompiled
-constexpr std::uint32_t kTable = 1u << 16;
-Block *g_table[kTable];
+// ---- block cache: g_table (above), backed by a map so conflicting blocks aren't recompiled
 std::unordered_map<std::uint32_t, std::unique_ptr<Block>> g_blocks;
 std::deque<std::unique_ptr<Block>> g_retired;  // replaced blocks may still be on the stack
 std::uint64_t g_compiled = 0;
@@ -695,10 +834,14 @@ std::uint64_t jit_block(Cpu &c) {
     if (pc >= kRamSize - 4u * (kMaxBlock + 2) || (pc & 3u)) return interp_block(c);
     Block *&slot = g_table[(pc >> 2) & (kTable - 1)];
     Block *b = slot;
-    if (!b || b->pc != pc || !current(b)) [[unlikely]] {
-        const auto it = g_blocks.find(pc);
-        b = it != g_blocks.end() && current(it->second.get()) ? it->second.get() : compile(pc);
+    if (!b || b->pc != pc || b->checked != g_code_epoch) [[unlikely]] {
+        if (!b || b->pc != pc) {
+            const auto it = g_blocks.find(pc);
+            b = it != g_blocks.end() ? it->second.get() : nullptr;
+        }
+        if (!b || !current(b)) b = compile(pc);
         if (!b) return interp_block(c);
+        b->checked = g_code_epoch;
         slot = b;
     }
     return b->fn(&c);

@@ -42,6 +42,17 @@ bool simple(Cpu &c, const recomp::Insn &i);   // one non-control instruction; fa
 bool condition(Cpu &c, const recomp::Insn &i); // branch condition
 std::uint64_t interp_block(Cpu &c);
 
+// Code epoch: a translated block checks its guest words once per epoch. The epoch moves wherever
+// game code can have changed, as on the real EE with its instruction cache: syscalls (FlushCache,
+// FlushCache / iFlushCache / ExecPS2 syscalls (a game must flush after writing or loading code),
+// the CACHE instruction, and every new frame.
+extern std::uint32_t g_code_epoch;
+inline void code_may_change() { ++g_code_epoch; }
+
+// Guest call depth of the innermost running interpret() frame: a translated block calls a function
+// itself (ee_h_call -> ps2::call) and needs the depth the generated code would pass.
+extern std::uint32_t g_depth;
+
 // JIT (ARM64 only). jit_enabled(): built for ARM64 and PS2_EE_JIT is not 0.
 bool jit_enabled();
 std::uint64_t jit_block(Cpu &c);
