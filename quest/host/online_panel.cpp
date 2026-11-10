@@ -423,7 +423,7 @@ void draw_lobby(Canvas &cv, const Data &d) {
                {"Who", 760, 220, 0}, {"Ping", 990, 110, 1}, {"Status", 1110, 130, 1}},
           rows, mine, g_scroll, "", g_sel, kRacesTop, kGreen);
     if (rr.size() == 1) cv.text("No open races right now", 40, kRacesTop + kRowH + 60, 28, kDim, kWidth - 80, 2);
-    draw_footer(cv, "Right stick  up/down: choose     A: select");
+    draw_footer(cv, "Stick  up/down: choose     A: select");
 }
 
 void draw_settings(Canvas &cv) {
@@ -471,7 +471,7 @@ void draw_settings(Canvas &cv) {
         y += 58;
     }
     cv.text(rows[g_set_sel].hint, 40, y + 30, 22, kDim, kWidth - 80);
-    draw_footer(cv, "Right stick  up/down: choose     left/right: change     A: select");
+    draw_footer(cv, "Stick  up/down: choose     left/right: change     A: select");
 }
 
 void draw(std::vector<std::uint8_t> &px, const Data &d, const Context &ctx) {

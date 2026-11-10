@@ -287,6 +287,9 @@ public:
         };
         const bool up = stickDir(m_rs[0], in.rightY, 1.0f), down = stickDir(m_rs[1], in.rightY, -1.0f);
         const bool left = stickDir(m_rs[2], in.rightX, -1.0f), right = stickDir(m_rs[3], in.rightX, 1.0f);
+        // The VR menu also takes the left (steering) stick; the game's D-pad stays on the right stick.
+        const bool m_up = stickDir(m_ls[0], in.leftY, 1.0f) || up, m_down = stickDir(m_ls[1], in.leftY, -1.0f) || down;
+        const bool m_left = stickDir(m_ls[2], in.leftX, -1.0f) || left, m_right = stickDir(m_ls[3], in.leftX, 1.0f) || right;
 
         if (in.leftStickClick && in.rightStickClick && !m_stickCombo)
         {
@@ -342,7 +345,7 @@ public:
             start = now < m_startUntil;
         }
 
-        // VR menu open: the right stick chooses (up/down) and changes settings (left/right), A selects,
+        // VR menu open: either stick chooses (up/down) and changes settings (left/right), A selects,
         // the grips switch Lobby / Settings, B or Menu closes it, and the game gets a released pad
         // (pause GT4 first if a race is running).
         const bool panel_b = in.b && !m_panelB;
@@ -351,8 +354,8 @@ public:
         m_panelA = in.a;
         if (gt4::panel::isOpen())
         {
-            const int dx = (right && !m_panelDir[3]) - (left && !m_panelDir[2]);
-            const int dy = (down && !m_panelDir[1]) - (up && !m_panelDir[0]);
+            const int dx = (m_right && !m_panelDir[3]) - (m_left && !m_panelDir[2]);
+            const int dy = (m_down && !m_panelDir[1]) - (m_up && !m_panelDir[0]);
             if (dx || dy)
                 gt4::panel::input(dx, dy);
             const int page = (grip_r && !m_panelGrip[1]) - (grip_l && !m_panelGrip[0]);
@@ -363,7 +366,7 @@ public:
                 gt4::panel::setOpen(false);
             if (in.a && !was_a)
                 gt4::panel::select();
-            m_panelDir[0] = up, m_panelDir[1] = down, m_panelDir[2] = left, m_panelDir[3] = right;
+            m_panelDir[0] = m_up, m_panelDir[1] = m_down, m_panelDir[2] = m_left, m_panelDir[3] = m_right;
             m_panelHeld = true;
             gt4::quest::Pad idle;
             idle.connected = true;
@@ -373,7 +376,7 @@ public:
         // press doesn't reach the game.
         if (m_panelHeld)
         {
-            if (in.a || in.b || up || down || left || right || lg || rg)
+            if (in.a || in.b || m_up || m_down || m_left || m_right || lg || rg)
             {
                 gt4::quest::Pad idle;
                 idle.connected = true;
@@ -416,6 +419,7 @@ private:
     bool m_rt = false, m_lt = false, m_lg = false, m_rg = false;
     bool m_stickCombo = false;
     bool m_rs[4] = {};
+    bool m_ls[4] = {};  // left stick directions (VR menu only)
     bool m_panelA = false, m_panelB = false, m_panelHeld = false;
     bool m_panelDir[4] = {};
     bool m_panelGrip[2] = {};
