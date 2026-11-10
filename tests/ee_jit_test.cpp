@@ -3,6 +3,7 @@
 // against the interpreter (ee::interp_block). Prints the first mismatches per opcode.
 //   build: see quest/tools or the ee-interpreter notes; run: qemu-aarch64 ee_jit_test [iterations]
 #include "../runtime/src/ee_core.hpp"
+#include "../recomp/r5900.hpp"
 #include "ps2/memory.hpp"
 
 #include <cstdio>
@@ -44,6 +45,7 @@ std::uint64_t value() {
 struct Case {
     const char *name;
     std::uint32_t (*make)();
+    std::uint32_t (*make2)(std::uint32_t first) = nullptr;  // pairs: the second instruction
 };
 
 constexpr std::uint32_t kBase = 0x00200000u;  // test code
@@ -79,6 +81,23 @@ std::vector<Case> cases = {
     F("msuba.s", 0x1F), F("cvt.w.s", 0x24), F("max.s", 0x28), F("min.s", 0x29), F("c.eq.s", 0x32), F("c.lt.s", 0x34),
     F("c.le.s", 0x36),
     {"cvt.s.w", [] { return 0x46800020u | (rng() % 32) << 11 | (rng() % 32) << 6; }},
+    // MMI: pcpyld / pextlw / pextlh
+    {"pcpyld", [] { return 0x70000389u | reg() << 21 | reg() << 16 | reg() << 11; }},
+    {"pextlw", [] { return 0x70000488u | reg() << 21 | reg() << 16 | reg() << 11; }},
+    {"pextlh", [] { return 0x70000588u | reg() << 21 | reg() << 16 | reg() << 11; }},
+    // COP2 moves (no interlock bit) and VU0 macro ops
+    {"qmfc2", [] { return 0x48200000u | reg() << 16 | (rng() % 32) << 11; }},
+    {"qmtc2", [] { return 0x48A00000u | reg() << 16 | (rng() % 32) << 11; }},
+    {"cfc2", [] { return 0x48400000u | reg() << 16 | (rng() % 16) << 11; }},
+    {"ctc2", [] { return 0x48C00000u | reg() << 16 | (rng() % 16) << 11; }},
+#define VS2(NAME, OP) {NAME, [] { return 0x4A000000u | (rng() % 16) << 21 | (rng() % 32) << 16 | (rng() % 32) << 11 | ((OP) >> 2) << 6 | 0x3Cu | ((OP) & 3u); }}
+#define VBC(NAME, BASE) {NAME, [] { return 0x4A000000u | (rng() % 16) << 21 | (rng() % 32) << 16 | (rng() % 32) << 11 | (rng() % 32) << 6 | ((BASE) + rng() % 4); }}
+#define V3(NAME, FN) {NAME, [] { return 0x4A000000u | (rng() % 16) << 21 | (rng() % 32) << 16 | (rng() % 32) << 11 | (rng() % 32) << 6 | (FN); }}
+    {"vmaddabc", [] { return 0x4A000000u | (rng() % 16) << 21 | (rng() % 32) << 16 | (rng() % 32) << 11 | 2u << 6 | 0x3Cu | rng() % 4; }},
+    {"vmulabc", [] { return 0x4A000000u | (rng() % 16) << 21 | (rng() % 32) << 16 | (rng() % 32) << 11 | 6u << 6 | 0x3Cu | rng() % 4; }},
+    VS2("vclip", 0x1F), VS2("vmula", 0x2A), VS2("vmadda", 0x29), VS2("vnop", 0x2F), VS2("vmove", 0x30),
+    VBC("vaddbc", 0x00), VBC("vsubbc", 0x04), VBC("vmaddbc", 0x08), VBC("vmulbc", 0x18),
+    V3("vadd", 0x28), V3("vmadd", 0x29), V3("vmul", 0x2A), V3("vsub", 0x2C),
 };
 // memory: base register forced to a RAM address, offsets small
 #define M(NAME, OP) {NAME, [] { return enc_i(OP, 1 + rng() % 31, reg(), imm16() & 0x8FFFu); }}
@@ -87,6 +106,29 @@ std::vector<Case> mem_cases = {
     M("sb", 0x28), M("sh", 0x29), M("sw", 0x2B), M("sd", 0x3F), M("lq", 0x1E), M("sq", 0x1F),
     {"lwc1", [] { return enc_i(0x31, 1 + rng() % 31, rng() % 32, imm16() & 0x8FFFu); }},
     {"swc1", [] { return enc_i(0x39, 1 + rng() % 31, rng() % 32, imm16() & 0x8FFFu); }},
+    {"lqc2", [] { return enc_i(0x36, 1 + rng() % 31, rng() % 32, imm16() & 0x8FFFu); }},
+    {"sqc2", [] { return enc_i(0x3E, 1 + rng() % 31, rng() % 32, imm16() & 0x8FFFu); }},
+    M("ldl", 0x1A), M("ldr", 0x1B), M("lwl", 0x22), M("lwr", 0x26), M("sdl", 0x2C), M("sdr", 0x2D), M("swl", 0x2A), M("swr", 0x2E),
+};
+// unaligned pairs (fused): first [hi: k+width-1 / lo: k], second the partner, same base and target
+std::uint32_t pair_first(unsigned op_first) {
+    const unsigned rs = 1 + rng() % 31;
+    unsigned rt = reg();
+    if (rt == rs) rt = rs % 31 + 1;
+    return enc_i(op_first, rs, rt, imm16() & 0x0FFFu);
+}
+std::uint32_t pair_second(std::uint32_t first, unsigned op_second, int delta) {
+    return (first & 0x03FF0000u) | op_second << 26 | ((first + static_cast<std::uint32_t>(delta)) & 0xFFFFu);
+}
+std::vector<Case> pair_cases = {
+    {"ldl+ldr", [] { return pair_first(0x1A); }, [](std::uint32_t f) { return pair_second(f, 0x1B, -7); }},
+    {"ldr+ldl", [] { return pair_first(0x1B); }, [](std::uint32_t f) { return pair_second(f, 0x1A, 7); }},
+    {"lwl+lwr", [] { return pair_first(0x22); }, [](std::uint32_t f) { return pair_second(f, 0x26, -3); }},
+    {"lwr+lwl", [] { return pair_first(0x26); }, [](std::uint32_t f) { return pair_second(f, 0x22, 3); }},
+    {"sdl+sdr", [] { return pair_first(0x2C); }, [](std::uint32_t f) { return pair_second(f, 0x2D, -7); }},
+    {"sdr+sdl", [] { return pair_first(0x2D); }, [](std::uint32_t f) { return pair_second(f, 0x2C, 7); }},
+    {"swl+swr", [] { return pair_first(0x2A); }, [](std::uint32_t f) { return pair_second(f, 0x2E, -3); }},
+    {"swr+swl", [] { return pair_first(0x2E); }, [](std::uint32_t f) { return pair_second(f, 0x2A, 3); }},
 };
 // branches: target forward inside the test page
 std::vector<Case> branch_cases = {
@@ -115,6 +157,18 @@ void randomize(Cpu &c, bool ram_bases) {
     c.fcr31 = static_cast<std::uint32_t>(rng()) & (1u << 23);
     c.budget = 1000;
     c.pc = kBase;
+    // VU0: values near 1.0 and random bits, flags
+    for (auto &r : c.vu0.vf)
+        for (auto &x : r.w) x = rng() % 3 ? (0x3F000000u + (rng() & 0x01FFFFFFu)) ^ (rng() % 2 ? 0x80000000u : 0u) : static_cast<std::uint32_t>(rng());
+    c.vu0.vf[0].w[0] = c.vu0.vf[0].w[1] = c.vu0.vf[0].w[2] = 0;
+    c.vu0.vf[0].w[3] = 0x3F800000u;
+    for (auto &x : c.vu0.acc.w) x = 0x3F000000u + (rng() & 0x01FFFFFFu);
+    for (int k = 1; k < 16; ++k) c.vu0.vi[k] = static_cast<std::uint16_t>(rng());
+    c.vu0.q = 0x3F800000u + (rng() & 0x7FFFFFu);
+    c.vu0.i = 0x3F800000u + (rng() & 0x7FFFFFu);
+    c.vu0.mac = rng() & 0xFFFF;
+    c.vu0.status = rng() & 0xFFF;
+    c.vu0.clip = rng() & 0xFFFFFF;
 }
 
 int failures = 0;
@@ -127,6 +181,7 @@ bool same(const Cpu &a, const Cpu &b, std::string &why) {
     if (a.pc != b.pc) { why = "pc"; return false; }
     if (a.facc != b.facc || a.fcr31 != b.fcr31) { why = "facc/fcr31"; return false; }
     if (a.budget != b.budget) { why = "budget"; return false; }
+    if (std::memcmp(&a.vu0, &b.vu0, sizeof a.vu0)) { why = "vu0"; return false; }
     return true;
 }
 
@@ -137,7 +192,11 @@ void run(const std::vector<Case> &list, bool ram_bases, bool as_branch, int iter
         for (int n = 0; n < iterations; ++n) {
             const std::uint32_t word = k.make();
             // block: [insn] [delay: addiu r9, r9, 1 / or a 2nd random insn] ... nops ... at +0x40: jr ra
-            const std::uint32_t second = as_branch ? enc_i(0x09, 9, 9, 1) : 0x00000000u;
+            const std::uint32_t second = k.make2 ? k.make2(word) : as_branch ? enc_i(0x09, 9, 9, 1) : 0x00000000u;
+            if (n == 0) {
+                const recomp::Insn d1 = recomp::decode(word, kBase), d2 = recomp::decode(second, kBase + 4);
+                std::printf("     %-9s decodes as %s%s%s\n", k.name, recomp::name(d1.op), k.make2 ? " + " : "", k.make2 ? recomp::name(d2.op) : "");
+            }
             std::memset(g_ram + kBase, 0, 0x100);
             std::memcpy(g_ram + kBase, &word, 4);
             std::memcpy(g_ram + kBase + 4, &second, 4);
@@ -197,6 +256,7 @@ int main(int argc, char **argv) {
     }
     run(cases, false, false, iterations);
     run(mem_cases, true, false, iterations);
+    run(pair_cases, true, false, iterations);
     run(branch_cases, false, true, iterations);
     std::printf("%s: %d failures\n", failures ? "FAILED" : "PASSED", failures);
     return failures ? 1 : 0;

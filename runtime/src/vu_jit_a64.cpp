@@ -1022,6 +1022,53 @@ private:
         }
         Reader &r = rd_;
         switch (sub) {
+        case 0x0D: {  // i8x16.shuffle: dup for a lane broadcast, one-table tbl for one source
+            std::uint8_t idx[16];
+            for (auto &x : idx) x = r.byte();
+            if (!need(2)) return true;
+            const std::size_t a = top() - 1, b = top();
+            const unsigned va = vsrc(a), vb = vsrc(b);
+            bool only_a = true, only_b = true;
+            for (std::uint8_t x : idx) {
+                if (x >= 32) return fail("shuffle index");
+                if (x < 16) only_b = false;
+                else only_a = false;
+            }
+            unsigned src = only_a ? va : vb;
+            bool single = only_a || only_b;
+            if (!single && va == vb) {  // both inputs the same register: indices mod 16
+                single = true;
+                src = va;
+            }
+            if (single) {
+                std::uint8_t m[16];
+                for (int k = 0; k < 16; ++k) m[k] = idx[k] & 15u;
+                bool broadcast = m[0] % 4 == 0;
+                for (int k = 0; k < 16 && broadcast; ++k) broadcast = m[k] == m[k % 4] && m[k % 4] == m[0] + k % 4;
+                if (broadcast) {
+                    const unsigned lane = m[0] / 4u;
+                    w(0x4E040400u | ((lane << 3) | 4u) << 16 | src << 5 | vreg(a));  // dup vd.4s, vn.s[lane]
+                } else {
+                    std::array<std::uint32_t, 4> lanes{};
+                    for (int k = 0; k < 16; ++k) lanes[k / 4] |= static_cast<std::uint32_t>(m[k]) << (8 * (k % 4));
+                    pool_refs_.push_back({code_.size(), lanes});
+                    w(0x9C000000u | 2);                                // ldr q2, indices
+                    w(0x4E000000u | 2 << 16 | src << 5 | vreg(a));    // tbl vd.16b, {vn.16b}, v2.16b
+                }
+            } else {
+                std::array<std::uint32_t, 4> lanes{};
+                for (int k = 0; k < 16; ++k) lanes[k / 4] |= static_cast<std::uint32_t>(idx[k]) << (8 * (k % 4));
+                vmov(0, va);
+                vmov(1, vb);
+                pool_refs_.push_back({code_.size(), lanes});
+                w(0x9C000000u | 2);
+                w(0x4E002000u | 2 << 16 | 0 << 5 | vreg(a));  // tbl vd.16b, {v0, v1}, v2
+            }
+            stack_.pop_back();
+            sync_lazy();
+            set_slot(a);
+            return true;
+        }
         case 0x00: { r.u32(); return lazy_vmem(false, r.u32()); }
         case 0x0B: { r.u32(); return lazy_vmem(true, r.u32()); }
         case 0xA1: case 0xF8: case 0xFA: {

@@ -10,7 +10,10 @@
 #if defined(__aarch64__)
 
 #include "ee_core.hpp"
+#include "ps2/generated.hpp"
+#include "ps2/memory.hpp"
 #include "ps2/system.hpp"
+#include "ps2/vu.hpp"
 
 #include <sys/mman.h>
 
@@ -72,6 +75,32 @@ std::uint64_t ee_h_call(Cpu *c, std::uint32_t target, std::uint32_t ret) {
     g_depth = d;
     return c->pc == ret ? 1u : 0u;
 }
+// Unaligned loads / stores (memory.hpp), DIV.S, and the frequent COP2 macro ops, called directly
+// (the same code as ee_interp.cpp's cases, without simple()'s dispatch). None of them stops.
+void ee_x_ldl(Reg128 *rt, std::uint32_t a) { ldl(*rt, a); }
+void ee_x_ldr(Reg128 *rt, std::uint32_t a) { ldr(*rt, a); }
+void ee_x_lwl(Reg128 *rt, std::uint32_t a) { lwl(*rt, a); }
+void ee_x_lwr(Reg128 *rt, std::uint32_t a) { lwr(*rt, a); }
+void ee_x_sdl(const Reg128 *rt, std::uint32_t a) { sdl(*rt, a); }
+void ee_x_sdr(const Reg128 *rt, std::uint32_t a) { sdr(*rt, a); }
+void ee_x_swl(const Reg128 *rt, std::uint32_t a) { swl(*rt, a); }
+void ee_x_swr(const Reg128 *rt, std::uint32_t a) { swr(*rt, a); }
+void ee_x_divs(Cpu *c, std::uint32_t fd, std::uint32_t a, std::uint32_t b) { fpu_div(*c, fd, a, b); }
+#define BC v.vf[i->ft()].w[i->bc()]
+void ee_v_maddabc(Vu0Regs *pv, const Insn *i) { Vu0Regs &v = *pv; vu::maddabc(v, i->dest(), i->fs(), BC); }
+void ee_v_mulabc(Vu0Regs *pv, const Insn *i) { Vu0Regs &v = *pv; vu::mulabc(v, i->dest(), i->fs(), BC); }
+void ee_v_maddbc(Vu0Regs *pv, const Insn *i) { Vu0Regs &v = *pv; vu::maddbc(v, i->dest(), i->fd(), i->fs(), BC); }
+void ee_v_mulbc(Vu0Regs *pv, const Insn *i) { Vu0Regs &v = *pv; vu::mulbc(v, i->dest(), i->fd(), i->fs(), BC); }
+void ee_v_addbc(Vu0Regs *pv, const Insn *i) { Vu0Regs &v = *pv; vu::addbc(v, i->dest(), i->fd(), i->fs(), BC); }
+void ee_v_subbc(Vu0Regs *pv, const Insn *i) { Vu0Regs &v = *pv; vu::subbc(v, i->dest(), i->fd(), i->fs(), BC); }
+void ee_v_mul(Vu0Regs *pv, const Insn *i) { Vu0Regs &v = *pv; vu::mul(v, i->dest(), i->fd(), i->fs(), i->ft()); }
+void ee_v_add(Vu0Regs *pv, const Insn *i) { Vu0Regs &v = *pv; vu::add(v, i->dest(), i->fd(), i->fs(), i->ft()); }
+void ee_v_sub(Vu0Regs *pv, const Insn *i) { Vu0Regs &v = *pv; vu::sub(v, i->dest(), i->fd(), i->fs(), i->ft()); }
+void ee_v_madd(Vu0Regs *pv, const Insn *i) { Vu0Regs &v = *pv; vu::madd(v, i->dest(), i->fd(), i->fs(), i->ft()); }
+void ee_v_mula(Vu0Regs *pv, const Insn *i) { Vu0Regs &v = *pv; vu::mula(v, i->dest(), i->fs(), i->ft()); }
+void ee_v_madda(Vu0Regs *pv, const Insn *i) { Vu0Regs &v = *pv; vu::madda(v, i->dest(), i->fs(), i->ft()); }
+void ee_v_clip(Vu0Regs *pv, const Insn *i) { vu::clip(*pv, i->fs(), i->ft()); }
+#undef BC
 std::uint32_t ee_fp_add(std::uint32_t a, std::uint32_t b) { return fp::add(a, b); }
 std::uint32_t ee_fp_sub(std::uint32_t a, std::uint32_t b) { return fp::sub(a, b); }
 std::uint32_t ee_fp_mul(std::uint32_t a, std::uint32_t b) { return fp::fpu_mul(a, b); }
@@ -99,6 +128,10 @@ constexpr std::uint32_t kOffFcr31 = offsetof(Cpu, fcr31);
 constexpr std::uint32_t kOffFacc = offsetof(Cpu, facc);
 constexpr std::uint32_t fr(unsigned r) { return kOffF + r * 4u; }
 constexpr std::uint32_t gr(unsigned r) { return kOffR + r * 16u; }
+constexpr std::uint32_t kOffVu0 = offsetof(Cpu, vu0);
+constexpr std::uint32_t vfr(unsigned r) { return kOffVu0 + static_cast<std::uint32_t>(offsetof(Vu0Regs, vf)) + r * 16u; }
+constexpr std::uint32_t vir(unsigned r) { return kOffVu0 + static_cast<std::uint32_t>(offsetof(Vu0Regs, vi)) + r * 2u; }
+static_assert(kOffVu0 < 4096 && vfr(31) + 16 < 4096 * 4 && vir(15) < 4096 * 2, "VU0 registers within the immediate offsets");
 
 enum Cond : std::uint32_t { EQ = 0, NE = 1, HS = 2, LO = 3, GE = 10, LT = 11, GT = 12, LE = 13 };
 constexpr unsigned ZR = 31, X16 = 16, C = 19, RAM = 20, T = 21;
@@ -189,6 +222,14 @@ public:
     void csel_x(unsigned d, unsigned n, unsigned m, Cond c) { w(0x9A800000u | m << 16 | c << 12 | n << 5 | d); }
     // memory with a 32-bit guest address zero-extended: [x20, wm, uxtw]
     void ram(std::uint32_t op, unsigned t, unsigned m) { w(op | m << 16 | RAM << 5 | t); }
+    void ldrh_w(unsigned t, unsigned n, std::uint32_t off) { w(0x79400000u | (off / 2) << 10 | n << 5 | t); }
+    void strh_w(unsigned t, unsigned n, std::uint32_t off) { w(0x79000000u | (off / 2) << 10 | n << 5 | t); }
+    void ldr_q(unsigned t, unsigned n, std::uint32_t off) { w(0x3DC00000u | (off / 16) << 10 | n << 5 | t); }
+    void str_q(unsigned t, unsigned n, std::uint32_t off) { w(0x3D800000u | (off / 16) << 10 | n << 5 | t); }
+    void movi_zero_q(unsigned d) { w(0x6F00E400u | d); }  // movi vd.2d, #0
+    // zip1 vd, vn, vm (size: 1 = 8h, 2 = 4s, 3 = 2d)
+    void zip1(unsigned d, unsigned n, unsigned m, unsigned size) { w(0x4E003800u | size << 22 | m << 16 | n << 5 | d); }
+    void add_xi(unsigned d, unsigned n, std::uint32_t imm12) { w(0x91000000u | imm12 << 10 | n << 5 | d); }
     // control
     void blr(unsigned n) { w(0xD63F0000u | n << 5); }
     void ret() { w(0xD65F03C0u); }
@@ -224,6 +265,11 @@ struct Block {
 
 // block table, direct mapped by pc (8 MB of code without conflicts); chained jumps read it too
 constexpr std::uint32_t kTable = 1u << 21;
+// PS2_EE_JIT_FUSE=0: no fused unaligned pairs (A/B check)
+const bool g_fuse = [] {
+    const char *v = std::getenv("PS2_EE_JIT_FUSE");
+    return !v || std::strcmp(v, "0") != 0;
+}();
 Block *g_table[kTable];
 
 class Compiler {
@@ -396,11 +442,11 @@ public:
         std::uint32_t *slow = slow_if_not_ram();
         a_.add_x(2, RAM, 0);  // x2 = g_ram + w0 (w0 < 32 MB, upper bits clear)
         if (is_store) {
-            a_.ldp_x(3, 4, C, static_cast<std::int32_t>(reg_off));
-            a_.stp_x(3, 4, 2, 0);
+            a_.ldr_q(0, C, reg_off);
+            a_.str_q(0, 2, 0);
         } else if (!discard) {
-            a_.ldp_x(3, 4, 2, 0);
-            a_.stp_x(3, 4, C, static_cast<std::int32_t>(reg_off));
+            a_.ldr_q(0, 2, 0);
+            a_.str_q(0, C, reg_off);
         }
         std::uint32_t *done = a_.b();
         a_.patch19(slow);
@@ -421,6 +467,70 @@ public:
             if (discard) a_.w(0x910043FFu);  // add sp, sp, #16
         }
         a_.patch26(done);
+    }
+
+#define FPH(name) reinterpret_cast<const void *>(&name)
+    // An unaligned pair at the same base (ldl rt, k+7 / ldr rt, k in either order; lwl/lwr k+3 / k;
+    // the stores alike): one unaligned access when the bytes lie in RAM, else both helpers in order.
+    // Same result as the two instructions: they assemble exactly the bytes at k (loads: lwl/lwr leave
+    // the word sign-extended either way; ldl/ldr the full doubleword; the upper 64 bits untouched).
+    bool fused_pair(const Insn &a, const Insn &b) {
+        const bool is64 = a.op == Ldl || a.op == Ldr || a.op == Sdl || a.op == Sdr;
+        recomp::Op lo, hi;
+        switch (a.op) {
+        case Ldl: case Ldr: lo = Ldr; hi = Ldl; break;
+        case Lwl: case Lwr: lo = Lwr; hi = Lwl; break;
+        case Sdl: case Sdr: lo = Sdr; hi = Sdl; break;
+        case Swl: case Swr: lo = Swr; hi = Swl; break;
+        default: return false;
+        }
+        if (!((a.op == lo && b.op == hi) || (a.op == hi && b.op == lo))) return false;
+        if (a.rs() != b.rs() || a.rt() != b.rt()) return false;
+        const bool load = lo == Ldr || lo == Lwr;
+        if (load && (a.rt() == a.rs() || !a.rt())) return false;  // base changed by the first / no target
+        const Insn &l = a.op == lo ? a : b, &h = a.op == lo ? b : a;
+        const std::int32_t width = is64 ? 8 : 4;
+        if (h.simm() != l.simm() + width - 1) return false;
+        add_imm_w(0, l.rs(), l.simm());  // w0 = k
+        a_.mov_x(5, 0);
+        // fast path: k .. k+width-1 in RAM
+        a_.imm32(1, kRamSize - static_cast<std::uint32_t>(width));
+        a_.cmp_w(0, 1);
+        std::uint32_t *slow = a_.bcond(HS);
+        const unsigned rt = l.rt();
+        if (load) {
+            a_.ram(is64 ? LDRX : LDRW, 2, 0);
+            if (!is64) a_.sxtw(2, 2);
+            a_.str_x(2, C, gr(rt));
+        } else {
+            a_.ram(is64 ? STRX : STRW, src(rt, 2), 0);
+        }
+        std::uint32_t *done = a_.b();
+        a_.patch19(slow);
+        const auto helper = [&](recomp::Op op) -> const void * {
+            switch (op) {
+            case Ldl: return FPH(ee_x_ldl);
+            case Ldr: return FPH(ee_x_ldr);
+            case Lwl: return FPH(ee_x_lwl);
+            case Lwr: return FPH(ee_x_lwr);
+            case Sdl: return FPH(ee_x_sdl);
+            case Sdr: return FPH(ee_x_sdr);
+            case Swl: return FPH(ee_x_swl);
+            default: return FPH(ee_x_swr);
+            }
+        };
+        for (const Insn *x : {&a, &b}) {
+            a_.add_xi(0, C, gr(rt));
+            if (x->op == lo) a_.mov_x(1, 5);
+            else a_.add_wi(1, 5, static_cast<std::uint32_t>(width - 1));
+            a_.call(helper(x->op));
+            if (x == &a) {  // x5 is caller-saved: rebuild k for the second call
+                add_imm_w(0, l.rs(), l.simm());
+                a_.mov_x(5, 0);
+            }
+        }
+        a_.patch26(done);
+        return true;
     }
 
     // One non-control instruction: native when simple, else the interpreter's simple().
@@ -566,6 +676,96 @@ public:
         case Swc1: store(i, STRW, reinterpret_cast<const void *>(&ee_h_st32), true); return;
         case Lq: quad(i, false, gr(rt), rt == 0); return;
         case Sq: quad(i, true, gr(rt), false); return;
+        case Lqc2: quad(i, false, vfr(i.ft()), i.ft() == 0); return;
+        case Sqc2: quad(i, true, vfr(i.ft()), false); return;
+        case Vnop: case Vwaitq: return;
+        case Qmfc2:
+            if (i.word & 1u) break;  // interlock: vu0_wait in simple()
+            if (rt) {
+                a_.ldr_q(0, C, vfr(i.fs()));
+                a_.str_q(0, C, gr(rt));
+            }
+            return;
+        case Qmtc2:
+            if (i.word & 1u) break;
+            if (i.fs()) {
+                if (rt) a_.ldr_q(0, C, gr(rt));
+                else a_.movi_zero_q(0);
+                a_.str_q(0, C, vfr(i.fs()));
+            }
+            return;
+        case Cfc2:
+            if (i.fs() >= 16) break;
+            if (rt) {
+                a_.ldrh_w(0, C, vir(i.fs()));
+                a_.str_x(0, C, gr(rt));  // < 0x10000: set32's sign extension keeps it
+            }
+            return;
+        case Ctc2:
+            if (i.fs() >= 16) break;
+            if (i.fs()) a_.strh_w(src(rt, 0), C, vir(i.fs()));
+            return;
+        case Vmove:
+            if (!i.ft()) return;
+            for (unsigned k = 0; k < 4; ++k)
+                if (i.dest() & (8u >> k)) {
+                    a_.ldr_w(0, C, vfr(i.fs()) + 4u * k);
+                    a_.str_w(0, C, vfr(i.ft()) + 4u * k);
+                }
+            return;
+        case Pcpyld: case Pextlw: case Pextlh: {
+            if (!rd) return;
+            if (rt) a_.ldr_q(0, C, gr(rt));
+            else a_.movi_zero_q(0);
+            if (rs) a_.ldr_q(1, C, gr(rs));
+            else a_.movi_zero_q(1);
+            a_.zip1(2, 0, 1, i.op == Pcpyld ? 3u : i.op == Pextlw ? 2u : 1u);
+            a_.str_q(2, C, gr(rd));
+            return;
+        }
+        case Ldl: case Ldr: case Lwl: case Lwr:
+            if (!rt) return;
+            address(i);
+            a_.mov_x(1, 0);
+            a_.add_xi(0, C, gr(rt));
+            a_.call(i.op == Ldl ? FPH(ee_x_ldl) : i.op == Ldr ? FPH(ee_x_ldr) : i.op == Lwl ? FPH(ee_x_lwl) : FPH(ee_x_lwr));
+            return;
+        case Sdl: case Sdr: case Swl: case Swr:
+            address(i);
+            a_.mov_x(1, 0);
+            a_.add_xi(0, C, gr(rt));
+            a_.call(i.op == Sdl ? FPH(ee_x_sdl) : i.op == Sdr ? FPH(ee_x_sdr) : i.op == Swl ? FPH(ee_x_swl) : FPH(ee_x_swr));
+            return;
+        case DivS:
+            a_.mov_x(0, C);
+            a_.imm32(1, i.fd());
+            a_.ldr_w(2, C, fr(i.fs()));
+            a_.ldr_w(3, C, fr(i.ft()));
+            a_.call(FPH(ee_x_divs));
+            return;
+        case Vmaddabc: case Vmulabc: case Vmaddbc: case Vmulbc: case Vaddbc: case Vsubbc: case Vmul: case Vadd: case Vsub:
+        case Vmadd: case Vmula: case Vmadda: case Vclip: {
+            const void *fn = nullptr;
+            switch (i.op) {
+            case Vmaddabc: fn = FPH(ee_v_maddabc); break;
+            case Vmulabc: fn = FPH(ee_v_mulabc); break;
+            case Vmaddbc: fn = FPH(ee_v_maddbc); break;
+            case Vmulbc: fn = FPH(ee_v_mulbc); break;
+            case Vaddbc: fn = FPH(ee_v_addbc); break;
+            case Vsubbc: fn = FPH(ee_v_subbc); break;
+            case Vmul: fn = FPH(ee_v_mul); break;
+            case Vadd: fn = FPH(ee_v_add); break;
+            case Vsub: fn = FPH(ee_v_sub); break;
+            case Vmadd: fn = FPH(ee_v_madd); break;
+            case Vmula: fn = FPH(ee_v_mula); break;
+            case Vmadda: fn = FPH(ee_v_madda); break;
+            default: fn = FPH(ee_v_clip); break;
+            }
+            a_.add_xi(0, C, kOffVu0);
+            a_.imm64(1, reinterpret_cast<std::uint64_t>(stored));
+            a_.call(fn);
+            return;
+        }
         case Mfc1: if (rt) { a_.ldr_w(0, C, kOffF + i.fs() * 4u); put32(rt, 0); } return;
         case Mtc1: a_.str_w(src(rt, 0), C, kOffF + i.fs() * 4u); return;
         case MovS: a_.ldr_w(0, C, kOffF + i.fs() * 4u); a_.str_w(0, C, kOffF + i.fd() * 4u); return;
@@ -608,13 +808,13 @@ public:
         case Cache: a_.call(FPF(ee_h_cache)); return;
 #undef FPF
         case Sync: case Pref: return;
-        default:
-            a_.mov_x(0, C);
-            a_.imm64(1, reinterpret_cast<std::uint64_t>(stored));
-            a_.call(reinterpret_cast<const void *>(&ee_h_simple));
-            halt_if_zero();
-            return;
+        default: break;
         }
+        // everything else (and the cases above that break out): the interpreter's simple()
+        a_.mov_x(0, C);
+        a_.imm64(1, reinterpret_cast<std::uint64_t>(stored));
+        a_.call(reinterpret_cast<const void *>(&ee_h_simple));
+        halt_if_zero();
     }
 
     // w21 = branch condition
@@ -691,6 +891,7 @@ public:
         }
 
         std::int32_t cost = 0;
+        bool fused = false;  // this instruction was emitted with the previous one (fused_pair)
         for (std::size_t k = 0; k < list.size(); ++k) {
             const Insn &i = b_.insns[k];
             const std::uint32_t at = i.pc;
@@ -702,7 +903,14 @@ public:
                     leave(pack(kSyscall, at), at + 4);
                     return;
                 }
-                op(i, &b_.insns[k]);
+                if (fused) {
+                    fused = false;
+                } else if (k + 1 < list.size() && recomp::flow(b_.insns[k + 1].op) == Flow::None &&
+                           b_.insns[k + 1].op != Syscall && g_fuse && fused_pair(i, b_.insns[k + 1])) {
+                    fused = true;
+                } else {
+                    op(i, &b_.insns[k]);
+                }
                 if (k + 1 == list.size()) {  // block cut (size limit or probe)
                     charge(cost);
                     leave(pack(kNext), at + 4);
