@@ -301,7 +301,10 @@ std::string base_fields(const Race &r) {
     return o;
 }
 
+// Status only while in a race room: the lobby browser lists rooms from it. Outside a room nothing is
+// sent (owner 2026-11-10: no live list / leaderboard any more).
 void send_status(const Race &r, int lap, bool force) {
+    if (room_fields().empty()) return;
     const long long now = now_s();
     if (!force && now - g_last_status.load() < 5) return;
     g_last_status = now;
@@ -429,9 +432,8 @@ void on_lap(ps2::Cpu &c) {
         return;
     }
 
-    enqueue("{" + base_fields(r) + ",\"type\":\"lap\",\"lap\":" + std::to_string(lap) + ",\"time_ms\":" +
-                std::to_string(ms) + ",\"race\":" + json_str(g_race_id) + "}",
-            true);
+    // Lap times stay on the headset (laps.txt above); they are no longer sent to the server
+    // (owner 2026-11-10: no leaderboard). The room's status still reports the lap.
     send_status(r, static_cast<int>(lap) + 1, true);
 }
 
