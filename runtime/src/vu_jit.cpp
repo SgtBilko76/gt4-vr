@@ -645,13 +645,16 @@ private:
             c_.vstore(vf_off(to));
             return;
         }
-        for (unsigned l = 0; l < 4; ++l) {
-            if (!lane(dest, static_cast<int>(l))) continue;
-            c_.get(kR);
-            c_.get(kTmp);
-            c_.load(l * 4u);
-            c_.store(vf_off(to) + l * 4u);
-        }
+        // Partial: merge in the vector domain and store all 16 bytes. Separate 32-bit lane stores made the
+        // next full read of the register wait for them (no store-to-load forwarding from several stores).
+        c_.get(kR);
+        c_.get(kTmp);
+        c_.vload(0);
+        c_.get(kR);
+        c_.vload(vf_off(to));
+        lane_mask(dest);
+        c_.simd(kVBitselect);
+        c_.vstore(vf_off(to));
     }
 
     void lanes_store(unsigned dest, unsigned from) {
@@ -671,12 +674,16 @@ private:
     }
 
     void lanes_fill(unsigned dest, unsigned to, std::uint32_t value_local) {
-        for (unsigned l = 0; l < 4; ++l) {
-            if (!lane(dest, static_cast<int>(l))) continue;
+        c_.get(kR);  // one 16-byte store, see lanes_copy
+        c_.get(value_local);
+        c_.simd(kVSplat);
+        if (dest != 0xF) {
             c_.get(kR);
-            c_.get(value_local);
-            c_.store(vf_off(to) + l * 4u);
+            c_.vload(vf_off(to));
+            lane_mask(dest);
+            c_.simd(kVBitselect);
         }
+        c_.vstore(vf_off(to));
     }
 
     void lane_mask(unsigned d) {
