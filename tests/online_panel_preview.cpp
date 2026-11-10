@@ -59,13 +59,17 @@ int main(int argc, char **argv) {
         }
         gt4::panel::nextPage(1);
     }
-    // Settings page: defaults; then distance +2 steps, size -1 step, triggers swapped, grips row selected.
+    // Settings page: defaults; then distance +2 steps, size -1 step, 3D -2 steps, triggers swapped,
+    // grips row selected.
     gt4::panel::input(0, -9);
     gt4::panel::render(px);
     save(out + "/panel_settings.ppm", px);
     gt4::panel::input(1, 0);
     gt4::panel::input(1, 0);
     gt4::panel::input(0, 1);
+    gt4::panel::input(-1, 0);
+    gt4::panel::input(0, 1);
+    gt4::panel::input(-1, 0);
     gt4::panel::input(-1, 0);
     gt4::panel::input(0, 1);
     gt4::panel::select();

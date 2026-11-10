@@ -112,7 +112,7 @@ int g_page = kSettings;
 int g_scroll = 0;
 int g_sel = 0;      // selected row on the lobby page
 int g_set_sel = 0;  // selected row on the settings page
-enum SettingRow { kRowDistance, kRowSize, kRowTriggers, kRowGrips, kRowReset, kSettingRows };
+enum SettingRow { kRowDistance, kRowSize, kRowStereo, kRowTriggers, kRowGrips, kRowReset, kSettingRows };
 
 void fetch_loop() {
     for (;;) {
@@ -436,39 +436,42 @@ void draw_settings(Canvas &cv) {
         std::string value, hint;
         bool arrows;
     };
-    char dist[32], size[32];
+    char dist[32], size[32], depth[32];
     std::snprintf(dist, sizeof dist, "%.2f m", v.screen_distance_m);
     std::snprintf(size, sizeof size, "%d %%", v.screen_size_pct);
+    std::snprintf(depth, sizeof depth, v.stereo_pct ? "%d %%" : "off (flat)", v.stereo_pct);
     const Row rows[kSettingRows] = {
         {"Screen", "Distance", dist, "How far away the screen is (the curved screen and the menus). Default 3.00 m.", true},
         {nullptr, "Size", size, "Width of the screen, 100 % = default. Bigger = more of your view.", true},
+        {"VR view", "3D strength", depth,
+         "Depth of the 3D in the VR race view. 100 % = real size (default), less = flatter, more = deeper.", true},
         {"Controller", "Throttle / brake",
          v.swap_triggers ? "Left trigger = throttle, right = brake" : "Right trigger = throttle, left = brake",
          "Press A or left/right to swap the triggers.", false},
         {nullptr, "Shift up / down",
          v.swap_grips ? "Left grip = shift up, right = down" : "Right grip = shift up, left = down",
          "Press A or left/right to swap the grips.", false},
-        {nullptr, "Reset to defaults", "", "Press A: default screen and controller settings.", false},
+        {nullptr, "Reset to defaults", "", "Press A: default screen, 3D and controller settings.", false},
     };
     int y = 214;
     for (int i = 0; i < kSettingRows; ++i) {
         const Row &r = rows[i];
         if (r.section) {
-            y += 18;
+            y += 12;
             cv.text(r.section, 40, y + 20, 22, kGold);
-            y += 30;
+            y += 28;
         }
         const bool on = i == g_set_sel;
         if (on) {
-            cv.rect(40, y, kWidth - 80, 52, kSelected);
-            cv.rect(40, y, 6, 52, kAccent);
+            cv.rect(40, y, kWidth - 80, 46, kSelected);
+            cv.rect(40, y, 6, 46, kAccent);
         }
-        cv.text(r.name, 66, y + 35, 28, on ? kText : kDim, 420);
+        cv.text(r.name, 66, y + 32, 28, on ? kText : kDim, 420);
         if (!r.value.empty()) {
             const std::string shown = r.arrows ? std::string("<   ") + r.value + "   >" : r.value;
-            cv.text(shown, 500, y + 35, 28, on ? kText : kDim, kWidth - 560, 1);
+            cv.text(shown, 500, y + 32, 28, on ? kText : kDim, kWidth - 560, 1);
         }
-        y += 58;
+        y += 52;
     }
     cv.text(rows[g_set_sel].hint, 40, y + 30, 22, kDim, kWidth - 80);
     draw_footer(cv, "Stick  up/down: choose     left/right: change     A: select");
@@ -536,6 +539,10 @@ void change_setting(int dx) {
     case kRowSize:
         if (!dx) return;
         v.screen_size_pct += dx * gt4::settings::kSizeStepPct;
+        break;
+    case kRowStereo:
+        if (!dx) return;
+        v.stereo_pct += dx * gt4::settings::kStereoStepPct;
         break;
     case kRowTriggers: v.swap_triggers = !v.swap_triggers; break;
     case kRowGrips: v.swap_grips = !v.swap_grips; break;

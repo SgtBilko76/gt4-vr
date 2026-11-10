@@ -1555,7 +1555,9 @@ private:
         const float show_depth = ReadFloatProperty("debug.gt4vr.showdepth", 0.0f);
         const float near_m = std::clamp(ReadFloatProperty("debug.gt4vr.nearm", kNearM), 0.2f, 20.0f);
         const float upm = std::clamp(ReadFloatProperty("debug.gt4vr.upm", kUnitsPerMeter), 1.0f, 10000.0f);
-        const float sscale = std::clamp(ReadFloatProperty("debug.gt4vr.stereoscale", 1.0f), 0.0f, 5.0f);
+        // 3D strength: VR menu > Settings (gt4_settings.h, 100 % = true scale); debug.gt4vr.stereoscale overrides.
+        const float player_scale = static_cast<float>(gt4::settings::get().stereo_pct) / 100.0f;
+        const float sscale = std::clamp(ReadFloatProperty("debug.gt4vr.stereoscale", player_scale), 0.0f, 5.0f);
         if (near_m != m_near_m || upm != m_units_per_m || sscale != m_stereo_scale)
         {
             m_near_m = near_m;
