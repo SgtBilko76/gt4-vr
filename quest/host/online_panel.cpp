@@ -399,7 +399,7 @@ void draw(std::vector<std::uint8_t> &px, const Data &d, const Context &ctx) {
     if (rr.size() == 1) cv.text("No open races right now", 40, kRacesTop + kRowH + 60, 28, kDim, kWidth - 80, 2);
     // Footer
     cv.rect(0, kHeight - 56, kWidth, 56, kHeader);
-    cv.text("Right stick  up/down: choose     A: select     B or both stick clicks: close", 40, kHeight - 20, 22, kDim,
+    cv.text("Right stick  up/down: choose     A: select     B or Menu: close", 40, kHeight - 20, 22, kDim,
             kWidth - 80, 2);
 }
 
