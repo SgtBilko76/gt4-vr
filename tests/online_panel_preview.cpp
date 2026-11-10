@@ -1,8 +1,10 @@
-// Renders the GT4 Online menu (online_panel.cpp) to PPM files on the PC, with stubbed room state and
-// race-list data from a running gt4-results (or none), to check the layout without the headset.
-//   g++ -std=c++20 -O1 -Iquest/host tests/online_panel_preview.cpp quest/host/online_panel.cpp -o panel_preview
-//   ./panel_preview <out dir> [server host:port]
+// Renders the VR menu (online_panel.cpp) to PPM files on the PC, with stubbed room state and race-list
+// data from a running gt4-results (or none), to check the layout without the headset.
+//   g++ -std=c++20 -O1 -Iquest/host tests/online_panel_preview.cpp quest/host/online_panel.cpp
+//       quest/host/gt4_settings.cpp -o panel_preview
+//   ./panel_preview <out dir> [server host:port]   (no server = Spec II: Settings page only)
 #include "gt4_results.h"
+#include "gt4_settings.h"
 #include "online_panel.h"
 
 #include <chrono>
@@ -34,23 +36,45 @@ static void save(const std::string &path, const std::vector<std::uint8_t> &rgba)
 
 int main(int argc, char **argv) {
     const std::string out = argc > 1 ? argv[1] : ".";
-    const std::string server = argc > 2 ? argv[2] : "127.0.0.1:1";
+    const std::string server = argc > 2 ? argv[2] : "";
+    gt4::settings::load(out + "/settings.txt");
     if (!gt4::panel::start(server, "quest/android/build/stage/assets/gt4vr/resources/fonts/Roboto-Regular.ttf",
                            [] { return gt4::panel::Context{"Bilko", "", ""}; }))
         return 1;
     gt4::panel::setOpen(true);
-    std::this_thread::sleep_for(std::chrono::seconds(3));
     std::vector<std::uint8_t> px;
-    const struct {
-        const char *name;
-        gt4::results::Room room;
-    } states[] = {{"lobby", {}}, {"host", {"R123456", true}}, {"joined", {"R654321", false}}};
-    for (const auto &s : states) {
-        g_room = s.room;
-        gt4::panel::input(0, 1);
-        gt4::panel::input(0, -1);
-        gt4::panel::render(px);
-        save(out + "/panel_" + s.name + ".ppm", px);
+    if (!server.empty()) {
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        const struct {
+            const char *name;
+            gt4::results::Room room;
+        } states[] = {{"lobby", {}}, {"host", {"R123456", true}}, {"joined", {"R654321", false}}};
+        for (const auto &s : states) {
+            g_room = s.room;
+            gt4::panel::setTab(0);
+            gt4::panel::input(0, 1);
+            gt4::panel::input(0, -1);
+            gt4::panel::render(px);
+            save(out + "/panel_" + s.name + ".ppm", px);
+        }
+        gt4::panel::nextPage(1);
     }
+    // Settings page: defaults; then distance +2 steps, size -1 step, 3D -2 steps, triggers swapped,
+    // grips row selected.
+    gt4::panel::input(0, -9);
+    gt4::panel::render(px);
+    save(out + "/panel_settings.ppm", px);
+    gt4::panel::input(1, 0);
+    gt4::panel::input(1, 0);
+    gt4::panel::input(0, 1);
+    gt4::panel::input(-1, 0);
+    gt4::panel::input(0, 1);
+    gt4::panel::input(-1, 0);
+    gt4::panel::input(-1, 0);
+    gt4::panel::input(0, 1);
+    gt4::panel::select();
+    gt4::panel::input(0, 1);
+    gt4::panel::render(px);
+    save(out + "/panel_settings_changed.ppm", px);
     std::_Exit(0);
 }

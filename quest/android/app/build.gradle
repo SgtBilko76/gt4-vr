@@ -15,7 +15,10 @@ android {
         // gtLauncher: which entry the app library shows - specii / online (that version's game starts
         // directly) or selector (the combined app's 2D version picker).
         def launcher = project.findProperty('gtLauncher') ?: 'specii'
+        // App icon per app (owner 2026-11-10): GT4 logo with "spec-II" for Spec II, without it for Online.
+        // The official GT4 logo is Sony's trademark: fine for the private builds only.
         manifestPlaceholders = [appLabel: project.findProperty('gtAppLabel') ?: 'Gran Turismo 4 Spec II 3D/VR',
+                                appIcon: launcher == 'online' ? 'ic_launcher_online' : 'ic_launcher_specii',
                                 selectorEnabled: (launcher == 'selector').toString(),
                                 speciiLauncher: (launcher == 'specii').toString(),
                                 onlineLauncher: (launcher == 'online').toString()]

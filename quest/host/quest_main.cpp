@@ -50,9 +50,10 @@ void register_generated_code();
 #include "gt4_camera.h"
 #include "gt4_lan.h"
 #include "gt4_display.h"
+#include "gt4_settings.h"
+#include "online_panel.h"
 #if GT4VR_ONLINE
 #include "gt4_results.h"
-#include "online_panel.h"
 #endif
 #include <sys/system_properties.h>
 
@@ -925,22 +926,28 @@ bool start_game(const fs::path &files) {
     // loading screen (PC test 2026-11-06; the same is reported for the beta on PCSX2).
     if (std::strcmp(GT4VR_NET_PRODUCT, "SPEC2V110") == 0 && std::getenv("PS2_GT4_SPEC2LAN")) gt4::lan::installSpecIIMenu();
     else if (retail_program && !GT4VR_CAMERA_HOOKS) gt4::camera::installSceneDetector();
+    // Player settings (VR menu > Settings): screen distance / size, swapped triggers / grips.
+    gt4::settings::load(kDataDir + "/settings.txt");
+    const std::string panel_font = (files / "resources" / "fonts" / "Roboto-Regular.ttf").string();
 #if GT4VR_ONLINE
-    // GT4 Online (retail): own laps go to the leaderboard (gt4.portroyale.online) and to laps.txt.
-    // config.txt PS2_RESULTS_SERVER=off turns the reports off. Not built into the Spec II app.
+    // GT4 Online (retail): race rooms on the results server, own laps to laps.txt on the headset.
+    // config.txt PS2_RESULTS_SERVER=off turns the server off (the VR menu then has Settings only).
     {
         setenv("PS2_RESULTS_SERVER", "217.154.211.69:27314", 0);
         setenv("PS2_RESULTS_LOG", (kDataDir + "/laps.txt").c_str(), 0);
         gt4::results::install();
-        // The online menu (both stick clicks): leaderboard data from the same server.
+        // The VR menu (Menu held): lobby from the same server + settings.
         const char *server = std::getenv("PS2_RESULTS_SERVER");
-        if (server && std::strcmp(server, "off") != 0)
-            gt4::panel::start(server, (files / "resources" / "fonts" / "Roboto-Regular.ttf").string(), [] {
-                gt4::panel::Context c;
-                gt4::results::current(c.player, c.track, c.car);
-                return c;
-            });
+        const bool lobby = server && std::strcmp(server, "off") != 0;
+        gt4::panel::start(lobby ? server : "", panel_font, [] {
+            gt4::panel::Context c;
+            gt4::results::current(c.player, c.track, c.car);
+            return c;
+        });
     }
+#else
+    // Spec II: the VR menu (Menu held) with the Settings page only.
+    gt4::panel::start("", panel_font, nullptr);
 #endif
     ps2::gs::bridge::set_field_tags(gt4::quest::takeBuiltKey, gt4::quest::notePresentedKey);
 

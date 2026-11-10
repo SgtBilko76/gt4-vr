@@ -16,6 +16,7 @@
 #include "quest_host.h"
 #include "rrv_pcsx2_gs_bridge.h"
 #include "gt4_camera.h"
+#include "gt4_settings.h"
 #include "online_panel.h"
 #include "ps2/net.hpp"
 
@@ -239,8 +240,9 @@ bool LoadFunction(XrInstance instance, const char *name, Fn &out)
 //   left / right stick click = L1 / R1                            Menu button = Start (pause)
 //   both stick clicks together = switch the race view (curved screen <-> VR), once per press
 //   (nothing while kVrModeAllowed is false).
-//   Online builds: Menu held 0.6 s = online lobby (open / close), the only way to open it
-//   (owner 2026-11-10); a short Menu press stays Start, sent on release.
+//   Menu held 0.6 s = VR menu (open / close; GT4 Online: Lobby + Settings, Spec II: Settings), the
+//   only way to open it (owner 2026-11-10); a short Menu press stays Start, sent on release.
+//   VR menu > Settings can swap the triggers (throttle / brake) and the grips (shift up / down).
 // GT4 reads Cross/Square pressure, so the triggers give analog throttle and brake.
 struct ControllerInput
 {
@@ -267,10 +269,14 @@ public:
                 state = false;
             return state;
         };
-        const float throttle = trigger(m_rt, in.rightTrigger);
-        const float brake = trigger(m_lt, in.leftTrigger);
-        const bool lg = hyst(m_lg, in.leftGrip);
-        const bool rg = hyst(m_rg, in.rightGrip);
+        // VR menu > Settings: swapped triggers (left = throttle) / grips (left = shift up).
+        const gt4::settings::Values set = gt4::settings::get();
+        const float throttle = trigger(m_rt, set.swap_triggers ? in.leftTrigger : in.rightTrigger);
+        const float brake = trigger(m_lt, set.swap_triggers ? in.rightTrigger : in.leftTrigger);
+        const bool lg = hyst(m_lg, set.swap_grips ? in.rightGrip : in.leftGrip);
+        const bool rg = hyst(m_rg, set.swap_grips ? in.leftGrip : in.rightGrip);
+        // The grips as the player holds them (menu pages: left = previous, right = next).
+        const bool grip_l = set.swap_grips ? rg : lg, grip_r = set.swap_grips ? lg : rg;
         const auto stickDir = [](bool &state, float value, float sign) {
             const float v = value * sign;
             if (!state && v > 0.6f)
@@ -281,6 +287,9 @@ public:
         };
         const bool up = stickDir(m_rs[0], in.rightY, 1.0f), down = stickDir(m_rs[1], in.rightY, -1.0f);
         const bool left = stickDir(m_rs[2], in.rightX, -1.0f), right = stickDir(m_rs[3], in.rightX, 1.0f);
+        // The VR menu also takes the left (steering) stick; the game's D-pad stays on the right stick.
+        const bool m_up = stickDir(m_ls[0], in.leftY, 1.0f) || up, m_down = stickDir(m_ls[1], in.leftY, -1.0f) || down;
+        const bool m_left = stickDir(m_ls[2], in.leftX, -1.0f) || left, m_right = stickDir(m_ls[3], in.leftX, 1.0f) || right;
 
         if (in.leftStickClick && in.rightStickClick && !m_stickCombo)
         {
@@ -300,10 +309,11 @@ public:
             m_stickCombo = false;
         }
 
-        // Menu button with the online menu (owner 2026-11-05: "Online Lobby" on the pause button):
-        // held 0.6 s it opens the lobby on its Races tab (or closes it); a shorter press is Start,
-        // sent as a 0.15 s tap on release (GT4 acts on the press, so the delay is invisible). With
-        // the lobby open a short press closes it. Without the online menu Menu is Start as before.
+        // Menu button with the VR menu (owner 2026-11-05: "Online Lobby" on the pause button; 2026-11-10:
+        // settings too, in both apps): held 0.6 s it opens the menu on its first page - Lobby in GT4
+        // Online, Settings in Spec II - (or closes it); a shorter press is Start, sent as a 0.15 s tap
+        // on release (GT4 acts on the press, so the delay is invisible). With the menu open a short
+        // press closes it. Without the VR menu (no font) Menu is Start as before.
         bool start = in.menu;
         if (gt4::panel::available())
         {
@@ -335,23 +345,28 @@ public:
             start = now < m_startUntil;
         }
 
-        // Online menu open: the right stick chooses (up/down), A selects, B or Menu closes it, and the
-        // game gets a released pad (pause GT4 first if a race is running).
+        // VR menu open: either stick chooses (up/down) and changes settings (left/right), A selects,
+        // the grips switch Lobby / Settings, B or Menu closes it, and the game gets a released pad
+        // (pause GT4 first if a race is running).
         const bool panel_b = in.b && !m_panelB;
         m_panelB = in.b;
         const bool was_a = m_panelA;
         m_panelA = in.a;
         if (gt4::panel::isOpen())
         {
-            const int dx = (right && !m_panelDir[3]) - (left && !m_panelDir[2]);
-            const int dy = (down && !m_panelDir[1]) - (up && !m_panelDir[0]);
+            const int dx = (m_right && !m_panelDir[3]) - (m_left && !m_panelDir[2]);
+            const int dy = (m_down && !m_panelDir[1]) - (m_up && !m_panelDir[0]);
             if (dx || dy)
                 gt4::panel::input(dx, dy);
+            const int page = (grip_r && !m_panelGrip[1]) - (grip_l && !m_panelGrip[0]);
+            if (page)
+                gt4::panel::nextPage(page);
+            m_panelGrip[0] = grip_l, m_panelGrip[1] = grip_r;
             if (panel_b)
                 gt4::panel::setOpen(false);
             if (in.a && !was_a)
                 gt4::panel::select();
-            m_panelDir[0] = up, m_panelDir[1] = down, m_panelDir[2] = left, m_panelDir[3] = right;
+            m_panelDir[0] = m_up, m_panelDir[1] = m_down, m_panelDir[2] = m_left, m_panelDir[3] = m_right;
             m_panelHeld = true;
             gt4::quest::Pad idle;
             idle.connected = true;
@@ -361,7 +376,7 @@ public:
         // press doesn't reach the game.
         if (m_panelHeld)
         {
-            if (in.a || in.b || up || down || left || right)
+            if (in.a || in.b || m_up || m_down || m_left || m_right || lg || rg)
             {
                 gt4::quest::Pad idle;
                 idle.connected = true;
@@ -404,8 +419,10 @@ private:
     bool m_rt = false, m_lt = false, m_lg = false, m_rg = false;
     bool m_stickCombo = false;
     bool m_rs[4] = {};
+    bool m_ls[4] = {};  // left stick directions (VR menu only)
     bool m_panelA = false, m_panelB = false, m_panelHeld = false;
     bool m_panelDir[4] = {};
+    bool m_panelGrip[2] = {};
     static constexpr double kMenuHoldS = 0.6;
     double m_menuDown = -1.0, m_startUntil = 0.0;
     bool m_menuLong = false;
@@ -969,8 +986,9 @@ private:
         }
         // Online lobby on Multi-LAN Race (owner 2026-11-05): GT4 asks for an address (DHCP) when
         // Arcade -> Multi-LAN Race connects, so the first request after a minute without one opens
-        // the lobby on its Races tab (create / join a race there while the game waits).
-        if (gt4::panel::available())
+        // the lobby on its Races tab (create / join a race there while the game waits). GT4 Online
+        // only: Spec II's VR menu has no lobby.
+        if (GT4VR_ONLINE && gt4::panel::available())
         {
             const uint64_t dhcp = ps2::net::dhcp_requests();
             if (dhcp != m_dhcp_seen)
@@ -1001,14 +1019,16 @@ private:
         if (!vr_allowed && vr_prop != 1 && !gt4::quest::curvedView())
             gt4::quest::setCurvedView(true);
         const bool curved = ReadFloatProperty("debug.gt4vr.curved", 0.0f) != 0.0f || gt4::quest::curvedView();
-        const float dist = std::max(0.3f, ReadFloatProperty("debug.gt4vr.dist", kScreenDistanceM));
+        // Distance / size: VR menu > Settings (gt4_settings.h); the debug properties still override.
+        const gt4::settings::Values player = gt4::settings::get();
+        const float dist = std::max(0.3f, ReadFloatProperty("debug.gt4vr.dist", player.screen_distance_m));
         // Width: the fixed kScreenWidthM, so moving the screen away keeps its size (owner: farther =
         // the whole HUD in view). debug.gt4vr.screenfov (deg) sizes it by angle instead (chord width;
         // the curved layer turns it back into exactly that angle); debug.gt4vr.screenw overrides both.
         const float screen_fov = ReadFloatProperty("debug.gt4vr.screenfov", 0.0f);
         const float sized = screen_fov > 0.0f
                                 ? 2.0f * dist * std::tan(std::clamp(screen_fov, 20.0f, 170.0f) * 0.5f * 0.0174533f)
-                                : kScreenWidthM;
+                                : kScreenWidthM * static_cast<float>(player.screen_size_pct) / 100.0f;
         const float width = std::max(0.2f, ReadFloatProperty("debug.gt4vr.screenw", sized));
         const float screen_vertical_m = std::clamp(ReadFloatProperty("debug.gt4vr.screenu", kScreenVerticalOffsetM), -2.0f, 1.0f);
         if (screen_vertical_m != m_screen_vertical_offset_m)
@@ -1535,7 +1555,9 @@ private:
         const float show_depth = ReadFloatProperty("debug.gt4vr.showdepth", 0.0f);
         const float near_m = std::clamp(ReadFloatProperty("debug.gt4vr.nearm", kNearM), 0.2f, 20.0f);
         const float upm = std::clamp(ReadFloatProperty("debug.gt4vr.upm", kUnitsPerMeter), 1.0f, 10000.0f);
-        const float sscale = std::clamp(ReadFloatProperty("debug.gt4vr.stereoscale", 1.0f), 0.0f, 5.0f);
+        // 3D strength: VR menu > Settings (gt4_settings.h, 100 % = true scale); debug.gt4vr.stereoscale overrides.
+        const float player_scale = static_cast<float>(gt4::settings::get().stereo_pct) / 100.0f;
+        const float sscale = std::clamp(ReadFloatProperty("debug.gt4vr.stereoscale", player_scale), 0.0f, 5.0f);
         if (near_m != m_near_m || upm != m_units_per_m || sscale != m_stereo_scale)
         {
             m_near_m = near_m;

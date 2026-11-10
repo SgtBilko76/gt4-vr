@@ -31,7 +31,7 @@
 
     <application
         android:label="${appLabel}"
-        android:icon="@mipmap/ic_launcher"
+        android:icon="@mipmap/${appIcon}"
         android:allowBackup="false"
         android:hasCode="true"
         android:extractNativeLibs="true"
