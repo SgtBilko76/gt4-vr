@@ -85,21 +85,6 @@ bool get_json(const std::string &path, json::Value &out) {
     return true;
 }
 
-std::string url_encode(const std::string &s) {
-    static const char *hex = "0123456789ABCDEF";
-    std::string o;
-    for (unsigned char c : s) {
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.')
-            o += static_cast<char>(c);
-        else {
-            o += '%';
-            o += hex[c >> 4];
-            o += hex[c & 15];
-        }
-    }
-    return o;
-}
-
 // ------------------------------------------------------------------ data
 
 std::string str(const json::Value *v) { return v && v->type == json::Value::String ? v->str : std::string(); }
@@ -110,8 +95,7 @@ long long num(const json::Value *v, long long fallback = -1) {
 struct Data {
     bool reached = false;  // last fetch got through
     std::time_t fetched = 0;
-    json::Value live, leaderboard, tracks, track, rooms;
-    std::string track_name;  // the track `track` belongs to
+    json::Value rooms;
 };
 
 std::mutex g_mutex;
@@ -119,61 +103,36 @@ std::condition_variable g_wake;
 Data g_data;
 std::atomic<bool> g_open{false}, g_available{false}, g_dirty{true}, g_refresh{false};
 ContextFn g_context = nullptr;
-int g_tab = 0;
-int g_scroll[8] = {};
-int g_sel = 0;  // selected row on the Races tab
-
-// No "Recent" tab (owner 2026-11-05: too much data); the server no longer serves api/recent.
-enum Tab { kRaces, kLive, kLeaderboard, kTrack, kTabCount };
-const char *const kTabNames[kTabCount] = {"Races", "Live", "Leaderboard", "Track"};
+// One page: the lobby browser (owner 2026-11-10: no leaderboard / live list / track records in the
+// game any more, no website either - only the open races and how to connect).
+int g_scroll = 0;
+int g_sel = 0;  // selected row
 
 void fetch_loop() {
-    std::chrono::steady_clock::time_point last_all{};
     for (;;) {
         {
             std::unique_lock<std::mutex> lock(g_mutex);
             g_wake.wait_for(lock, std::chrono::seconds(5), [] { return g_open.load(); });
         }
         if (!g_open.load()) continue;
-        const Context ctx = g_context ? g_context() : Context{};
         Data d;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             d = g_data;
         }
-        const auto now = std::chrono::steady_clock::now();
-        bool reached = get_json("/api/live", d.live);
-        if (reached) get_json("/api/rooms", d.rooms);
-        if (reached && (now - last_all > std::chrono::seconds(15) || d.leaderboard.type == json::Value::Null)) {
-            reached = get_json("/api/leaderboard", d.leaderboard) && get_json("/api/tracks", d.tracks);
-            if (reached) last_all = now;
-        }
-        // Track tab: the track being driven, else the track with the newest record.
-        std::string track = ctx.track;
-        if (track.empty() && d.tracks.type == json::Value::Array) {
-            std::string newest;
-            for (const json::Value &t : d.tracks.arr) {
-                const json::Value *rec = t.get("record");
-                const std::string date = rec ? str(rec->get("date")) : std::string();
-                if (date > newest) newest = date, track = str(t.get("track"));
-            }
-        }
-        if (reached && !track.empty()) {
-            if (get_json("/api/track?name=" + url_encode(track), d.track)) d.track_name = track;
-        }
-        d.reached = reached;
+        d.reached = get_json("/api/rooms", d.rooms);
         d.fetched = std::time(nullptr);
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             g_data = std::move(d);
         }
         g_dirty = true;
-        // While open: Live every 5 s (the wait above), the rest every 15 s.
+        // While open: the race list every 5 s, at once (after the room's first heartbeat) after A.
         std::unique_lock<std::mutex> lock(g_mutex);
         g_wake.wait_for(lock, std::chrono::seconds(5), [] { return !g_open.load() || g_refresh.load(); });
         if (g_refresh.exchange(false)) {
             lock.unlock();
-            std::this_thread::sleep_for(std::chrono::milliseconds(2500));  // the room's first heartbeat
+            std::this_thread::sleep_for(std::chrono::milliseconds(2500));
         }
     }
 }
@@ -281,38 +240,6 @@ struct Canvas {
     }
 };
 
-std::string lap_time(long long ms) {
-    if (ms < 0) return "-";
-    char b[32];
-    std::snprintf(b, sizeof b, "%lld'%02lld.%03lld", ms / 60000, ms / 1000 % 60, ms % 1000);
-    return b;
-}
-
-std::string mode_name(const std::string &m) {
-    if (m == "arcade") return "Arcade";
-    if (m == "timetrial") return "Time Trial";
-    if (m == "gtmode") return "GT Mode";
-    if (m == "lan") return "LAN";
-    if (m == "license") return "License";
-    if (m == "mission") return "Mission";
-    return m.empty() ? "" : "Other";
-}
-
-// "2026-11-02T10:47:46Z" -> local "02.11. 11:47"
-std::string short_date(const std::string &iso) {
-    std::tm t{};
-    if (std::sscanf(iso.c_str(), "%d-%d-%dT%d:%d:%d", &t.tm_year, &t.tm_mon, &t.tm_mday, &t.tm_hour, &t.tm_min, &t.tm_sec) != 6)
-        return iso;
-    t.tm_year -= 1900;
-    t.tm_mon -= 1;
-    const std::time_t utc = timegm(&t);
-    std::tm local{};
-    localtime_r(&utc, &local);
-    char b[32];
-    std::strftime(b, sizeof b, "%d.%m. %H:%M", &local);
-    return b;
-}
-
 struct Column {
     const char *title;
     int x, w, align;
@@ -363,7 +290,7 @@ void table(Canvas &cv, const std::vector<Column> &cols, const std::vector<std::v
     }
 }
 
-// The Races tab: row 0 creates (or leaves) a race, the others are the open races to join.
+// The race list: row 0 creates (or leaves) a race, the others are the open races to join.
 struct RaceRow {
     std::vector<std::string> cells;
     std::string join;  // room id to join; "" for row 0
@@ -409,7 +336,7 @@ void draw(std::vector<std::uint8_t> &px, const Data &d, const Context &ctx) {
     cv.rect(0, 0, kWidth, 96, kHeader);
     cv.rect(0, 96, kWidth, 4, kAccent);
     cv.text("GT4 ONLINE", 40, 64, 44, kText);
-    cv.text("Leaderboard", 330, 62, 24, kDim);
+    cv.text("Lobby", 330, 62, 24, kDim);
     const std::string who = ctx.player.empty() ? "not signed in (start a race)" : ctx.player;
     cv.text(who, kWidth - 440, 46, 28, ctx.player.empty() ? kDim : kGold, 400, 1);
     char status[96];
@@ -427,107 +354,53 @@ void draw(std::vector<std::uint8_t> &px, const Data &d, const Context &ctx) {
         }
     }
     cv.text(status, kWidth - 440, 80, 20, d.fetched && !d.reached ? kAccent : kGreen, 400, 1);
-    // Tabs
-    const int tab_w = (kWidth - 80) / kTabCount;
-    for (int i = 0; i < kTabCount; ++i) {
-        const int x = 40 + i * tab_w;
-        cv.text(kTabNames[i], x, 150, 30, i == g_tab ? kText : kDim, tab_w, 2);
-        if (i == g_tab) cv.rect(x + tab_w / 4, 162, tab_w / 2, 4, kAccent);
+    // How to connect: the three steps, the current one highlighted, then the race list.
+    const gt4::results::Room cur = gt4::results::room();
+    const std::vector<RaceRow> rr = race_rows(d, cur);
+    g_sel = std::clamp(g_sel, 0, static_cast<int>(rr.size()) - 1);
+    std::string host = "?";
+    for (const RaceRow &row : rr)
+        if (row.join == cur.id && !row.cells.empty()) host = row.cells[0];
+    const int step = cur.id.empty() ? 1 : 2;
+    cv.text("How to race online", 40, 146, 30, kText);
+    struct Step {
+        std::string text;
+        int n;
+    };
+    const Step steps[] = {
+        {"1   Choose  \"+ Create a race\"  to host one, or pick an open race below and press A to join it.", 1},
+        {cur.id.empty() ? std::string("2   In GT4: Options > LAN Settings.  Host: Yes and No. of Players = seats (if you created the race),"
+                                      "  Host: No (if you joined).")
+         : cur.host     ? "2   You HOST race " + cur.id + ".  In GT4: Options > LAN Settings > Host: Yes, No. of Players = seats."
+                        : "2   You joined race " + cur.id + " (host: " + host + ").  In GT4: Options > LAN Settings > Host: No.",
+         2},
+        {cur.id.empty() ? std::string("3   Then Arcade > Multi-LAN Race > Connect. The race starts when all of the host's seats are taken.")
+         : cur.host     ? std::string("3   Then Arcade > Multi-LAN Race > Connect. The race starts when all seats are taken.")
+                        : std::string("3   Then Arcade > Multi-LAN Race > Connect and wait for the host to start the race."),
+         2},
+    };
+    for (int i = 0; i < 3; ++i) {
+        const Color c = steps[i].n == step ? (cur.id.empty() ? kText : cur.host ? kGreen : kGold) : kDim;
+        cv.text(steps[i].text, 56, 186 + i * 32, 23, c, kWidth - 110);
     }
-
-    const auto own = [&ctx](const std::string &player) { return !ctx.player.empty() && player == ctx.player; };
+    cv.text(cur.id.empty() ? "Without a race, Multi-LAN Race connects you with everyone in the open lobby."
+                           : "Leave the race (first row) to go back to the open lobby.",
+            56, 186 + 3 * 32, 21, kDim, kWidth - 110);
     std::vector<std::vector<std::string>> rows;
     std::vector<bool> mine;
-    switch (g_tab) {
-    case kRaces: {
-        const gt4::results::Room cur = gt4::results::room();
-        const std::vector<RaceRow> rr = race_rows(d, cur);
-        g_sel = std::clamp(g_sel, 0, static_cast<int>(rr.size()) - 1);
-        for (const RaceRow &row : rr) {
-            rows.push_back(row.cells);
-            mine.push_back(row.own);
-        }
-        if (cur.id.empty()) {
-            cv.text("You are in the open lobby: Multi-LAN Race finds everyone who is not in a race.", 40, 192, 22, kDim, kWidth - 80);
-            cv.text("Create a race, or pick one below and press A to join it. Ping = round trip to the race's host.", 40, 218,
-                    22, kDim, kWidth - 80);
-        } else if (cur.host) {
-            cv.text("You are the HOST of race " + cur.id + ". In GT4: Options > LAN Settings > Host: Yes, No. of Players = seats,",
-                    40, 192, 22, kGreen, kWidth - 80);
-            cv.text("then Arcade > Multi-LAN Race > Connect. The race starts when all seats are taken.", 40, 218, 22, kGreen,
-                    kWidth - 80);
-        } else {
-            // The joined race's host, from the room list.
-            std::string host = "?";
-            for (const RaceRow &row : rr)
-                if (row.join == cur.id && !row.cells.empty()) host = row.cells[0];
-            cv.text("You joined race " + cur.id + " - HOST: " + host + ". In GT4: Options > LAN Settings > Host: No,", 40, 192,
-                    22, kGold, kWidth - 80);
-            cv.text("then Arcade > Multi-LAN Race > Connect and wait for the host to start.", 40, 218, 22, kGold, kWidth - 80);
-        }
-        constexpr int kRacesTop = kTableTop + 34;
-        table(cv, {{"Host", 50, 170, 0}, {"Race", 230, 110, 0}, {"Track", 350, 290, 0}, {"Players", 650, 100, 0},
-                   {"Who", 760, 220, 0}, {"Ping", 990, 110, 1}, {"Status", 1110, 130, 1}},
-              rows, mine, g_scroll[kRaces], "", g_sel, kRacesTop, kGreen);
-        if (rr.size() == 1)
-            cv.text("No open races right now", 40, kRacesTop + kRowH + 60, 28, kDim, kWidth - 80, 2);
-        break;
+    for (const RaceRow &row : rr) {
+        rows.push_back(row.cells);
+        mine.push_back(row.own);
     }
-    case kLive: {
-        const json::Value *devs = d.live.get("devices");
-        if (devs && devs->type == json::Value::Array)
-            for (const json::Value &v : devs->arr) {
-                const std::string state = str(v.get("state"));
-                std::string where = state == "race" ? "racing" : state == "lobby" ? "in the LAN lobby" : "in the menus";
-                const long long lap = num(v.get("lap")), laps = num(v.get("laps"));
-                std::string lapstr = lap > 0 ? "lap " + std::to_string(lap) + (laps > 0 ? "/" + std::to_string(laps) : "") : "";
-                rows.push_back({str(v.get("player")), where, mode_name(str(v.get("mode"))), str(v.get("track")),
-                                str(v.get("car")), lapstr});
-                mine.push_back(own(str(v.get("player"))));
-            }
-        table(cv, {{"Player", 50, 190, 0}, {"Status", 250, 190, 0}, {"Mode", 450, 130, 0}, {"Track", 590, 250, 0},
-                   {"Car", 850, 300, 0}, {"Lap", 1160, 80, 1}},
-              rows, mine, g_scroll[kLive], "No one is racing right now");
-        break;
-    }
-    case kLeaderboard: {
-        const json::Value *players = d.leaderboard.get("players");
-        if (players && players->type == json::Value::Array)
-            for (const json::Value &v : players->arr) {
-                rows.push_back({std::to_string(num(v.get("rank"))), str(v.get("player")),
-                                std::to_string(num(v.get("track_records"), 0)), std::to_string(num(v.get("car_records"), 0)),
-                                std::to_string(num(v.get("laps"), 0))});
-                mine.push_back(own(str(v.get("player"))));
-            }
-        table(cv, {{"#", 50, 60, 0}, {"Player", 120, 420, 0}, {"Track records", 560, 220, 1}, {"Car records", 800, 200, 1},
-                   {"Laps", 1020, 200, 1}},
-              rows, mine, g_scroll[kLeaderboard], "No laps yet - drive one!");
-        break;
-    }
-    case kTrack: {
-        const json::Value *entries = d.track.get("entries");
-        if (!d.track_name.empty() && entries && entries->type == json::Value::Array) {
-            for (const json::Value &v : entries->arr) {
-                rows.push_back({std::to_string(num(v.get("rank"))), lap_time(num(v.get("time_ms"))), str(v.get("player")),
-                                str(v.get("car")), mode_name(str(v.get("mode"))), short_date(str(v.get("date")))});
-                mine.push_back(own(str(v.get("player"))));
-            }
-        }
-        table(cv, {{"#", 50, 50, 0}, {"Time", 110, 150, 0}, {"Player", 280, 200, 0}, {"Car", 490, 420, 0},
-                   {"Mode", 920, 130, 0}, {"Date", 1060, 180, 1}},
-              rows, mine, g_scroll[kTrack], "No laps on this track yet");
-        break;
-    }
-    }
-    // Track tab title above the table
-    if (g_tab == kTrack && !d.track_name.empty())
-        cv.text(d.track_name + (ctx.track == d.track_name ? "  ·  the track you are on" : "  ·  latest lap's track"), 40,
-                kTableTop - 40, 24, kGold, kWidth - 80);
+    constexpr int kRacesTop = 368;
+    table(cv, {{"Host", 50, 170, 0}, {"Race", 230, 110, 0}, {"Track", 350, 290, 0}, {"Players", 650, 100, 0},
+               {"Who", 760, 220, 0}, {"Ping", 990, 110, 1}, {"Status", 1110, 130, 1}},
+          rows, mine, g_scroll, "", g_sel, kRacesTop, kGreen);
+    if (rr.size() == 1) cv.text("No open races right now", 40, kRacesTop + kRowH + 60, 28, kDim, kWidth - 80, 2);
     // Footer
     cv.rect(0, kHeight - 56, kWidth, 56, kHeader);
-    cv.text(g_tab == kRaces ? "Right stick  left/right: tab   up/down: choose     A: select     B or both stick clicks: close"
-                            : "Right stick  left/right: tab   up/down: scroll        B or both stick clicks: close",
-            40, kHeight - 20, 22, kDim, kWidth - 80, 2);
+    cv.text("Right stick  up/down: choose     A: select     B or both stick clicks: close", 40, kHeight - 20, 22, kDim,
+            kWidth - 80, 2);
 }
 
 }
@@ -569,13 +442,9 @@ void toggle() { setOpen(!g_open.load()); }
 
 void input(int dx, int dy) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (dx) {
-        g_tab = (g_tab + dx + kTabCount) % kTabCount;
-        g_dirty = true;
-    }
+    (void)dx;  // one page: no tabs
     if (dy) {
-        if (g_tab == kRaces) g_sel = std::max(0, g_sel + dy);
-        else g_scroll[g_tab] = std::max(0, g_scroll[g_tab] + dy);
+        g_sel = std::max(0, g_sel + dy);
         g_dirty = true;
     }
 }
@@ -585,7 +454,6 @@ void select() {
     bool row0 = false;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (g_tab != kRaces) return;
         const std::vector<RaceRow> rr = race_rows(g_data, gt4::results::room());
         if (g_sel <= 0 || g_sel >= static_cast<int>(rr.size())) row0 = true;
         else join = rr[g_sel].join;
@@ -603,11 +471,7 @@ void select() {
     g_wake.notify_all();
 }
 
-void setTab(int tab) {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    g_tab = std::clamp(tab, 0, kTabCount - 1);
-    g_dirty = true;
-}
+void setTab(int) {}  // one page
 
 bool renderBadge(std::vector<std::uint8_t> &rgba) {
     if (!g_available.load()) return false;

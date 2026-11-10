@@ -1,8 +1,9 @@
 #pragma once
 
-// GT4 Online (retail SCUS-97328) lap results for the leaderboard: probes on the race conductor's
-// line-crossing functions read lap times, and a background thread sends them to the gt4-results
-// service (gt4.portroyale.online).
+// GT4 Online (retail SCUS-97328) race rooms and lap times: probes on the race conductor's
+// line-crossing functions read lap times into laps.txt on the headset (not sent anywhere since
+// 2026-11-10: no leaderboard). While in a race room, a status heartbeat goes to the gt4-results
+// service so the room shows up in the online menu's lobby browser.
 //
 // Environment (the Quest app sets defaults, config.txt overrides):
 //   PS2_RESULTS_SERVER  host[:port] of gt4-results (port 27314); unset or "off" = nothing is sent
