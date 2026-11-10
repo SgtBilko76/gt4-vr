@@ -37,6 +37,7 @@ namespace {
 vuops::FlagPipe g_fl;  // the flag pipe the translated programs use (Layout::flags)
 std::uintptr_t g_base = 0;
 bool g_base_ok = false;
+std::uint64_t kParamOffset[2] = {};  // regs(1) and g_vu1_mem relative to g_base (init_base)
 
 template <typename T>
 T *at(std::uint32_t offset) { return reinterpret_cast<T *>(g_base + offset); }
@@ -108,11 +109,13 @@ std::uint32_t *place(const std::vector<std::uint32_t> &code) {
 enum Type : std::uint8_t { I32, I64, F64, V128 };
 enum Cond : std::uint32_t { EQ = 0, NE = 1, HS = 2, LO = 3, HI = 8, LS = 9, GE = 10, LT = 11, GT = 12, LE = 13 };
 constexpr unsigned SP = 31, ZR = 31, X16 = 16, X17 = 17, BASE = 19;
-constexpr unsigned kIntRegs[] = {9, 10, 11, 12, 13, 14, 15, 2, 3, 4, 5, 6, 7, 8};
-constexpr unsigned kMaxDepth = 14;
-// Register locals (Compiler::allocate_locals). v0..v2 are scratch, v16..v31 the operand stack.
-constexpr unsigned kIntLocalRegs[] = {20, 21, 22, 23, 24, 25, 26, 27, 28};
-constexpr unsigned kVecLocalRegs[] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+constexpr unsigned kIntRegs[] = {9, 10, 11, 12, 13, 14, 15, 2};
+constexpr unsigned kMaxDepth = 8;  // the translator's expressions need <= 7
+// Register locals (Compiler::allocate_locals). v0..v2 are scratch, v16..v23 the operand stack.
+// x20..x28 are callee-saved; x3..x8 and every vector register are saved around import calls.
+constexpr unsigned kIntLocalRegs[] = {20, 21, 22, 23, 24, 25, 26, 27, 28, 3, 4, 5, 6, 7, 8};
+constexpr unsigned kVecLocalRegs[] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31};
+bool caller_saved_int(unsigned r) { return r >= 3 && r <= 8; }
 
 struct Reader {
     const std::uint8_t *p, *end;
@@ -246,7 +249,7 @@ private:
     // import calls), the most used vector locals in v3..v15 (saved to their frame slots around calls;
     // d8..d15 are saved in the prologue as the ABI requires). The rest stay in the frame.
     void allocate_locals() {
-        std::vector<std::uint32_t> uses(local_type_.size(), 0);
+        std::vector<std::uint32_t> uses(local_type_.size(), 0), writes(local_type_.size(), 0);
         Reader r = rd_;
         unsigned depth = 0;
         bool done = false;
@@ -260,12 +263,18 @@ private:
                 break;
             case 0x20: case 0x21: case 0x22: {
                 const std::uint32_t l = r.u32();
-                if (l < uses.size()) ++uses[l];
+                if (l < uses.size()) {
+                    ++uses[l];
+                    if (op != 0x20) ++writes[l];
+                }
                 break;
             }
             default: skip_immediates_in(r, op); break;
             }
         }
+        // The params are always the VU1 registers and data memory (vu_micro.cpp calls programs with
+        // regs(1) / g_vu1_mem; the prologue checks it): never written, they read as constants.
+        for (unsigned p = 0; p < 2 && p < uses.size(); ++p) const_param_[p] = !writes[p];
         std::vector<std::uint32_t> order(local_type_.size());
         for (std::uint32_t i = 0; i < order.size(); ++i) order[i] = i;
         std::stable_sort(order.begin(), order.end(), [&](std::uint32_t a, std::uint32_t b) { return uses[a] > uses[b]; });
@@ -273,8 +282,14 @@ private:
         unsigned next_int = 0, next_vec = 0;
         for (std::uint32_t l : order) {
             if (!uses[l]) break;
+            if (local_type_[l] == I32 || local_type_[l] == I64) ++locals_used_int_;
+            else ++locals_used_vec_;
             if (local_type_[l] == I32 || local_type_[l] == I64) {
-                if (next_int < sizeof kIntLocalRegs / sizeof kIntLocalRegs[0]) local_reg_[l] = static_cast<int>(kIntLocalRegs[next_int++]);
+                if (l < 2 && !writes[l]) continue;  // the (r, mem) params: constants, see const_param_
+                if (next_int < sizeof kIntLocalRegs / sizeof kIntLocalRegs[0]) {
+                    local_reg_[l] = static_cast<int>(kIntLocalRegs[next_int++]);
+                    if (caller_saved_int(static_cast<unsigned>(local_reg_[l]))) scratch_int_locals_.push_back(l);
+                }
             } else if (next_vec < sizeof kVecLocalRegs / sizeof kVecLocalRegs[0]) {
                 local_reg_[l] = static_cast<int>(kVecLocalRegs[next_vec++]);
                 vec_locals_.push_back(l);
@@ -285,9 +300,11 @@ private:
     // Vector register locals are caller-saved: store them before an import call, reload after.
     void save_vec_locals() {
         for (std::uint32_t l : vec_locals_) frame_st(V128, static_cast<unsigned>(local_reg_[l]), local_off_[l]);
+        for (std::uint32_t l : scratch_int_locals_) frame_st(I64, static_cast<unsigned>(local_reg_[l]), local_off_[l]);
     }
     void load_vec_locals() {
         for (std::uint32_t l : vec_locals_) frame_ld(V128, static_cast<unsigned>(local_reg_[l]), local_off_[l]);
+        for (std::uint32_t l : scratch_int_locals_) frame_ld(I64, static_cast<unsigned>(local_reg_[l]), local_off_[l]);
     }
 
     bool fail(const char *why) {
@@ -375,6 +392,14 @@ private:
         w(0xCB000000u | BASE << 16 | 0 << 5 | 0);  // sub x0, x0, x19
         w(0xCB000000u | BASE << 16 | 1 << 5 | 1);  // sub x1, x1, x19
         for (unsigned p = 0; p < 2; ++p) {
+            if (const_param_[p]) {  // must be the expected object: else trap (brk) instead of wrong data
+                movx(X17, kParamOffset[p]);
+                w(0xEB00001Fu | X17 << 16 | p << 5);  // cmp xp, x17
+                w(0x54000040u | NE);                  // b.ne +2
+                w(0x14000002u);                       // b +2
+                w(0xD4200000u);                       // brk #0
+                continue;
+            }
             if (local_reg_[p] >= 0) w(0x2A0003E0u | p << 16 | static_cast<unsigned>(local_reg_[p]));  // mov w, wp
             else frame_st(I32, p, local_off_[p]);
         }
@@ -401,6 +426,7 @@ private:
     bool push(Type t) {
         if (stack_.size() >= kMaxDepth) return fail("operand stack too deep");
         stack_.push_back(t);
+        max_depth_ = std::max(max_depth_, stack_.size());
         return true;
     }
     std::size_t top() const { return stack_.size() - 1; }
@@ -1094,6 +1120,13 @@ private:
             if (l >= local_type_.size()) return fail("local index");
             const int lr = local_reg_[l];
             const Type t = local_type_[l];
+            if (op == 0x20 && l < 2 && const_param_[l]) {
+                r.u32();
+                if (!push(t)) return false;
+                sync_lazy();
+                lz_[top()] = Lazy{kImm, 0, kParamOffset[l]};
+                return true;
+            }
             if (op == 0x20) {
                 if (lr < 0) break;  // frame local: slot load
                 r.u32();
@@ -1593,6 +1626,8 @@ private:
     std::vector<std::uint32_t> local_off_;
     std::vector<int> local_reg_;            // register of a local, -1 = in the frame
     std::vector<std::uint32_t> vec_locals_;  // locals held in vector registers
+    std::vector<std::uint32_t> scratch_int_locals_;  // integer locals in caller-saved registers
+    bool const_param_[2] = {};
     std::uint32_t locals_size_ = 0, spill_off_ = 0, args_off_ = 0, frame_ = 0;
     std::vector<std::uint32_t> code_;
     std::vector<std::pair<std::size_t, std::array<std::uint32_t, 4>>> pool_refs_;
@@ -1600,6 +1635,10 @@ private:
     std::vector<Ctrl> ctrl_;
     bool dead_ = false;
     bool range_error_ = false;
+public:
+    std::size_t max_depth_ = 0;
+    std::size_t locals_used_int_ = 0, locals_used_vec_ = 0;
+private:
     unsigned dead_depth_ = 0;
     const char *error_ = "";
 };
@@ -1613,6 +1652,8 @@ bool init_base() {
     const std::uintptr_t low = std::min({a, b, c}) & ~std::uintptr_t{0xFFF};
     const std::uintptr_t high = std::max({a + sizeof(Vu0Regs), b + sizeof g_vu1_mem, c + sizeof g_fl});
     g_base = low;
+    kParamOffset[0] = a - low;
+    kParamOffset[1] = b - low;
     g_base_ok = high - low < (std::uintptr_t{1} << 31);
     std::fprintf(stderr, "[vu-jit] ARM64 VU1 JIT %s (span %zu KB)\n", g_base_ok ? "on" : "off: data too far apart",
                  static_cast<std::size_t>((high - low) >> 10));
@@ -1641,6 +1682,8 @@ ProgramFn compile_a64(const std::uint8_t *code, std::uint32_t entry) {
     std::uint32_t *fn = place(words);
     // PS2_VU_JIT_DUMP=<dir>: raw ARM64 code of every compiled program (vu1_<entry>_<address>.bin).
     if (const char *dir = std::getenv("PS2_VU_JIT_DUMP")) {
+        std::fprintf(stderr, "[vu-jit] %04X: %zu words, stack depth %zu, locals used %zu int / %zu vec\n", entry, words.size(),
+                     c.max_depth_, c.locals_used_int_, c.locals_used_vec_);
         char name[512];
         std::snprintf(name, sizeof name, "%s/vu1_%04X_%llx.bin", dir, entry, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(fn)));
         if (std::FILE *f = std::fopen(name, "wb")) {

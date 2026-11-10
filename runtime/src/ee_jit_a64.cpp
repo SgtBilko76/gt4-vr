@@ -43,7 +43,24 @@ void ee_h_st16(std::uint32_t a, std::uint64_t v) { st16(a, static_cast<std::uint
 void ee_h_st32(std::uint32_t a, std::uint64_t v) { st32(a, static_cast<std::uint32_t>(v)); }
 void ee_h_st64(std::uint32_t a, std::uint64_t v) { st64(a, v); }
 void ee_h_st128(std::uint32_t a, const Reg128 *v) { st128(a, *v); }
-std::uint64_t ee_h_simple(Cpu *c, const Insn *i) { return simple(*c, *i) ? 1u : 0u; }
+// PS2_EE_JIT_STATS=1: count the instructions that take the simple() path, by opcode (printed every
+// 2^20 calls) - shows which ops are worth translating natively.
+std::uint64_t g_simple_count[1024];
+std::uint64_t g_simple_total = 0;
+std::uint64_t ee_h_simple(Cpu *c, const Insn *i) {
+    static const bool stats = std::getenv("PS2_EE_JIT_STATS") != nullptr;
+    if (stats) {
+        ++g_simple_count[static_cast<unsigned>(i->op) & 1023u];
+        if ((++g_simple_total & ((1u << 20) - 1)) == 0) {
+            std::fprintf(stderr, "[ee-jit] simple() calls %llu:", static_cast<unsigned long long>(g_simple_total));
+            for (unsigned k = 0; k < 1024; ++k)
+                if (g_simple_count[k] * 200 >= g_simple_total)
+                    std::fprintf(stderr, " %s:%llu", recomp::name(static_cast<recomp::Op>(k)), static_cast<unsigned long long>(g_simple_count[k]));
+            std::fprintf(stderr, "\n");
+        }
+    }
+    return simple(*c, *i) ? 1u : 0u;
+}
 std::uint64_t ee_h_cond(Cpu *c, const Insn *i) { return condition(*c, *i) ? 1u : 0u; }
 void ee_h_stop(Cpu *c, std::uint32_t pc, const char *what) { stop(*c, pc, what); }
 void ee_h_cache() { code_may_change(); }
