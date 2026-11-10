@@ -12,6 +12,7 @@
 // disc.iso and memcard.ps2 are also taken from /sdcard/GT4 (the first GT4 Quest build) when absent.
 // config.txt: KEY=VALUE lines; PS2_* and RRV_* keys become environment variables (runtime and
 // PCSX2 GS switches), the rest are host settings.
+#include <dirent.h>
 #include "quest_host.h"
 #include "quest_xr.h"
 
@@ -974,8 +975,52 @@ bool start_game(const fs::path &files) {
     return true;
 }
 
+// CPU use per thread since the last call (from /proc/self/task/<tid>/stat utime + stime): the busiest ones,
+// so a [perf] line shows which thread holds the frame rate (EE, VU1, GS, XR).
+std::string thread_cpu(double seconds) {
+    static std::map<int, unsigned long long> prev;
+    std::map<int, unsigned long long> now;
+    std::vector<std::pair<double, std::string>> busy;
+    const double hz = static_cast<double>(sysconf(_SC_CLK_TCK));
+    if (DIR *dir = opendir("/proc/self/task")) {
+        while (const dirent *e = readdir(dir)) {
+            if (e->d_name[0] == '.') continue;
+            const int tid = std::atoi(e->d_name);
+            std::ifstream in("/proc/self/task/" + std::string(e->d_name) + "/stat");
+            std::string line;
+            if (!std::getline(in, line)) continue;
+            const auto open = line.find('('), close = line.rfind(')');
+            if (open == std::string::npos || close == std::string::npos) continue;
+            std::istringstream rest(line.substr(close + 2));
+            std::string field;
+            unsigned long long utime = 0, stime = 0;
+            for (int k = 3; k <= 15 && rest >> field; ++k) {
+                if (k == 14) utime = std::strtoull(field.c_str(), nullptr, 10);
+                if (k == 15) stime = std::strtoull(field.c_str(), nullptr, 10);
+            }
+            now[tid] = utime + stime;
+            const auto p = prev.find(tid);
+            if (p != prev.end() && seconds > 0) {
+                const double pct = 100.0 * static_cast<double>(now[tid] - p->second) / hz / seconds;
+                if (pct >= 10.0) busy.emplace_back(pct, line.substr(open + 1, close - open - 1));
+            }
+        }
+        closedir(dir);
+    }
+    prev = std::move(now);
+    std::sort(busy.begin(), busy.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+    std::string out;
+    for (std::size_t k = 0; k < busy.size() && k < 6; ++k) {
+        char part[64];
+        std::snprintf(part, sizeof part, "%s%s %.0f%%", k ? ", " : "", busy[k].second.c_str(), busy[k].first);
+        out += part;
+    }
+    return out;
+}
+
 void perf_loop() {
     pthread_setname_np(pthread_self(), "gt4-perf");
+    thread_cpu(0);
     std::uint64_t last_frames = ps2::frames_run(), last_fields = ps2::gs::bridge::fields(), last_interp = ps2::vu1_interpreted_calls();
     auto last = std::chrono::steady_clock::now();
     while (!gt4::quest::closeRequested()) {
@@ -984,10 +1029,10 @@ void perf_loop() {
         const double s = std::chrono::duration<double>(now - last).count();
         const std::uint64_t frames = ps2::frames_run(), fields = ps2::gs::bridge::fields(), interp = ps2::vu1_interpreted_calls();
         logf("[perf] game %.1f fps, GS fields %.1f/s, audio queued %zu ms, vu1 interpreted %.0f/s | audio peak game %d played %d, "
-             "callbacks %u (%u muted), stream state %d",
+             "callbacks %u (%u muted), stream state %d | cpu %s",
              (frames - last_frames) / s, (fields - last_fields) / s, ring_queued() / 48, (interp - last_interp) / s, g_peak_in.exchange(0),
              g_peak_out.exchange(0), g_callbacks.exchange(0), g_muted_callbacks.exchange(0),
-             g_audio ? static_cast<int>(AAudioStream_getState(g_audio)) : -1);
+             g_audio ? static_cast<int>(AAudioStream_getState(g_audio)) : -1, thread_cpu(s).c_str());
         last_frames = frames;
         last_fields = fields;
         last_interp = interp;
