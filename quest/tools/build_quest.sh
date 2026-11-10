@@ -144,6 +144,8 @@ cd "$ROOT/quest/android"
 JAVA_HOME=$(ls -d "$HOME"/tools/jdk-17* | head -1) ./gradlew --no-daemon -q --offline assembleRelease -PgtAppId="$APP_ID" -PgtAppLabel="$APP_LABEL" -PgtLauncher="$LAUNCHER" \
   -PgtVersionName="${VERSION_NAME:-0.2.0-beta}" -PgtVersionCode="${VERSION_CODE:-3}"
 mkdir -p "$ROOT/build/apk"
-OUT="$ROOT/build/apk/$GAME$([ "${NOGEN:-0}" = 1 ] && echo -nogen).apk"
+SUFFIX=""
+if [ "${NOGEN:-0}" = 1 ]; then SUFFIX=-nogen; fi  # an `[ ] && echo` inside $() fails the assignment under set -e
+OUT="$ROOT/build/apk/$GAME$SUFFIX.apk"
 cp app/build/outputs/apk/release/app-release.apk "$OUT"
 ls -la app/build/outputs/apk/release/ "$OUT"
