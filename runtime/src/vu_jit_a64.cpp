@@ -39,6 +39,7 @@ std::uintptr_t g_base = 0;
 bool g_base_ok = false;
 std::uint64_t kParamOffset[2] = {};
 const bool g_regbase = [] { const char *v = std::getenv("PS2_VU_JIT_REGBASE"); return !v || std::strcmp(v, "0") != 0; }();
+const bool g_movi = [] { const char *v = std::getenv("PS2_VU_JIT_MOVI"); return !v || std::strcmp(v, "0") != 0; }();
 const bool g_retarget = [] { const char *v = std::getenv("PS2_VU_JIT_RETARGET"); return !v || std::strcmp(v, "0") != 0; }();  // regs(1) and g_vu1_mem relative to g_base (init_base)
 
 template <typename T>
@@ -334,7 +335,10 @@ private:
             if ((i & 0xBFE09C00u) == 0x0E000000u) return true;  // tbl
             if ((i & 0xFF000000u) == 0x9C000000u) return true;  // ldr q, literal
             if ((i & 0xFFC00000u) == 0x3DC00000u) return true;  // ldr q, [x, #imm]
-            if ((i & 0xFFFFFFE0u) == 0x6F00E400u) return true;  // movi v.2d, #0
+            if ((i & 0x9FF80400u) == 0x0F000400u) {  // movi / mvni / fmov (vector immediate), not orr / bic
+                const std::uint32_t cmode = (i >> 12) & 0xFu;
+                return !(cmode & 1u) || cmode == 13 || cmode == 15;
+            }
             return false;
         }
         if ((i & 0x1F800000u) == 0x11000000u) return true;                                  // add/sub imm
@@ -358,6 +362,36 @@ private:
         i = (i & ~31u) | to;
         ++retargeted_;
         return true;
+    }
+
+    // A 4 x 32-bit splat constant in one instruction (movi / mvni / fmov) when it has such a form: the
+    // clamp masks 0x7fffffff, 0x80000000, 0x00800000 and 0 were 80 % of the literal-pool loads.
+    bool splat_imm(unsigned d, std::uint32_t v) {
+        const auto modimm = [&](std::uint32_t op, std::uint32_t cmode, std::uint32_t imm8) {
+            w(0x4F000400u | op << 29 | (imm8 >> 5) << 16 | cmode << 12 | (imm8 & 31u) << 5 | d);
+        };
+        if (v == 0) {
+            w(0x6F00E400u | d);  // movi v.2d, #0
+            return true;
+        }
+        for (std::uint32_t sh = 0; sh < 4; ++sh) {
+            const std::uint32_t mask = 0xFFu << (8 * sh);
+            if (!(v & ~mask)) { modimm(0, 2 * sh, v >> (8 * sh)); return true; }     // movi .4s, #imm, lsl
+            if (!(~v & ~mask)) { modimm(1, 2 * sh, ~v >> (8 * sh)); return true; }   // mvni .4s, #imm, lsl
+        }
+        if ((v & 0xFFFF00FFu) == 0xFFu) { modimm(0, 12, (v >> 8) & 0xFFu); return true; }        // movi msl #8
+        if ((v & 0xFF00FFFFu) == 0xFFFFu) { modimm(0, 13, (v >> 16) & 0xFFu); return true; }     // movi msl #16
+        if ((~v & 0xFFFF00FFu) == 0xFFu) { modimm(1, 12, (~v >> 8) & 0xFFu); return true; }      // mvni msl #8
+        if ((~v & 0xFF00FFFFu) == 0xFFFFu) { modimm(1, 13, (~v >> 16) & 0xFFu); return true; }   // mvni msl #16
+        // fmov .4s, #imm: a:NOT(b):bbbbb:cdefgh:0{19}
+        if (!(v & 0x7FFFFu)) {
+            const std::uint32_t b = (v >> 29) & 1u, b5 = (v >> 25) & 0x1Fu;
+            if (((v >> 30) & 1u) == (b ^ 1u) && b5 == (b ? 0x1Fu : 0u)) {
+                modimm(0, 15, (v >> 31) << 7 | b << 6 | ((v >> 19) & 0x3Fu));
+                return true;
+            }
+        }
+        return false;
     }
 
     bool fail(const char *why) {
@@ -1662,6 +1696,7 @@ private:
             std::array<std::uint32_t, 4> v{};
             for (int k = 0; k < 16; ++k) v[k / 4] |= static_cast<std::uint32_t>(r.byte()) << (8 * (k % 4));
             if (!push(V128)) return false;
+            if (v[0] == v[1] && v[0] == v[2] && v[0] == v[3] && g_movi && splat_imm(vreg(top()), v[0])) return true;
             pool_refs_.push_back({code_.size(), v});
             w(0x9C000000u | vreg(top()));  // ldr q, literal (patched)
             return true;
