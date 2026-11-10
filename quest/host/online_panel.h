@@ -1,9 +1,10 @@
 #pragma once
 
-// GT4 Online's VR online menu: a panel in front of the curved screen with the lobby browser (open
-// race rooms from gt4-results' /api/rooms) and how to connect. Platform-neutral: it fetches the data
-// on its own thread and draws the panel into an RGBA image; quest_xr.cpp shows that image as a quad
-// layer and feeds the controller input. Owner 2026-11-10: lobby only, no leaderboard.
+// The VR menu: a panel in front of the curved screen. Pages: Lobby (GT4 Online only: open race rooms
+// from gt4-results' /api/rooms and how to connect) and Settings (screen distance / size, swapped
+// triggers / grips: gt4_settings.h). Platform-neutral: it fetches the lobby data on its own thread and
+// draws the panel into an RGBA image; quest_xr.cpp shows that image as a quad layer and feeds the
+// controller input. Owner 2026-11-10: lobby without leaderboard; settings in both apps.
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -20,8 +21,9 @@ struct Context {
 };
 using ContextFn = Context (*)();
 
-// server = "host[:port]" of gt4-results, font = path of a TrueType font. Starts the fetch thread.
-// Returns false (panel unavailable) when the font can't be loaded.
+// server = "host[:port]" of gt4-results ("" = no lobby page: Spec II, or reports switched off),
+// font = path of a TrueType font. Starts the fetch thread. Returns false (panel unavailable) when the
+// font can't be loaded.
 bool start(const std::string &server, const std::string &font, ContextFn context);
 bool available();
 
@@ -29,10 +31,12 @@ void setOpen(bool open);
 bool isOpen();
 void toggle();
 
-// Controller input while open: dy = -1/+1 choose the row above/below (dx is ignored: one page).
+// Controller input while open: dy = -1/+1 choose the row above/below; dx = -1/+1 changes the
+// selected setting on the Settings page.
 void input(int dx, int dy);
-void setTab(int tab);  // no-op (one page)
-// A: create / leave a race or join the selected one.
+void nextPage(int d);  // grips: Lobby <-> Settings (GT4 Online)
+void setTab(int tab);  // 0 Lobby (if there is one), else Settings
+// A: lobby - create / leave a race or join the selected one; settings - toggle / reset.
 void select();
 
 // Draws the panel into rgba (kWidth * kHeight, R G B A bytes, top row first) when something

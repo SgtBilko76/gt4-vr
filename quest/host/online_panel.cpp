@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// GT4 Online's VR online menu, see online_panel.h.
+// The VR menu (GT4 Online lobby + settings; settings only in the Spec II app), see online_panel.h.
 #include "online_panel.h"
 
 #include "gt4_json.hpp"
 #include "gt4_results.h"
+#include "gt4_settings.h"
 
 #define STB_TRUETYPE_IMPLEMENTATION
 #define STBTT_STATIC
@@ -103,10 +104,15 @@ std::condition_variable g_wake;
 Data g_data;
 std::atomic<bool> g_open{false}, g_available{false}, g_dirty{true}, g_refresh{false};
 ContextFn g_context = nullptr;
-// One page: the lobby browser (owner 2026-11-10: no leaderboard / live list / track records in the
-// game any more, no website either - only the open races and how to connect).
+// Pages: the lobby browser (GT4 Online only; owner 2026-11-10: no leaderboard / live list / track
+// records, only the open races and how to connect) and the settings (screen, controller).
+enum Page { kLobby, kSettings };
+bool g_lobby = false;  // the lobby page exists (a results server was given to start())
+int g_page = kSettings;
 int g_scroll = 0;
-int g_sel = 0;  // selected row
+int g_sel = 0;      // selected row on the lobby page
+int g_set_sel = 0;  // selected row on the settings page
+enum SettingRow { kRowDistance, kRowSize, kRowTriggers, kRowGrips, kRowReset, kSettingRows };
 
 void fetch_loop() {
     for (;;) {
@@ -329,15 +335,23 @@ std::vector<RaceRow> race_rows(const Data &d, const gt4::results::Room &cur) {
     return rows;
 }
 
-void draw(std::vector<std::uint8_t> &px, const Data &d, const Context &ctx) {
-    Canvas cv{px};
+void draw_header(Canvas &cv, const Data &d, const Context &ctx) {
     cv.rect(0, 0, kWidth, kHeight, kBg);
-    // Header
     cv.rect(0, 0, kWidth, 96, kHeader);
     cv.rect(0, 96, kWidth, 4, kAccent);
-    cv.text("GT4 ONLINE", 40, 56, 44, kText);
-    cv.text("Lobby", 330, 54, 24, kDim);
+    cv.text(g_lobby ? "GT4 ONLINE" : "GT4 SPEC II", 40, 56, 44, kText);
+    // Page tabs (one tab without the lobby).
+    const char *names[2] = {"Lobby", "Settings"};
+    int x = g_lobby ? 330 : 360;
+    for (int p = g_lobby ? 0 : 1; p < 2; ++p) {
+        const bool on = p == g_page;
+        cv.text(names[p], x, 54, 26, on ? kText : kDim);
+        const int w = static_cast<int>(cv.width(names[p], 26));
+        if (on) cv.rect(x, 62, w, 4, kAccent);
+        x += w + 36;
+    }
     cv.text("3D/VR port  by Sgt.Bilko - Portroyale.online", 42, 86, 20, kGold, 700);
+    if (!g_lobby) return;
     const std::string who = ctx.player.empty() ? "not signed in (start a race)" : ctx.player;
     cv.text(who, kWidth - 440, 46, 28, ctx.player.empty() ? kDim : kGold, 400, 1);
     char status[96];
@@ -355,6 +369,17 @@ void draw(std::vector<std::uint8_t> &px, const Data &d, const Context &ctx) {
         }
     }
     cv.text(status, kWidth - 440, 80, 20, d.fetched && !d.reached ? kAccent : kGreen, 400, 1);
+}
+
+void draw_footer(Canvas &cv, const char *keys) {
+    cv.rect(0, kHeight - 56, kWidth, 56, kHeader);
+    std::string line = keys;
+    if (g_lobby) line += "     Grips: Lobby / Settings";
+    line += "     B or Menu: close";
+    cv.text(line, 40, kHeight - 20, 22, kDim, kWidth - 80, 2);
+}
+
+void draw_lobby(Canvas &cv, const Data &d) {
     // How to connect: the three steps, the current one highlighted, then the race list.
     const gt4::results::Room cur = gt4::results::room();
     const std::vector<RaceRow> rr = race_rows(d, cur);
@@ -398,10 +423,62 @@ void draw(std::vector<std::uint8_t> &px, const Data &d, const Context &ctx) {
                {"Who", 760, 220, 0}, {"Ping", 990, 110, 1}, {"Status", 1110, 130, 1}},
           rows, mine, g_scroll, "", g_sel, kRacesTop, kGreen);
     if (rr.size() == 1) cv.text("No open races right now", 40, kRacesTop + kRowH + 60, 28, kDim, kWidth - 80, 2);
-    // Footer
-    cv.rect(0, kHeight - 56, kWidth, 56, kHeader);
-    cv.text("Right stick  up/down: choose     A: select     B or Menu: close", 40, kHeight - 20, 22, kDim,
-            kWidth - 80, 2);
+    draw_footer(cv, "Right stick  up/down: choose     A: select");
+}
+
+void draw_settings(Canvas &cv) {
+    const gt4::settings::Values v = gt4::settings::get();
+    g_set_sel = std::clamp(g_set_sel, 0, kSettingRows - 1);
+    cv.text("Settings", 40, 146, 30, kText);
+    cv.text("Changes apply at once and are saved for the next start.", 40, 180, 21, kDim, kWidth - 80);
+    struct Row {
+        const char *section, *name;
+        std::string value, hint;
+        bool arrows;
+    };
+    char dist[32], size[32];
+    std::snprintf(dist, sizeof dist, "%.2f m", v.screen_distance_m);
+    std::snprintf(size, sizeof size, "%d %%", v.screen_size_pct);
+    const Row rows[kSettingRows] = {
+        {"Screen", "Distance", dist, "How far away the screen is (the curved screen and the menus). Default 3.00 m.", true},
+        {nullptr, "Size", size, "Width of the screen, 100 % = default. Bigger = more of your view.", true},
+        {"Controller", "Throttle / brake",
+         v.swap_triggers ? "Left trigger = throttle, right = brake" : "Right trigger = throttle, left = brake",
+         "Press A or left/right to swap the triggers.", false},
+        {nullptr, "Shift up / down",
+         v.swap_grips ? "Left grip = shift up, right = down" : "Right grip = shift up, left = down",
+         "Press A or left/right to swap the grips.", false},
+        {nullptr, "Reset to defaults", "", "Press A: default screen and controller settings.", false},
+    };
+    int y = 214;
+    for (int i = 0; i < kSettingRows; ++i) {
+        const Row &r = rows[i];
+        if (r.section) {
+            y += 18;
+            cv.text(r.section, 40, y + 20, 22, kGold);
+            y += 30;
+        }
+        const bool on = i == g_set_sel;
+        if (on) {
+            cv.rect(40, y, kWidth - 80, 52, kSelected);
+            cv.rect(40, y, 6, 52, kAccent);
+        }
+        cv.text(r.name, 66, y + 35, 28, on ? kText : kDim, 420);
+        if (!r.value.empty()) {
+            const std::string shown = r.arrows ? std::string("<   ") + r.value + "   >" : r.value;
+            cv.text(shown, 500, y + 35, 28, on ? kText : kDim, kWidth - 560, 1);
+        }
+        y += 58;
+    }
+    cv.text(rows[g_set_sel].hint, 40, y + 30, 22, kDim, kWidth - 80);
+    draw_footer(cv, "Right stick  up/down: choose     left/right: change     A: select");
+}
+
+void draw(std::vector<std::uint8_t> &px, const Data &d, const Context &ctx) {
+    Canvas cv{px};
+    draw_header(cv, d, ctx);
+    if (g_page == kLobby && g_lobby) draw_lobby(cv, d);
+    else draw_settings(cv);
 }
 
 }
@@ -422,9 +499,15 @@ bool start(const std::string &server, const std::string &font, ContextFn context
         return false;
     }
     g_context = context;
+    g_lobby = !server.empty();
+    g_page = g_lobby ? kLobby : kSettings;
     g_available = true;
-    std::thread(fetch_loop).detach();
-    std::fprintf(stderr, "[panel] online menu ready (%s:%s)\n", g_host.c_str(), g_port.c_str());
+    if (g_lobby) {
+        std::thread(fetch_loop).detach();
+        std::fprintf(stderr, "[panel] VR menu ready: lobby (%s:%s) + settings\n", g_host.c_str(), g_port.c_str());
+    } else {
+        std::fprintf(stderr, "[panel] VR menu ready: settings\n");
+    }
     return true;
 }
 
@@ -441,16 +524,63 @@ void setOpen(bool open) {
 bool isOpen() { return g_open.load(); }
 void toggle() { setOpen(!g_open.load()); }
 
+namespace {
+// Settings page: change the selected value (dx -1 / +1) or, with dx 0, the A button.
+void change_setting(int dx) {
+    gt4::settings::Values v = gt4::settings::get();
+    switch (g_set_sel) {
+    case kRowDistance:
+        if (!dx) return;
+        v.screen_distance_m += dx * gt4::settings::kDistanceStepM;
+        break;
+    case kRowSize:
+        if (!dx) return;
+        v.screen_size_pct += dx * gt4::settings::kSizeStepPct;
+        break;
+    case kRowTriggers: v.swap_triggers = !v.swap_triggers; break;
+    case kRowGrips: v.swap_grips = !v.swap_grips; break;
+    case kRowReset:
+        if (dx) return;
+        v = gt4::settings::Values{};
+        break;
+    default: return;
+    }
+    gt4::settings::set(v);
+    g_dirty = true;
+}
+}  // namespace
+
 void input(int dx, int dy) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    (void)dx;  // one page: no tabs
+    if (g_page == kSettings) {
+        if (dy) {
+            g_set_sel = std::clamp(g_set_sel + dy, 0, kSettingRows - 1);
+            g_dirty = true;
+        }
+        if (dx) change_setting(dx);
+        return;
+    }
     if (dy) {
         g_sel = std::max(0, g_sel + dy);
         g_dirty = true;
     }
 }
 
+void nextPage(int d) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_lobby || !d) return;
+    g_page = g_page == kLobby ? kSettings : kLobby;
+    g_dirty = true;
+}
+
 void select() {
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_page == kSettings || !g_lobby) {
+            change_setting(0);
+            return;
+        }
+    }
     std::string join;
     bool row0 = false;
     {
@@ -472,10 +602,14 @@ void select() {
     g_wake.notify_all();
 }
 
-void setTab(int) {}  // one page
+void setTab(int tab) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_page = g_lobby && tab == 0 ? kLobby : kSettings;
+    g_dirty = true;
+}
 
 bool renderBadge(std::vector<std::uint8_t> &rgba) {
-    if (!g_available.load()) return false;
+    if (!g_available.load() || !g_lobby) return false;  // "Online": GT4 Online only
     constexpr int W = kBadgeWidth, H = kBadgeHeight;
     rgba.assign(static_cast<std::size_t>(W) * H * 4, 0);
     const auto put = [&](int x, int y, Color c, unsigned a) {

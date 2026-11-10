@@ -1,16 +1,14 @@
-// Builds without GT4 Online's online menu (the A-Spec II app, GT4VR_ONLINE OFF): the panel API the XR
-// host calls, with no menu behind it. No leaderboard, lap reports or race rooms are compiled in.
-#include "online_panel.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Builds without GT4 Online (the A-Spec II app, GT4VR_ONLINE OFF): no leaderboard reports or race
+// rooms are compiled in. The VR menu (online_panel.cpp) runs with its Settings page only and calls
+// these instead of gt4_results.cpp.
+#include "gt4_results.h"
 
-namespace gt4::panel {
-bool start(const std::string &, const std::string &, ContextFn) { return false; }
-bool available() { return false; }
-void setOpen(bool) {}
-bool isOpen() { return false; }
-void toggle() {}
-void input(int, int) {}
-void setTab(int) {}
-void select() {}
-bool render(std::vector<std::uint8_t> &) { return false; }
-bool renderBadge(std::vector<std::uint8_t> &) { return false; }
-}  // namespace gt4::panel
+namespace gt4::results {
+Room room() { return {}; }
+void createRoom() {}
+void joinRoom(const std::string &) {}
+void leaveRoom() {}
+int pingMs() { return -1; }
+void notePing(int) {}
+}  // namespace gt4::results
