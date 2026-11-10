@@ -409,7 +409,7 @@ void draw(std::vector<std::uint8_t> &px, const Data &d, const Context &ctx) {
     cv.rect(0, 0, kWidth, 96, kHeader);
     cv.rect(0, 96, kWidth, 4, kAccent);
     cv.text("GT4 ONLINE", 40, 64, 44, kText);
-    cv.text("Leaderboard  ·  gt4.portroyale.online", 330, 62, 24, kDim);
+    cv.text("Leaderboard", 330, 62, 24, kDim);
     const std::string who = ctx.player.empty() ? "not signed in (start a race)" : ctx.player;
     cv.text(who, kWidth - 440, 46, 28, ctx.player.empty() ? kDim : kGold, 400, 1);
     char status[96];
