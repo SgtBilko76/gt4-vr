@@ -8,8 +8,11 @@
 #   VERSION_NAME  versionName (default 0.2.0-beta), VERSION_CODE versionCode (default 3)
 #   JOBS=N        parallel compile jobs (default 4: generated units take ~1 GB each)
 #   BRIDGE_BUILD  PCSX2 GS bridge build dir (default: the Ridge Racer V port's Android bridge)
+#   NOGEN=1       no game code in the APK: the EE runs the program from the player's ISO through the
+#                 interpreter / ARM64 JIT (runtime/src/ee_*). Own build dir (build/android-<g>-nogen)
+#                 and APK name (build/apk/<GAME>-nogen.apk).
 #
-# The APK holds the game's recompiled code: never publish it.
+# Without NOGEN the APK holds the game's recompiled code: never publish it.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 NDK=${ANDROID_NDK:-$HOME/workspace/android-ndk-r30}
@@ -55,12 +58,14 @@ LIBS=()
 for g in "${GAMES[@]}"; do
   variant "$g"
   BUILD="$ROOT/build/android-$g"
+  GENERATED="$ROOT/generated/$SRC"
+  if [ "${NOGEN:-0}" = 1 ]; then BUILD="$BUILD-nogen"; GENERATED="$ROOT/runtime/nogen"; fi
   "$SDK_CMAKE/cmake" -S "$ROOT" -B "$BUILD" -G Ninja \
     -DCMAKE_MAKE_PROGRAM="$SDK_CMAKE/ninja" \
     -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
     -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 -DANDROID_STL=c++_static \
     -DCMAKE_BUILD_TYPE=Release \
-    -DPS2_GENERATED="$ROOT/generated/$SRC" "${VARIANT[@]}" \
+    -DPS2_GENERATED="$GENERATED" "${VARIANT[@]}" \
     -DPS2_OPENXR_DIR="$ROOT/quest/third_party/openxr" > "$BUILD.configure.log" 2>&1 || { tail -30 "$BUILD.configure.log"; exit 1; }
   "$SDK_CMAKE/ninja" -C "$BUILD" -j "${JOBS:-4}" gt4vr
   lib="$BUILD/lib$LIBNAME.so"
@@ -139,5 +144,6 @@ cd "$ROOT/quest/android"
 JAVA_HOME=$(ls -d "$HOME"/tools/jdk-17* | head -1) ./gradlew --no-daemon -q --offline assembleRelease -PgtAppId="$APP_ID" -PgtAppLabel="$APP_LABEL" -PgtLauncher="$LAUNCHER" \
   -PgtVersionName="${VERSION_NAME:-0.2.0-beta}" -PgtVersionCode="${VERSION_CODE:-3}"
 mkdir -p "$ROOT/build/apk"
-cp app/build/outputs/apk/release/app-release.apk "$ROOT/build/apk/$GAME.apk"
-ls -la app/build/outputs/apk/release/ "$ROOT/build/apk/$GAME.apk"
+OUT="$ROOT/build/apk/$GAME$([ "${NOGEN:-0}" = 1 ] && echo -nogen).apk"
+cp app/build/outputs/apk/release/app-release.apk "$OUT"
+ls -la app/build/outputs/apk/release/ "$OUT"
