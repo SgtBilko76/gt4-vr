@@ -1199,6 +1199,17 @@ private:
         }
         stack_.back() = V128;
         set_slot(ad);
+        // Store-to-load forwarding: "str qM, [b, #o]" directly followed by "ldr qD, [b, #o]" (VU register
+        // written, then read by the next op) waited for the store's round trip - the hottest stall of the
+        // car-select programs. The value is still in vM: copy it (the store stays). Not across a jump
+        // target (barrier_). PS2_VU_JIT_FWD=0: off.
+        static const bool fwd = [] { const char *v = std::getenv("PS2_VU_JIT_FWD"); return !v || v[0] != '0'; }();
+        if (fwd && code_.size() > barrier_ && !code_.empty() && (code_.back() & 0xFFFFFFE0u) == (0x3D800000u | field)) {
+            const unsigned m = code_.back() & 31u, d = vreg(ad);
+            w(0x4EA01C00u | m << 16 | m << 5 | d);  // orr vd.16b, vm.16b, vm.16b (mov; harmless if d == m)
+            ++fwd_hits_;
+            return true;
+        }
         w(0x3DC00000u | field | vreg(ad));
         return true;
     }
@@ -1920,6 +1931,7 @@ private:
     bool range_error_ = false;
 public:
     std::size_t retargeted_ = 0;  // local.set movs saved (stats)
+    std::size_t fwd_hits_ = 0;  // vector reloads replaced by a register copy (stats)
     std::size_t pinned_hits_ = 0;  // v128.const uses served by a pinned register (stats)
     std::size_t pinned_count() const { return pinned_.size(); }
     std::size_t max_depth_ = 0;
@@ -1968,8 +1980,8 @@ ProgramFn compile_a64(const std::uint8_t *code, std::uint32_t entry) {
     std::uint32_t *fn = place(words);
     // PS2_VU_JIT_DUMP=<dir>: raw ARM64 code of every compiled program (vu1_<entry>_<address>.bin).
     if (const char *dir = std::getenv("PS2_VU_JIT_DUMP")) {
-        std::fprintf(stderr, "[vu-jit] %04X: %zu words, stack depth %zu, locals used %zu int / %zu vec, %zu movs saved, %zu consts pinned (%zu uses)\n", entry, words.size(),
-                     c.max_depth_, c.locals_used_int_, c.locals_used_vec_, c.retargeted_, c.pinned_count(), c.pinned_hits_);
+        std::fprintf(stderr, "[vu-jit] %04X: %zu words, stack depth %zu, locals used %zu int / %zu vec, %zu movs saved, %zu consts pinned (%zu uses), %zu reloads forwarded\n", entry, words.size(),
+                     c.max_depth_, c.locals_used_int_, c.locals_used_vec_, c.retargeted_, c.pinned_count(), c.pinned_hits_, c.fwd_hits_);
         char name[512];
         std::snprintf(name, sizeof name, "%s/vu1_%04X_%llx.bin", dir, entry, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(fn)));
         if (std::FILE *f = std::fopen(name, "wb")) {

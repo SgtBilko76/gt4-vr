@@ -318,17 +318,60 @@ std::size_t ring_queued() { return g_ring_write.load() - g_ring_read.load(); }
 std::atomic<int> g_peak_in{0}, g_peak_out{0};
 std::atomic<std::uint32_t> g_callbacks{0}, g_muted_callbacks{0};
 
+std::size_t audio_target_frames();
+
+// Sound safety net (owner 2026-11-11: crackling in the car select, where the version without game code
+// runs at ~48 fps and makes only ~80 % of the sound that plays). When the queue falls below half its
+// normal level, playback slows smoothly (down to kMinRate) instead of running dry: a short dip sounds
+// slightly lower, not broken. At full speed the queue sits at the target and the rate stays 1.0.
+// config.txt RRV_AUDIO_STRETCH=0: off; RRV_AUDIO_MIN_RATE=0.5..1 (default 0.8).
+std::atomic<int> g_rate_min_permille{1000};
+
 aaudio_data_callback_result_t audio_callback(AAudioStream *, void *, void *data, int32_t frames) {
+    static const bool stretch = [] { const char *v = std::getenv("RRV_AUDIO_STRETCH"); return !v || v[0] != '0'; }();
+    static const double kMinRate = [] {
+        const char *v = std::getenv("RRV_AUDIO_MIN_RATE");
+        return v ? std::clamp(std::atof(v), 0.5, 1.0) : 0.8;
+    }();
+    static double rate = 1.0, frac = 0.0;
     auto *out = static_cast<std::int16_t *>(data);
     std::size_t r = g_ring_read.load();
-    const std::size_t n = std::min<std::size_t>(g_ring_write.load() - r, static_cast<std::size_t>(frames));
+    const std::size_t w = g_ring_write.load();
     const bool muted = !gt4::quest::visible();
     int peak = 0;
-    for (std::size_t i = 0; i < n; ++i, ++r) {
-        const std::size_t at = (r % kRingFrames) * 2;
-        out[i * 2] = muted ? 0 : g_ring[at];
-        out[i * 2 + 1] = muted ? 0 : g_ring[at + 1];
-        peak = std::max({peak, std::abs(static_cast<int>(out[i * 2])), std::abs(static_cast<int>(out[i * 2 + 1]))});
+    std::size_t n = 0;
+    if (stretch) {
+        const double low = static_cast<double>(audio_target_frames()) * 0.5;
+        const double avail = static_cast<double>(w - r);
+        const double want = avail >= low ? 1.0 : kMinRate + (1.0 - kMinRate) * (avail / low);
+        rate += (want - rate) * 0.1;  // per callback: glides over ~100 ms, no audible steps
+        if (rate > 0.9995) {
+            rate = 1.0;
+            frac = 0.0;  // back on whole samples: no interpolation (it would dull the highs) at normal speed
+        }
+        const int pm = static_cast<int>(rate * 1000.0);
+        if (pm < g_rate_min_permille.load(std::memory_order_relaxed)) g_rate_min_permille.store(pm, std::memory_order_relaxed);
+        for (; n < static_cast<std::size_t>(frames) && r + 1 < w; ++n) {
+            const std::size_t a = (r % kRingFrames) * 2, b = ((r + 1) % kRingFrames) * 2;
+            for (int ch = 0; ch < 2; ++ch) {
+                const double v = g_ring[a + ch] + (g_ring[b + ch] - g_ring[a + ch]) * frac;
+                out[n * 2 + ch] = muted ? 0 : static_cast<std::int16_t>(v);
+            }
+            peak = std::max({peak, std::abs(static_cast<int>(out[n * 2])), std::abs(static_cast<int>(out[n * 2 + 1]))});
+            frac += rate;
+            while (frac >= 1.0) {
+                frac -= 1.0;
+                ++r;
+            }
+        }
+    } else {
+        n = std::min<std::size_t>(w - r, static_cast<std::size_t>(frames));
+        for (std::size_t i = 0; i < n; ++i, ++r) {
+            const std::size_t at = (r % kRingFrames) * 2;
+            out[i * 2] = muted ? 0 : g_ring[at];
+            out[i * 2 + 1] = muted ? 0 : g_ring[at + 1];
+            peak = std::max({peak, std::abs(static_cast<int>(out[i * 2])), std::abs(static_cast<int>(out[i * 2 + 1]))});
+        }
     }
     if (peak > g_peak_out.load(std::memory_order_relaxed)) g_peak_out.store(peak, std::memory_order_relaxed);
     g_callbacks.fetch_add(1, std::memory_order_relaxed);
@@ -1029,10 +1072,10 @@ void perf_loop() {
         const double s = std::chrono::duration<double>(now - last).count();
         const std::uint64_t frames = ps2::frames_run(), fields = ps2::gs::bridge::fields(), interp = ps2::vu1_interpreted_calls();
         logf("[perf] game %.1f fps, GS fields %.1f/s, audio queued %zu ms, vu1 interpreted %.0f/s | audio peak game %d played %d, "
-             "callbacks %u (%u muted), stream state %d | cpu %s | ee stale %llu, epoch %llu",
+             "callbacks %u (%u muted), stream state %d, rate min %.2f | cpu %s | ee stale %llu, epoch %llu",
              (frames - last_frames) / s, (fields - last_fields) / s, ring_queued() / 48, (interp - last_interp) / s, g_peak_in.exchange(0),
              g_peak_out.exchange(0), g_callbacks.exchange(0), g_muted_callbacks.exchange(0),
-             g_audio ? static_cast<int>(AAudioStream_getState(g_audio)) : -1, thread_cpu(s).c_str(),
+             g_audio ? static_cast<int>(AAudioStream_getState(g_audio)) : -1, g_rate_min_permille.exchange(1000) / 1000.0, thread_cpu(s).c_str(),
              static_cast<unsigned long long>(ps2::ee_stale_blocks()), static_cast<unsigned long long>(ps2::ee_epoch_bumps()));
         last_frames = frames;
         last_fields = fields;
