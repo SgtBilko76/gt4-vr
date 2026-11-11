@@ -1771,7 +1771,7 @@ void Translator::instruction(std::uint32_t pc, std::uint32_t following) {
     const Up u = decode_upper(hi);
     // PS2_VU_JIT_NOFLAGS=1: TIMING EXPERIMENT ONLY (wrong results): no MAC/status updates at all.
     static const bool no_flags = std::getenv("PS2_VU_JIT_NOFLAGS") != nullptr;
-    const bool flags_live = no_flags ? false : any_status_ ? true : ((any_flags_ || code_flags_) && out_live(pc));
+    const bool flags_live = no_flags ? false : ((any_flags_ || code_flags_) && out_live(pc));
     const LowerInfo &li = lowers_[pc];
     if (u.flags && u.kind != Clip && u.dest) {
         ++stat_flag_ops_;
