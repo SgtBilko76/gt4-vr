@@ -204,7 +204,7 @@ enum : std::uint8_t {
 
 enum : std::uint32_t {
     kVSplat = 0x11, kVExtract = 0x1B, kI32x4Eq = 0x37, kI32x4LtS = 0x39, kI32x4GtS = 0x3B, kI32x4LeS = 0x3D, kI32x4GeS = 0x3F, kF32x4Lt = 0x43,
-    kF32x4Ge = 0x46, kVAnd = 0x4E, kVAndnot = 0x4F, kVOr = 0x50, kVBitselect = 0x52, kI32x4Neg = 0xA1, kI32x4Add = 0xAE, kI32x4MinS = 0xB6,
+    kF32x4Ge = 0x46, kVAnd = 0x4E, kVAndnot = 0x4F, kVOr = 0x50, kVBitselect = 0x52, kI32x4Neg = 0xA1, kI32x4Add = 0xAE, kI32x4MinS = 0xB6, kI32x4MinU = 0xB7,
     kF32x4Add = 0xE4, kF32x4Sub = 0xE5, kF32x4Mul = 0xE6, kI32x4TruncF32x4S = 0xF8, kF32x4ConvertI32x4S = 0xFA,
 };
 
@@ -373,6 +373,15 @@ LowerInfo analyze_lower(std::uint32_t w, std::uint32_t pc) {
 class Translator {
 public:
     Translator(const std::uint8_t *code, std::uint32_t entry, const Layout &layout) : code_(code), entry_(entry & kMask), layout_(layout) {}
+    void flag_stats() const {
+        std::uint32_t readers = 0, status_readers = 0;
+        for (const auto &[pc, l] : lowers_) {
+            readers += l.reads_flags;
+            status_readers += l.reads_status;
+        }
+        std::fprintf(stderr, "[vu-flags] %04X: %u insns, flag-setting upper ops %u, flags computed %u; this program: %u flag reads (%u status), any_status %d, code_flags %d\n",
+                     entry_, static_cast<unsigned>(pcs_.size()), stat_flag_ops_, stat_flag_live_, readers, status_readers, any_status_, code_flags_);
+    }
 
     bool run(std::vector<std::uint8_t> &out);
 
@@ -399,6 +408,7 @@ private:
     // Some program in VU1 code memory reads MAC/status (the interpreter's scan_flags rule): then the
     // flags at this program's exits are live too - a later program may read them before setting any.
     bool code_flags_ = false;
+    std::uint32_t stat_flag_ops_ = 0, stat_flag_live_ = 0;  // PS2_VU_JIT_FLAGSTAT
 
     std::uint32_t word(std::uint32_t at) const {
         std::uint32_t v;
@@ -529,6 +539,22 @@ private:
         c_.vsplatc(0x80000000u);
         c_.simd(kVAnd);
         c_.simd(kVOr);
+    }
+
+    // Clamp after float arithmetic. The inputs are always fixed values (shadows, Q/I and ACC go through
+    // vfix), so only the result needs it. With layout_.ftz the hardware already turned a denormal result
+    // into a signed zero, and two integer mins on the raw bits cap the magnitude at +-0x7F7FFFFF, keeping
+    // the sign (also for inf / NaN): umin moves negatives above -max down, smin positives above +max.
+    // Bit-identical to vfix() for every non-denormal value. PS2_VU_JIT_FTZ=0 turns it off (ARM64 back end).
+    void vfix_arith() {
+        if (!layout_.ftz) {
+            vfix();
+            return;
+        }
+        c_.vsplatc(0xFF7FFFFFu);
+        c_.simd(kI32x4MinU);
+        c_.vsplatc(0x7F7FFFFFu);
+        c_.simd(kI32x4MinS);
     }
 
     void vkey_of(std::uint32_t local) {
@@ -1096,10 +1122,10 @@ void Translator::outer_product(const Up &u) {
     shadow_vec(u.ft);
     c_.shuffle(kZxy);
     c_.simd(kF32x4Mul);
-    vfix();
+    vfix_arith();
     if (u.kind == Opmsub) {
         c_.simd(kF32x4Sub);
-        vfix();
+        vfix_arith();
     }
     c_.set(kUv);
 }
@@ -1143,20 +1169,20 @@ void Translator::upper_pre(const Up &u, bool flags_live) {
             break;
         }
         switch (u.kind) {
-        case Add: c_.simd(kF32x4Add); vfix(); break;
-        case Sub: c_.simd(kF32x4Sub); vfix(); break;
-        case Mul: c_.simd(kF32x4Mul); vfix(); break;
+        case Add: c_.simd(kF32x4Add); vfix_arith(); break;
+        case Sub: c_.simd(kF32x4Sub); vfix_arith(); break;
+        case Mul: c_.simd(kF32x4Mul); vfix_arith(); break;
         case Madd:
             c_.simd(kF32x4Mul);
-            vfix();
+            vfix_arith();
             c_.simd(kF32x4Add);
-            vfix();
+            vfix_arith();
             break;
         default:
             c_.simd(kF32x4Mul);
-            vfix();
+            vfix_arith();
             c_.simd(kF32x4Sub);
-            vfix();
+            vfix_arith();
             break;
         }
         c_.set(kUv);
@@ -1743,8 +1769,14 @@ void Translator::fsset(std::uint32_t w) {
 void Translator::instruction(std::uint32_t pc, std::uint32_t following) {
     const std::uint32_t lo = word(pc), hi = word(pc + 4);
     const Up u = decode_upper(hi);
-    const bool flags_live = any_status_ ? true : ((any_flags_ || code_flags_) && out_live(pc));
+    // PS2_VU_JIT_NOFLAGS=1: TIMING EXPERIMENT ONLY (wrong results): no MAC/status updates at all.
+    static const bool no_flags = std::getenv("PS2_VU_JIT_NOFLAGS") != nullptr;
+    const bool flags_live = no_flags ? false : any_status_ ? true : ((any_flags_ || code_flags_) && out_live(pc));
     const LowerInfo &li = lowers_[pc];
+    if (u.flags && u.kind != Clip && u.dest) {
+        ++stat_flag_ops_;
+        if (flags_live) ++stat_flag_live_;
+    }
 
     c_.get(kT);
     c_.i32c(1);
@@ -2155,7 +2187,9 @@ bool Translator::run(std::vector<std::uint8_t> &out) {
 
 bool translate(const std::uint8_t *code, std::uint32_t entry, const Layout &layout, std::vector<std::uint8_t> &out) {
     Translator t(code, entry, layout);
-    return t.run(out);
+    const bool ok = t.run(out);
+    if (ok && std::getenv("PS2_VU_JIT_FLAGSTAT")) t.flag_stats();
+    return ok;
 }
 
 }

@@ -419,6 +419,7 @@ bool run_wasm(const Module &m, std::uintptr_t base, std::uint32_t r_off, std::ui
                     case 0xAE: z[k] = x[k] + y[k]; break;
                     case 0xB1: z[k] = x[k] - y[k]; break;
                     case 0xB6: z[k] = static_cast<std::uint32_t>(std::min(sa, sb)); break;
+                    case 0xB7: z[k] = std::min(x[k], y[k]); break;
                     case 0xB8: z[k] = static_cast<std::uint32_t>(std::max(sa, sb)); break;
                     case 0xE4: z[k] = bits(fa + fb); break;
                     case 0xE5: z[k] = bits(fa - fb); break;
@@ -540,6 +541,14 @@ int main(int argc, char **argv) {
     setenv("PS2_VU_INTERPRET", "1", 1);  // vu::interpret = the real interpreter, not the JIT
     const std::uintptr_t base = vu::jit::a64_base();
     if (!base) return 1;
+    // The app runs VU1 programs with FPCR.FZ when the JIT relies on it (vu_micro.cpp FtzScope): do the
+    // same for all three runs (ARM64 code, wasm reference, interpreter).
+    if (vu::jit::a64_ftz()) {
+        std::uint64_t fpcr;
+        asm volatile("mrs %0, fpcr" : "=r"(fpcr));
+        asm volatile("msr fpcr, %0" ::"r"(fpcr | (1ull << 24)));
+        std::printf("FPCR.FZ on (PS2_VU_JIT_FTZ=0: off)\n");
+    }
     std::vector<std::filesystem::path> files;
     for (const auto &e : std::filesystem::directory_iterator(argv[1]))
         if (e.path().extension() == ".bin") files.push_back(e.path());
@@ -566,7 +575,7 @@ int main(int argc, char **argv) {
         std::vector<std::uint8_t> flags0(kFlagsSize, 0);
 
         std::vector<std::uint8_t> module;
-        const vu::jit::Layout layout{static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(vu::jit::a64_flags()) - base)};
+        const vu::jit::Layout layout{static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(vu::jit::a64_flags()) - base), vu::jit::a64_ftz()};
         if (!vu::jit::translate(s.code.data(), s.entry, layout, module)) {
             std::printf("%s: not translated\n", path.filename().c_str());
             continue;

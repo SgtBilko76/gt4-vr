@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -991,6 +992,25 @@ void shadow_check(ProgramFn jit, std::uint32_t pc) {
     std::memcpy(g_vu1_mem, before_mem, sizeof before_mem);
 }
 
+// ARM64: VU1 programs run with flush-to-zero (FPCR.FZ) when the JIT relies on it (jit::a64_ftz,
+// Layout::ftz). Interpreter and JIT both run inside, so they keep giving the same results.
+struct FtzScope {
+#if defined(__aarch64__) && !defined(__EMSCRIPTEN__)
+    std::uint64_t old = 0;
+    bool on = false;
+    FtzScope() {
+        static const bool enabled = jit::mode() >= 1 && jit::a64_ftz();
+        if (!enabled) return;
+        asm volatile("mrs %0, fpcr" : "=r"(old)::"memory");
+        on = !(old & (1ull << 24));
+        if (on) asm volatile("msr fpcr, %0" ::"r"(old | (1ull << 24)) : "memory");
+    }
+    ~FtzScope() {
+        if (on) asm volatile("msr fpcr, %0" ::"r"(old) : "memory");
+    }
+#endif
+};
+
 bool g_chaining = false;
 std::int64_t g_chained = -1;
 std::uint64_t g_last_key = 0;
@@ -1009,6 +1029,30 @@ void interpret(int unit, std::uint32_t pc) {
         return;
     }
     g_chaining = true;
+    const FtzScope ftz;
+    // PS2_VU_TIME=1: wall time spent in VU1 programs (JIT + interpreter fallback), printed every 50000
+    // calls - measures VU1 changes headless, where the software GS hides them in the frame time.
+    static const bool timing = std::getenv("PS2_VU_TIME") != nullptr;
+    struct Timer {
+        bool on;
+        timespec t0{};
+        explicit Timer(bool o) : on(o) {
+            if (on) clock_gettime(CLOCK_MONOTONIC, &t0);
+        }
+        ~Timer() {
+            if (!on) return;
+            static std::uint64_t ns = 0, calls = 0, last_ns = 0;
+            timespec t1;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            ns += static_cast<std::uint64_t>((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec));
+            if (++calls % 50000 == 0) {
+                std::fprintf(stderr, "[vu-time] %llu calls, %.1f ms total, %.2f us/call, last 50000: %.2f us/call\n",
+                             static_cast<unsigned long long>(calls), ns / 1e6, ns / 1e3 / static_cast<double>(calls),
+                             (ns - last_ns) / 1e3 / 50000.0);
+                last_ns = ns;
+            }
+        }
+    } timer(timing);
     for (;;) {
         run_entry(1, pc);
         if (g_chained < 0) break;

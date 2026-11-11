@@ -1204,14 +1204,60 @@ private:
         // car-select programs. The value is still in vM: copy it (the store stays). Not across a jump
         // target (barrier_). PS2_VU_JIT_FWD=0: off.
         static const bool fwd = [] { const char *v = std::getenv("PS2_VU_JIT_FWD"); return !v || v[0] != '0'; }();
-        if (fwd && code_.size() > barrier_ && !code_.empty() && (code_.back() & 0xFFFFFFE0u) == (0x3D800000u | field)) {
-            const unsigned m = code_.back() & 31u, d = vreg(ad);
-            w(0x4EA01C00u | m << 16 | m << 5 | d);  // orr vd.16b, vm.16b, vm.16b (mov; harmless if d == m)
-            ++fwd_hits_;
-            return true;
+        if (fwd) {
+            const int m = forwardable(field, basereg, static_cast<std::uint32_t>(disp));
+            if (m >= 0) {
+                const unsigned d = vreg(ad), mm = static_cast<unsigned>(m);
+                w(0x4EA01C00u | mm << 16 | mm << 5 | d);  // orr vd.16b, vm.16b, vm.16b (mov; harmless if d == m)
+                ++fwd_hits_;
+                return true;
+            }
         }
         w(0x3DC00000u | field | vreg(ad));
         return true;
+    }
+
+    // Windowed store-to-load forwarding (PS2_VU_JIT_FWD): the newest "str qM, [base, #disp]" within the last
+    // kFwdWindow instructions of this straight-line stretch, if vM still holds the stored value and nothing
+    // else may have written those 16 bytes. Typical case: a lower op merges into a VU register and stores
+    // it, the upper op stores another one, and both are read back a few instructions later to rebuild
+    // their clamped copies - each reload waited for its store. Deliberately conservative: only fixed base
+    // registers (not x16), any call / any write to vM / any store not provably elsewhere stops the search.
+    // Returns M or -1.
+    int forwardable(std::uint32_t field, unsigned basereg, std::uint32_t disp) const {
+        constexpr std::size_t kFwdWindow = 48;
+        if (basereg == X16 || basereg == SP || code_.empty() || code_.size() <= barrier_) return -1;
+        const std::size_t lo = std::max<std::size_t>(barrier_, code_.size() > kFwdWindow ? code_.size() - kFwdWindow : 0);
+        std::uint32_t written_regs = 0;  // vector/general register numbers written after the candidate store
+        for (std::size_t k = code_.size(); k-- > lo;) {
+            const std::uint32_t i = code_[k];
+            if ((i & 0xFFFFFFE0u) == (0x3D800000u | field)) {  // the store we look for
+                const unsigned m = i & 31u;
+                return ((written_regs >> m) & 1u) || ((written_regs >> basereg) & 1u) ? -1 : static_cast<int>(m);
+            }
+            if ((i & 0xFC000000u) == 0x94000000u || (i & 0xFFFFFC1Fu) == 0xD63F0000u) return -1;  // bl / blr
+            if ((i & 0x0A000000u) == 0x08000000u) {  // load / store
+                const bool pair = (i & 0x38000000u) == 0x28000000u;
+                const bool load = (i >> 22) & 1u;
+                const unsigned rt = i & 31u, rn = (i >> 5) & 31u;
+                if (load) {
+                    written_regs |= 1u << rt;
+                    if (pair) written_regs |= 1u << ((i >> 10) & 31u);
+                    continue;
+                }
+                if (rn == SP) continue;  // stack slots never alias the VU registers
+                // A store through the same base with a provably different 16-byte range is fine; anything
+                // else (other base, other addressing form) may hit the same bytes.
+                if (rn != basereg || (i & 0x3B000000u) != 0x39000000u) return -1;
+                const unsigned size = i >> 30, v = (i >> 26) & 1u, opc = (i >> 22) & 3u;
+                const unsigned scale = v && size == 0 && (opc & 2u) ? 4u : size;
+                const std::uint32_t at = ((i >> 10) & 0xFFFu) << scale, len = 1u << scale;
+                if (at < disp + 16u && disp < at + len) return -1;
+                continue;
+            }
+            written_regs |= 1u << (i & 31u);  // any other instruction: assume it writes register Rd
+        }
+        return -1;
     }
 
     // Vector ops that read lazy register locals directly.
@@ -1239,7 +1285,7 @@ private:
             {0x3F, 0x4EA03C00u, false}, {0x41, 0x4E20E400u, false}, {0x43, 0x6EA0E400u, true},  {0x44, 0x6EA0E400u, false},
             {0x45, 0x6E20E400u, true},  {0x46, 0x6E20E400u, false}, {0x4E, 0x4E201C00u, false}, {0x4F, 0x4E601C00u, false},
             {0x50, 0x4EA01C00u, false}, {0x51, 0x6E201C00u, false}, {0xAE, 0x4EA08400u, false}, {0xB1, 0x6EA08400u, false},
-            {0xB6, 0x4EA06C00u, false}, {0xB8, 0x4EA06400u, false}, {0xE4, 0x4E20D400u, false}, {0xE5, 0x4EA0D400u, false},
+            {0xB6, 0x4EA06C00u, false}, {0xB7, 0x6EA06C00u, false}, {0xB8, 0x4EA06400u, false}, {0xE4, 0x4E20D400u, false}, {0xE5, 0x4EA0D400u, false},
             {0xE6, 0x6E20DC00u, false},
         };
         for (const auto &op : kBin) {
@@ -1896,6 +1942,7 @@ private:
         case 0xAE: return binary_vec(0x4EA08400u);               // i32x4.add
         case 0xB1: return binary_vec(0x6EA08400u);               // i32x4.sub
         case 0xB6: return binary_vec(0x4EA06C00u);               // i32x4.min_s
+        case 0xB7: return binary_vec(0x6EA06C00u);               // i32x4.min_u
         case 0xB8: return binary_vec(0x4EA06400u);               // i32x4.max_s
         case 0xE4: return binary_vec(0x4E20D400u);               // f32x4.add
         case 0xE5: return binary_vec(0x4EA0D400u);               // f32x4.sub
@@ -1960,6 +2007,13 @@ bool init_base() {
 
 }
 
+// Flush-to-zero while VU1 programs run (vu_micro.cpp run_entry sets FPCR.FZ when this is on): lets the
+// Translator clamp arithmetic results with 2 instructions instead of 6 (Layout::ftz). PS2_VU_JIT_FTZ=0: off.
+bool a64_ftz() {
+    static const bool on = [] { const char *v = std::getenv("PS2_VU_JIT_FTZ"); return !v || v[0] != '0'; }();
+    return on;
+}
+
 // For tests/vu_jit_a64_test.cpp: the data base, the flag pipe and the import functions.
 std::uintptr_t a64_base() { return init_base() ? g_base : 0; }
 void *a64_flags() { return &g_fl; }
@@ -1968,7 +2022,7 @@ const void *a64_import(std::uint32_t i) { return i < kImports ? kImportFns[i].fn
 ProgramFn compile_a64(const std::uint8_t *code, std::uint32_t entry) {
     if (!init_base()) return nullptr;
     std::vector<std::uint8_t> module;
-    const Layout layout{static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(&g_fl) - g_base)};
+    const Layout layout{static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(&g_fl) - g_base), a64_ftz()};
     if (!translate(code, entry, layout, module)) return nullptr;
     Compiler c;
     std::vector<std::uint32_t> words;

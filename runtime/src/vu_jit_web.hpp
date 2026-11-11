@@ -11,6 +11,7 @@ int mode();
 ProgramFn compile(const std::uint8_t *code, std::uint32_t entry);
 ProgramFn compile_a64(const std::uint8_t *code, std::uint32_t entry);  // vu_jit_a64.cpp (ARM64 only)
 std::uintptr_t a64_base();
+bool a64_ftz();  // VU1 programs run with FPCR.FZ (vu_micro.cpp interpret)
 void *a64_flags();
 const void *a64_import(std::uint32_t i);
 
