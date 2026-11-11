@@ -1029,10 +1029,11 @@ void perf_loop() {
         const double s = std::chrono::duration<double>(now - last).count();
         const std::uint64_t frames = ps2::frames_run(), fields = ps2::gs::bridge::fields(), interp = ps2::vu1_interpreted_calls();
         logf("[perf] game %.1f fps, GS fields %.1f/s, audio queued %zu ms, vu1 interpreted %.0f/s | audio peak game %d played %d, "
-             "callbacks %u (%u muted), stream state %d | cpu %s",
+             "callbacks %u (%u muted), stream state %d | cpu %s | ee stale %llu, epoch %llu",
              (frames - last_frames) / s, (fields - last_fields) / s, ring_queued() / 48, (interp - last_interp) / s, g_peak_in.exchange(0),
              g_peak_out.exchange(0), g_callbacks.exchange(0), g_muted_callbacks.exchange(0),
-             g_audio ? static_cast<int>(AAudioStream_getState(g_audio)) : -1, thread_cpu(s).c_str());
+             g_audio ? static_cast<int>(AAudioStream_getState(g_audio)) : -1, thread_cpu(s).c_str(),
+             static_cast<unsigned long long>(ps2::ee_stale_blocks()), static_cast<unsigned long long>(ps2::ee_epoch_bumps()));
         last_frames = frames;
         last_fields = fields;
         last_interp = interp;

@@ -87,7 +87,7 @@ bool simple_impl(Cpu &c, const Insn &i) {
     case Movz: if (rd && D(c, rt) == 0) c.r[rd].d[0] = D(c, rs); break;
     case Movn: if (rd && D(c, rt) != 0) c.r[rd].d[0] = D(c, rs); break;
     case Break: breakpoint(c, i.pc); break;
-    case Cache: code_may_change(); break;
+    case Cache: cache_op(rt); break;
     case Sync: case Pref: break;
     case Mfhi: setd(c, rd, c.hi.d[0]); break;
     case Mflo: setd(c, rd, c.lo.d[0]); break;
@@ -389,6 +389,9 @@ bool simple(Cpu &c, const Insn &i) { return simple_impl(c, i); }
 bool condition(Cpu &c, const Insn &i) { return condition_impl(c, i); }
 
 std::uint32_t g_code_epoch = 1;
+std::uint64_t g_epoch_src[6] = {};
+std::uint64_t g_ee_stale = 0;
+const bool g_epoch_all = std::getenv("PS2_EE_EPOCH_ALL") != nullptr;
 std::uint32_t g_depth = 0;
 
 // One block (ee_core.hpp): the rules here are the JIT's contract, keep both in step.
@@ -523,7 +526,14 @@ void interpret(Cpu &c, std::uint32_t, std::uint32_t depth) {
                 static std::uint64_t frame = 0;
                 if (frame_count() != frame) {
                     frame = frame_count();
-                    code_may_change();
+                    ++g_epoch_src[4];
+                    static const bool frame_bump = [] { const char *v = std::getenv("PS2_EE_EPOCH_FRAME"); return !v || v[0] != '0'; }();
+                    if (frame_bump) code_may_change();
+                    static const bool stats = std::getenv("PS2_EE_EPOCH_STATS") != nullptr;
+                    if (stats && frame % 600 == 0)
+                        std::fprintf(stderr, "[ee] epoch bumps by source: icache-op %llu, dcache-op %llu, flush-icache %llu, flush-dcache %llu, frame %llu, exec %llu\n",
+                                     (unsigned long long)g_epoch_src[0], (unsigned long long)g_epoch_src[1], (unsigned long long)g_epoch_src[2],
+                                     (unsigned long long)g_epoch_src[3], (unsigned long long)g_epoch_src[4], (unsigned long long)g_epoch_src[5]);
                 }
                 if (preempt(c)) {
                     c.pc |= kUnwind;
@@ -541,7 +551,17 @@ void interpret(Cpu &c, std::uint32_t, std::uint32_t depth) {
         case kSyscall: {
             std::uint32_t n = c.r[3].w[0];
             if (n & 0x80000000u) n = 0u - n;
-            if (n == 0x64 || n == 0x68 || n == 0x06 || n == 0x07) code_may_change();
+            // FlushCache / iFlushCache(op): 0 = write back D-cache, 1 = invalidate D-cache (data only), 2 = invalidate
+            // I-cache, 3 = both (ps2sdk kernel.h). LoadExecPS2 / ExecPS2 always.
+            if (n == 0x64 || n == 0x68) {
+                const std::uint32_t op = c.r[4].w[0];
+                const bool icache = op > 1u;
+                ++g_epoch_src[icache ? 2 : 3];
+                if (icache || g_epoch_all) code_may_change();
+            } else if (n == 0x06 || n == 0x07) {
+                ++g_epoch_src[5];
+                code_may_change();
+            }
             syscall(c, at);
             g_depth = depth;
             if (c.pc != at + 4) return;
@@ -565,3 +585,8 @@ void jit_flush() {}
 #endif
 
 }
+
+namespace ps2 {
+std::uint64_t ee_stale_blocks() { return ee::g_ee_stale; }
+std::uint64_t ee_epoch_bumps() { return ee::g_code_epoch; }
+}  // namespace ps2

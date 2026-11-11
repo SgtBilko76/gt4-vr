@@ -66,7 +66,7 @@ std::uint64_t ee_h_simple(Cpu *c, const Insn *i) {
 }
 std::uint64_t ee_h_cond(Cpu *c, const Insn *i) { return condition(*c, *i) ? 1u : 0u; }
 void ee_h_stop(Cpu *c, std::uint32_t pc, const char *what) { stop(*c, pc, what); }
-void ee_h_cache() { code_may_change(); }
+void ee_h_cache(std::uint32_t rt) { cache_op(rt); }
 // A call from translated code, nested like generated code's. 1 = it returned to `ret`.
 std::uint64_t ee_h_call(Cpu *c, std::uint32_t target, std::uint32_t ret) {
     const std::uint32_t d = g_depth;
@@ -805,7 +805,10 @@ public:
             a_.imm32(3, i.op == CEq ? 0 : i.op == CLt ? 1 : 2);
             a_.call(FPF(ee_fp_cmp));
             return;
-        case Cache: a_.call(FPF(ee_h_cache)); return;
+        case Cache:
+            a_.imm32(0, i.rt());
+            a_.call(FPF(ee_h_cache));
+            return;
 #undef FPF
         case Sync: case Pref: return;
         default: break;
@@ -1065,7 +1068,10 @@ std::uint64_t jit_block(Cpu &c) {
             const auto it = g_blocks.find(pc);
             b = it != g_blocks.end() ? it->second.get() : nullptr;
         }
-        if (!b || !current(b)) b = compile(pc);
+        if (!b || !current(b)) {
+            if (b) ++g_ee_stale;
+            b = compile(pc);
+        }
         if (!b) return interp_block(c);
         b->checked = g_code_epoch;
         slot = b;

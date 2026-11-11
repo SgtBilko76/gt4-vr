@@ -119,6 +119,9 @@ void init_graphics();
 void start_render_thread();
 void start_vu_thread();
 void run_vu_thread();
+// EE JIT: blocks found changed when re-checked against RAM, and the code epoch (re-check rounds).
+std::uint64_t ee_stale_blocks();
+std::uint64_t ee_epoch_bumps();
 double vu_thread_idle_ms();
 double thread_waited_ms(int role);
 std::uint64_t vu1_interpreted_calls();

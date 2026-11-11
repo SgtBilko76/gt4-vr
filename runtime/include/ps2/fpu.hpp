@@ -177,7 +177,11 @@ inline std::uint32_t fpu_mul(std::uint32_t a, std::uint32_t b) {
     const std::uint32_t sign = (a ^ b) & kSign;
     if (!exponent(a) || !exponent(b)) return sign;
     int e = static_cast<int>(exponent(a)) + static_cast<int>(exponent(b)) - 127;
-    auto m = static_cast<std::uint32_t>(hw::mul_mantissa(mantissa(a), mantissa(b)) >> 23);
+    // hw::mul_mantissa = the plain product with bit 15 forced to the hardware's carry-save bit 15. That changes
+    // the kept bits (>> 23) only through a borrow, i.e. when bits 15..22 of the plain product are all 0: else
+    // the plain product's top bits are already exact (~255 of 256 multiplies skip the Booth model).
+    const std::uint64_t plain = static_cast<std::uint64_t>(mantissa(a)) * mantissa(b);
+    auto m = static_cast<std::uint32_t>(((plain & 0x7F8000u) ? plain : hw::mul_mantissa(mantissa(a), mantissa(b))) >> 23);
     if (m > 0xFFFFFFu) {
         m >>= 1;
         ++e;

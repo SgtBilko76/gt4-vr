@@ -48,6 +48,19 @@ std::uint64_t interp_block(Cpu &c);
 // the CACHE instruction, and every new frame.
 extern std::uint32_t g_code_epoch;
 inline void code_may_change() { ++g_code_epoch; }
+// Epoch bumps by source (PS2_EE_EPOCH_STATS=1 prints them every 600 frames): 0 CACHE (I-cache op), 1 CACHE
+// (D-cache op, skipped), 2 FlushCache/iFlushCache (I-cache), 3 FlushCache (D-cache only, skipped), 4 per frame,
+// 5 Exec syscalls. PS2_EE_EPOCH_ALL=1: bump for every one, as before (A/B and fallback).
+extern std::uint64_t g_epoch_src[6];
+extern std::uint64_t g_ee_stale;  // compiled blocks whose guest code had changed when re-checked
+extern const bool g_epoch_all;
+// CACHE: only the instruction-cache / BTAC operations (rt < 0x10: IXLTG..IFL) can make new code visible;
+// the data-cache ones (DXWBIN, DHWBIN, ...) only write back or drop data, and RAM here is coherent.
+inline void cache_op(std::uint32_t rt) {
+    const bool icache = rt < 0x10u;
+    ++g_epoch_src[icache ? 0 : 1];
+    if (icache || g_epoch_all) code_may_change();
+}
 
 // Guest call depth of the innermost running interpret() frame: a translated block calls a function
 // itself (ee_h_call -> ps2::call) and needs the depth the generated code would pass.
