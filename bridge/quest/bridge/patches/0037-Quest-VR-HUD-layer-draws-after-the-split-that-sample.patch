@@ -1,0 +1,62 @@
+From 8c8b06896da7b5c6fb93f2bfa8275154eb86e2f0 Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 15:26:30 +0100
+Subject: [PATCH 37/44] Quest VR HUD layer: draws after the split that sample a
+ displayed frame buffer (GT4 hit flash = copy of the picture) stay in the
+ picture; log skips the repeating centre HUD box
+
+---
+ pcsx2/GS/Renderers/HW/GSRendererHW.cpp | 20 ++++++++++++++------
+ 1 file changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index 1f460f4caa..fb6e9fbe95 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -218,7 +218,7 @@ namespace rrv_hud_split
+ 		if (!IsDisplayed(fbp))
+ 			s_displayed[s_displayed_next++ & 3u] = fbp;
+ 	}
+-	static u32 s_splits = 0, s_resolves = 0, s_fields = 0, s_rejoins = 0;
++	static u32 s_splits = 0, s_resolves = 0, s_fields = 0, s_rejoins = 0, s_after_frame_reads = 0;
+ 	// RR5 rule diagnostics: draws after the split that look like picture, not HUD.
+ 	static u32 s_late_3d = 0, s_late_wide = 0;
+ 
+@@ -255,10 +255,10 @@ namespace rrv_hud_split
+ 		{
+ #if defined(__ANDROID__)
+ 			if (GSStereo::hud_layer.load(std::memory_order_relaxed))
+-				std::fprintf(stderr, "[hud-layer] %u splits, %u shown in %u fields (after a split: %u 3D draws, %u full-width, %u full-screen effects kept in the picture)\n",
+-					s_splits, s_resolves, s_fields, s_late_3d, s_late_wide, s_rejoins);
++				std::fprintf(stderr, "[hud-layer] %u splits, %u shown in %u fields (after a split: %u 3D draws, %u full-width, %u full-screen effects kept in the picture, %u frame reads)\n",
++					s_splits, s_resolves, s_fields, s_late_3d, s_late_wide, s_rejoins, s_after_frame_reads);
+ #endif
+-			s_splits = s_resolves = s_fields = s_late_3d = s_late_wide = s_rejoins = 0;
++			s_splits = s_resolves = s_fields = s_late_3d = s_late_wide = s_rejoins = s_after_frame_reads = 0;
+ 		}
+ 	}
+ 	static Buffer* Pending(int fbp)
+@@ -473,10 +473,18 @@ void GSRendererHW::RrvHudSplitNoteDraw()
+ 		// "Reads the 3D picture" was tried and is wrong: GT4's HUD text/icons (lap time, position) sample
+ 		// textures at the 3D target's address (owner 2026-11-08 log: 600 HUD draws per 600 fields moved).
+ 		// Size rule only; big draws are logged to find the hit flash's real shape.
+-		const bool picture = full_screen;
++		// Second rule (owner 2026-11-08 video: the flash is a see-through copy of the race picture): a draw
++		// that samples a frame buffer being shown (its own or the other one) copies the picture. HUD
++		// textures never live there - those buffers are in use. GT4 may draw it in strips, so no size test.
++		const bool reads_frame = tme && (tbp & 31u) == 0 && IsDisplayed(static_cast<int>(tbp >> 5));
++		const bool picture = full_screen || reads_frame;
++		s_after_frame_reads += reads_frame ? 1u : 0u;
+ #if defined(__ANDROID__)
++		// Log what was not seen yet (the centre HUD box 194,163-446,211 repeats every field and filled
++		// the old log before the crash), plus every frame-reading draw.
+ 		static u32 s_dbg_after = 0;
+-		if (s_dbg_after < 400 && ((box.z - box.x) >= 200.0f || (box.w - box.y) >= 150.0f) && ++s_dbg_after)
++		const bool centre_hud = box.x >= 190.0f && box.x <= 198.0f && box.z >= 442.0f && box.z <= 450.0f;
++		if (s_dbg_after < 400 && (reads_frame || (!centre_hud && ((box.z - box.x) >= 200.0f || (box.w - box.y) >= 150.0f))) && ++s_dbg_after)
+ 			std::fprintf(stderr, "[hud-layer] after split: draw %d prims %u fbp 0x%x tme %d tbp 0x%x psm %u tpsm %u ztst %u%s box %.0f,%.0f-%.0f,%.0f rgba %u,%u,%u,%u alpha %016llx -> %s\n",
+ 				s_n, static_cast<unsigned>(m_index->tail), fbp, tme ? 1 : 0, tbp, static_cast<unsigned>(m_cached_ctx.FRAME.PSM),
+ 				static_cast<unsigned>(m_cached_ctx.TEX0.PSM), static_cast<unsigned>(test.ZTST), test.ZTE ? "" : " (off)", box.x, box.y, box.z, box.w,
+-- 
+2.53.0
+

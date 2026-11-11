@@ -1,0 +1,159 @@
+From 90b625cf4cb369a3aa9b97344ad5795b2388302c Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 11:56:38 +0100
+Subject: [PATCH 32/44] Quest VR: GT4 rear-view mirror moved from the 3D
+ picture onto the HUD layer (opt-in RRV_GT4_MIRROR_HUD=1)
+
+---
+ pcsx2/GS/Renderers/HW/GSRendererHW.cpp | 114 +++++++++++++++++++++++++
+ 1 file changed, 114 insertions(+)
+
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index d46fafe8fd..50bd056b2a 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -132,6 +132,51 @@ void GSRendererHW::UpdateSettings(const Pcsx2Config::GSOptions& old_config)
+ 	SetTCOffset();
+ }
+ 
++// Quest VR rear-view mirror on the HUD layer (GT4, opt-in RRV_GT4_MIRROR_HUD=1, only while the HUD
++// layer runs = the head-tracked view). GT4 draws its mirror into the main 3D target after the scene,
++// scissored to a small rectangle at the top. Before that pass the scene under the rectangle is saved;
++// when the 3D target is read for the composite, the mirror is cut out and the scene put back, so the
++// eyes get no mirror (it moved with the head) and GetOutput lays it onto the HUD layer, which stays
++// fixed in the driving direction (owner 2026-11-07).
++namespace rrv_mirror
++{
++	// Read on first use: the bridge library loads before the host sets its defaults.
++	static bool Enabled()
++	{
++		static const bool on = [] { const char* v = std::getenv("RRV_GT4_MIRROR_HUD"); return v && v[0] == '1'; }();
++		return on;
++	}
++	static int s_main_fbp = -1;   // main 3D target: depth-tested draws with a full-screen scissor
++	static u32 s_main_fbw = 0;
++	static GSVector2i s_full(0, 0); // its scissor extent in PS2 pixels
++	static bool s_active = false; // mirror pass running
++	static bool s_ready = false;  // mirror captured this field, not shown yet
++	static GSVector4i s_rect;     // mirror scissor, PS2 pixels (exclusive end)
++	static GSVector4i s_scaled;   // the same in target texels
++	static GSVector4 s_norm;      // mirror rect relative to the full picture (0..1)
++	static GSTexture* s_under = nullptr;
++	static GSTexture* s_mirror = nullptr;
++	static GSTexture* s_opaque = nullptr;
++	static u32 s_logged = 0;
++	static GSTexture* Ensure(GSTexture*& t, int w, int h)
++	{
++		if (t && (t->GetWidth() != w || t->GetHeight() != h))
++		{
++			g_gs_device->Recycle(t);
++			t = nullptr;
++		}
++		if (!t)
++			t = g_gs_device->CreateRenderTarget(w, h, GSTexture::Format::Color, false);
++		return t;
++	}
++	static void FieldStart()
++	{
++		s_active = false;
++		s_ready = false;
++		s_main_fbp = -1;
++	}
++} // namespace rrv_mirror
++
+ // Quest VR HUD layer, GS thread only. Per field: which frame buffers had depth-tested draws (the
+ // 3D targets), the composite (a full-width textured copy of a 3D target into another buffer --
+ // GT4's race picture into the frame buffer the CRTC shows) and whether that buffer was split.
+@@ -194,6 +239,7 @@ namespace rrv_hud_split
+ 	}
+ 	static void FieldStart()
+ 	{
++		rrv_mirror::FieldStart();
+ 		s_3d_count = 0;
+ 		s_comp_fbp = -1;
+ 		s_split_fbp = -1;
+@@ -292,6 +338,59 @@ GSTexture* GSRendererHW::GetStereoDepthTexture()
+ 
+ void GSRendererHW::RrvHudSplitNoteDraw()
+ {
++	if (rrv_mirror::Enabled())
++	{
++		using namespace rrv_mirror;
++		const GIFRegSCISSOR& sc = m_context->SCISSOR;
++		const int sx0 = sc.SCAX0, sx1 = sc.SCAX1 + 1, sy0 = sc.SCAY0, sy1 = sc.SCAY1 + 1;
++		const int mfbp = static_cast<int>(m_cached_ctx.FRAME.FBP);
++		const bool depth = m_cached_ctx.TEST.ZTE && m_cached_ctx.TEST.ZTST >= 2;
++		if (!s_active && depth && (sx1 - sx0) >= 600 && (sy1 - sy0) >= 400)
++		{
++			s_main_fbp = mfbp;
++			s_main_fbw = m_cached_ctx.FRAME.FBW;
++			s_full = GSVector2i(sx1, sy1);
++		}
++		else if (!s_active && !s_ready && mfbp == s_main_fbp && sx0 >= 32 && sx1 <= s_full.x - 32 && sy0 <= 64 &&
++				 (sy1 - sy0) >= 16 && (sy1 - sy0) <= 120 && (sx1 - sx0) >= 96 && (sx1 - sx0) <= 480)
++		{
++			// The mirror pass starts: keep the scene under its rectangle.
++			GSTextureCache::Target* rt = g_texture_cache->GetExactTarget(mfbp << 5, s_main_fbw, GSTextureCache::RenderTarget, mfbp << 5);
++			if (rt && rt->m_texture)
++			{
++				GSTexture* const t = rt->m_texture;
++				s_rect = GSVector4i(sx0, sy0, sx1, sy1);
++				s_scaled = GSVector4i(GSVector4(s_rect) * GSScale4(rt->m_scale)).rintersect(GSVector4i(0, 0, t->GetWidth(), t->GetHeight()));
++				if (!s_scaled.rempty() && Ensure(s_under, s_scaled.width(), s_scaled.height()))
++				{
++					g_gs_device->CopyRect(t, s_under, s_scaled, 0, 0);
++					s_active = true;
++				}
++			}
++		}
++		else if (s_active && PRIM->TME && static_cast<int>(m_cached_ctx.TEX0.TBP0 >> 5) == s_main_fbp &&
++				 (m_vt.m_max.p.x - m_vt.m_min.p.x) >= 600.0f)
++		{
++			// The composite reads the 3D target: take the mirror out, put the scene back.
++			s_active = false;
++			GSTextureCache::Target* rt = g_texture_cache->GetExactTarget(s_main_fbp << 5, s_main_fbw, GSTextureCache::RenderTarget, s_main_fbp << 5);
++			if (rt && rt->m_texture && s_under && Ensure(s_mirror, s_scaled.width(), s_scaled.height()))
++			{
++				GSTexture* const t = rt->m_texture;
++				g_gs_device->CopyRect(t, s_mirror, s_scaled, 0, 0);
++				g_gs_device->CopyRect(s_under, t, GSVector4i(0, 0, s_scaled.width(), s_scaled.height()), s_scaled.x, s_scaled.y);
++				s_norm = GSVector4(s_rect) / GSVector4(static_cast<float>(s_full.x), static_cast<float>(s_full.y),
++											  static_cast<float>(s_full.x), static_cast<float>(s_full.y));
++				s_ready = true;
++#if defined(__ANDROID__)
++				if (s_logged < 3 && ++s_logged)
++					std::fprintf(stderr, "[mirror-hud] mirror %d,%d-%d,%d of %dx%d (fbp 0x%x) moved to the HUD layer\n", s_rect.x, s_rect.y,
++						s_rect.z, s_rect.w, s_full.x, s_full.y, s_main_fbp);
++#endif
++			}
++		}
++	}
++
+ 	using namespace rrv_hud_split;
+ 	const u32 fbp = m_cached_ctx.FRAME.FBP;
+ 	const GIFRegTEST& test = m_cached_ctx.TEST;
+@@ -410,6 +509,21 @@ GSTexture* GSRendererHW::GetOutput(int i, GSVector2& scale, int& y_offset)
+ 			const GSVector4i fr = curFramebuffer.framebufferRect;
+ 			GSStereo::s_hud_src = GSVector4(static_cast<float>(fr.x), static_cast<float>(fr.y + y_offset),
+ 				static_cast<float>(fr.z), static_cast<float>(fr.w + y_offset)) * GSScale4(rt->m_scale);
++			// The rear-view mirror cut out of the 3D picture goes onto the HUD layer at its place in
++			// the frame, opaque (the HUD shader reads PS2 alpha 0x80 as 1).
++			if (rrv_mirror::s_ready && rrv_mirror::s_mirror)
++			{
++				const GSVector4 h = GSStereo::s_hud_src;
++				const GSVector4 n = rrv_mirror::s_norm;
++				const GSVector4 dst(h.x + n.x * (h.z - h.x), h.y + n.y * (h.w - h.y), h.x + n.z * (h.z - h.x), h.y + n.w * (h.w - h.y));
++				g_gs_device->StretchRectAuto(rrv_mirror::s_mirror, GSVector4(0, 0, 1, 1), GSStereo::s_hud_tex, dst, Biln);
++				if (rrv_mirror::Ensure(rrv_mirror::s_opaque, 4, 4))
++				{
++					g_gs_device->ClearRenderTarget(rrv_mirror::s_opaque, 0xFFFFFFFFu);
++					g_gs_device->StretchRectAutoMask(rrv_mirror::s_opaque, GSVector4(0, 0, 1, 1), GSStereo::s_hud_tex, dst, false, false, false, true);
++				}
++				rrv_mirror::s_ready = false;
++			}
+ 			GSStereo::s_hud_age = 0;
+ 			rrv_hud_split::s_resolves++;
+ 			break;
+-- 
+2.53.0
+

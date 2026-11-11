@@ -4,16 +4,20 @@ A standalone VR port of Gran Turismo 4 for Meta Quest 3 and Pico headsets, built
 ([portroyale.online](https://portroyale.online)). Two Android apps come out of this source:
 
 - **GT4 Spec II VR** (`online.portroyale.gt4vr`): the Spec II 1.10 mod.
-- **GT4 Online VR** (`online.portroyale.gt4hd`): GT4 USA v2.00 with online races and a leaderboard.
+- **GT4 Online VR** (`online.portroyale.gt4hd`): GT4 USA v2.00 with online races.
 
 Both show the game on a curved 3D screen and switch to a head-tracked VR view while you drive.
 No game data is included: players bring their own disc image.
 
+Since 0.3.0 the APKs contain no game code either: instead of the static recompilation described
+below, the Quest apps read the game's program from the player's ISO and translate it on the
+headset while it runs (an EE interpreter with an ARM64 JIT, and an ARM64 JIT for vector unit 1).
+
 The port is based on **[ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) by snuri00**
 (MIT License), the PS2 static recompiler and runtime described below; its full history is kept
 in this repository. The Quest code lives in `quest/` (`quest/tools/build_quest.sh` builds the
-APKs). The graphics come from a PCSX2-based GS bridge and PCSX2 fork that are not part of this
-repository.
+APKs). The graphics come from a PCSX2-based GS bridge; its source is in
+[`bridge/`](bridge/README.md) under the GPL-3.0.
 
 ---
 

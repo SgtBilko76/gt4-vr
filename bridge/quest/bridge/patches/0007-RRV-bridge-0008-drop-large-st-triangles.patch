@@ -1,0 +1,95 @@
+From 1ddaf57bf9a9c8a0446ef9d4908f2196bcd46dac Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 21:16:54 +0100
+Subject: [PATCH 07/44] RRV bridge 0008-drop-large-st-triangles
+
+Fukami tools/patches/pcsx2/0008-drop-large-st-triangles.patch, applied to ARMSX2 by a clean three-way merge.
+---
+ pcsx2/GS/GS.cpp      | 11 +++++++++++
+ pcsx2/GS/GS.h        |  4 ++++
+ pcsx2/GS/GSState.cpp | 11 +++++++++++
+ pcsx2/GS/GSState.h   |  2 ++
+ 4 files changed, 28 insertions(+)
+
+diff --git a/pcsx2/GS/GS.cpp b/pcsx2/GS/GS.cpp
+index f953664381..95c350ea31 100644
+--- a/pcsx2/GS/GS.cpp
++++ b/pcsx2/GS/GS.cpp
+@@ -99,6 +99,17 @@ void GSRrvSetRoundSpriteUOnly(bool u_only)
+ 	GSState::s_rrv_round_sprite_u_only = u_only;
+ }
+ 
++void GSRrvSetDropLargeSTTriangles(bool drop)
++{
++	GSState::s_rrv_drop_large_st_triangles = drop;
++	GSState::s_rrv_dropped_large_st_triangles.store(0, std::memory_order_relaxed);
++}
++
++u64 GSRrvGetDroppedLargeSTTriangles()
++{
++	return GSState::s_rrv_dropped_large_st_triangles.load(std::memory_order_relaxed);
++}
++
+ static GSRendererType GSCurrentRenderer;
+ static bool GSCurrentPresenterOffsetsRead;
+ 
+diff --git a/pcsx2/GS/GS.h b/pcsx2/GS/GS.h
+index 5ddbc74044..1086868e4e 100644
+--- a/pcsx2/GS/GS.h
++++ b/pcsx2/GS/GS.h
+@@ -100,6 +100,10 @@ u64 GSRrvGetFieldOfyCanonicalCount();
+ // rows, so rounding V to the native field texel grid would drop the rows the
+ // other field shows. 1:1 sprites (post-processing page strips) keep V rounding.
+ void GSRrvSetRoundSpriteUOnly(bool u_only);
++// RRV Gate-6 extension: when set, UserHacks_RewriteLargeST also collapses
++// every triangle whose ST it had to rewrite (degenerate Q), so it draws nothing.
++void GSRrvSetDropLargeSTTriangles(bool drop);
++u64 GSRrvGetDroppedLargeSTTriangles();
+ void GSvsync(u32 field, bool registers_written);
+ // Manual frameskip (Android low-end devices): present 1 of every (frames+1)
+ // VSyncs, skipping presentation of the rest. 0 disables. See GSRenderer::VSync.
+diff --git a/pcsx2/GS/GSState.cpp b/pcsx2/GS/GSState.cpp
+index 86e5fe9026..03f136fd05 100644
+--- a/pcsx2/GS/GSState.cpp
++++ b/pcsx2/GS/GSState.cpp
+@@ -28,6 +28,8 @@ u32 GSState::s_rrv_ofy_from = 0;
+ u32 GSState::s_rrv_ofy_to = 0;
+ std::atomic<u64> GSState::s_rrv_ofy_canonical_count{0};
+ bool GSState::s_rrv_round_sprite_u_only = false;
++bool GSState::s_rrv_drop_large_st_triangles = false;
++std::atomic<u64> GSState::s_rrv_dropped_large_st_triangles{0};
+ 
+ GSHWAutoFlushLevel GSState::GetAutoFlushLevel() const
+ {
+@@ -8974,6 +8976,15 @@ void GSState::RewriteVerticesIfLargeSTImpl(const GSVector4& large_val, bool chec
+ 					vertex_copy[i + j].m[1] = vertex[index[i + j]].m[1];
+ 					index[i + j] = i + j;
+ 				}
++
++				// RRV Gate-6 diagnostic (GSRrvSetDropLargeSTTriangles): collapse a
++				// triangle whose ST had to be rewritten, so it rasterizes nothing.
++				if (primclass == GS_TRIANGLE_CLASS && s_rrv_drop_large_st_triangles && (rewrite.mask() & 3) != 0)
++				{
++					for (int j = 1; j < n; j++)
++						vertex_copy[i + j].m[1] = vertex_copy[i].m[1];
++					s_rrv_dropped_large_st_triangles.fetch_add(1, std::memory_order_relaxed);
++				}
+ 			}
+ 
+ 			// Swap the buffers and fix the counts.
+diff --git a/pcsx2/GS/GSState.h b/pcsx2/GS/GSState.h
+index 32a0bd0863..5147fe525c 100644
+--- a/pcsx2/GS/GSState.h
++++ b/pcsx2/GS/GSState.h
+@@ -627,6 +627,8 @@ public:
+ 	static u32 s_rrv_ofy_to;
+ 	static std::atomic<u64> s_rrv_ofy_canonical_count;
+ 	static bool s_rrv_round_sprite_u_only;
++	static bool s_rrv_drop_large_st_triangles;
++	static std::atomic<u64> s_rrv_dropped_large_st_triangles;
+ 
+ 	GSPerfMon m_perfmon_frame; // Track stat across a frame.
+ 	GSPerfMon m_perfmon_draw;  // Track stat across a draw.
+-- 
+2.53.0
+

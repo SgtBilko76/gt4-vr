@@ -1,0 +1,52 @@
+From 8d7873d6bb6454e819f624d66cb44e2ad6311226 Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 16:00:51 +0100
+Subject: [PATCH 21/44] Quest: RRV_DATE_STENCIL modes 1 (no barriers), 2 (also
+ no primitive-ID), 3 (stencil only for no-alpha-write DATE)
+
+---
+ pcsx2/GS/Renderers/HW/GSRendererHW.cpp | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index 3d662496a2..a1192853d4 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -6871,12 +6871,23 @@ void GSRendererHW::EmulateDATESelectMethod(DATEOptions& date_options, GSTextureC
+ 	// i.e. the stencil pre-pass instead of an in-pass RT read. On the Adreno 740 every RT-reading
+ 	// draw needs a feedback-loop render pass, and DATE (plus the software blending it then prefers)
+ 	// is nearly all of them in RR5's race (RRV_VKDIAG).
+-	static const bool s_rrv_date_stencil = [] { const char* v = std::getenv("RRV_DATE_STENCIL"); return v && v[0] == '1'; }();
++	// Modes: 1 = no barriers for the DATE choice (stencil / primitive-ID instead), 2 = also no
++	// primitive-ID tracking, 3 = only DATE draws that write no alpha use the stencil (the DATE
++	// result cannot change during such a draw, so the stencil pre-pass is exact).
++	static const int s_rrv_date_stencil = [] {
++		const char* v = std::getenv("RRV_DATE_STENCIL");
++		const int m = (v && v[0] >= '1' && v[0] <= '3') ? v[0] - '0' : 0;
++		if (m)
++			std::fprintf(stderr, "[pcsx2-gs-bridge] DATE method mode %d\n", m);
++		return m;
++	}();
+ 	GSDevice::FeatureSupport rrv_features = g_gs_device->Features();
+-	if (s_rrv_date_stencil)
++	if (s_rrv_date_stencil == 1 || s_rrv_date_stencil == 2)
+ 	{
+ 		rrv_features.texture_barrier = false;
+ 		rrv_features.multidraw_fb_copy = false;
++		if (s_rrv_date_stencil == 2)
++			rrv_features.primitive_id = false;
+ 	}
+ 	const GSDevice::FeatureSupport& features = rrv_features;
+ 
+@@ -6992,7 +7003,7 @@ void GSRendererHW::EmulateDATESelectMethod(DATEOptions& date_options, GSTextureC
+ 			date_options.stencil_one = true;
+ 		}
+ 	}
+-	else if (features.texture_barrier && !m_conf.colormask.wa)
++	else if (features.texture_barrier && !m_conf.colormask.wa && s_rrv_date_stencil != 3)
+ 	{
+ 		GL_PERF("DATE: Accurate with no alpha write");
+ 		m_conf.require_one_barrier = true;
+-- 
+2.53.0
+

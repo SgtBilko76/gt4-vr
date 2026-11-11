@@ -1,0 +1,68 @@
+From e40fd2b1afdbc709624a9cbe187aa9c6efca1efa Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 22:39:26 +0100
+Subject: [PATCH 40/44] GSRrvSetBrightGain: scale FIX of GT4's 480p in-place
+ brightening (Cd*FIX, FIX>0x80) for that draw
+
+---
+ pcsx2/GS/GS.h                          |  3 +++
+ pcsx2/GS/Renderers/HW/GSRendererHW.cpp | 22 ++++++++++++++++++++++
+ 2 files changed, 25 insertions(+)
+
+diff --git a/pcsx2/GS/GS.h b/pcsx2/GS/GS.h
+index cadf9a4c03..2305ac1e2c 100644
+--- a/pcsx2/GS/GS.h
++++ b/pcsx2/GS/GS.h
+@@ -163,6 +163,9 @@ void GSRrvSetStereoHudRects(const float* rects, u32 count);
+ // RRV aniso (Quest): X upscale independent of the Y one (GSConfig.UpscaleMultiplier). 0 = isotropic.
+ // Set it before the GS renders (it is read wherever a target is created or scaled).
+ void GSRrvSetScaleX(float scale_x);
++// GT4 480p brightness (Quest): factor on the in-place brightening draw (Cd * FIX, FIX > 0x80) GT4 runs on
++// its 3D target in 480p only. 1 = unchanged (default, other games). Any thread.
++void GSRrvSetBrightGain(float gain);
+ float GSRrvGetScaleX();
+ void GSRrvGetCompileStats(u64* pipelines, u64* pipeline_us, u64* shaders, u64* shader_us, u64* flush_us);
+ /// Quest (fukami bridge): skip every draw and the presentation of the current field. The bridge
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index 465466e5cb..3cb7a30b2c 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -95,6 +95,8 @@ bool GSRendererHW::CanUpscale()
+ // RRV aniso (Quest): the X upscale (0 = the configured scale on both axes). Set before the first draw.
+ static float s_rrv_scale_x = 0.0f;
+ void GSRrvSetScaleX(float scale_x) { s_rrv_scale_x = scale_x; }
++static std::atomic<float> s_rrv_bright_gain{1.0f};
++void GSRrvSetBrightGain(float gain) { s_rrv_bright_gain.store(gain, std::memory_order_relaxed); }
+ float GSRrvGetScaleX() { return s_rrv_scale_x; }
+ 
+ GSVector2 GSRendererHW::GetUpscaleMultiplier()
+@@ -3894,6 +3896,26 @@ void GSRendererHW::Draw()
+ 	}
+ 	if (s_rrv_skip_field.load(std::memory_order_relaxed))
+ 		return; // RRV_SKIP_FIELD: the bridge drops this field (GSRrvSetSkipField)
++	// GT4 480p (owner 2026-11-08: colours brighter than interlaced, both games): scale the FIX of GT4's
++	// in-place brightening (Cd * FIX + 0 over the whole 3D target, FIX > 0x80; interlaced has none) for
++	// this draw only. Before the HUD split, so the mirror takes the same gain.
++	struct RrvFixRestore
++	{
++		GIFRegALPHA* alpha = nullptr;
++		u8 fix = 0;
++		~RrvFixRestore() { if (alpha) alpha->FIX = fix; }
++	} rrv_fix_restore;
++	if (const float gain = s_rrv_bright_gain.load(std::memory_order_relaxed); gain != 1.0f)
++	{
++		GIFRegALPHA& a = m_context->ALPHA;
++		if (a.A == 1 && a.B == 2 && a.C == 2 && a.D == 2 && a.FIX > 0x80 && !PRIM->TME &&
++			(m_vt.m_max.p.x - m_vt.m_min.p.x) >= 600.0f && (m_vt.m_max.p.y - m_vt.m_min.p.y) >= 400.0f)
++		{
++			rrv_fix_restore.alpha = &a;
++			rrv_fix_restore.fix = a.FIX;
++			a.FIX = static_cast<u8>(std::clamp(static_cast<float>(a.FIX) * gain + 0.5f, 0.0f, 255.0f));
++		}
++	}
+ 	if (GSStereo::hud_layer.load(std::memory_order_relaxed))
+ 		RrvHudSplitNoteDraw();
+ 
+-- 
+2.53.0
+

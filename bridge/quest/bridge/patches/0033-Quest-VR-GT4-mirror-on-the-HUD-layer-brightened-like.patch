@@ -1,0 +1,100 @@
+From 372371ba705e8940c9ac3df5b3f8ff94dfcf0f3c Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 12:04:37 +0100
+Subject: [PATCH 33/44] Quest VR: GT4 mirror on the HUD layer brightened like
+ the game's composite (gain 2.35, RRV_GT4_MIRROR_GAIN)
+
+---
+ bin/resources/shaders/vulkan/present.glsl | 7 ++++++-
+ pcsx2/GS/Renderers/Common/GSRenderer.cpp  | 1 +
+ pcsx2/GS/Renderers/Common/GSRenderer.h    | 3 +++
+ pcsx2/GS/Renderers/HW/GSRendererHW.cpp    | 8 ++++++++
+ pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp  | 3 ++-
+ 5 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/bin/resources/shaders/vulkan/present.glsl b/bin/resources/shaders/vulkan/present.glsl
+index 779e6d1901..1867af6f7a 100644
+--- a/bin/resources/shaders/vulkan/present.glsl
++++ b/bin/resources/shaders/vulkan/present.glsl
+@@ -454,7 +454,12 @@ void ps_automagical_supersampling()
+ // its alpha -- which recovers the soft edges a one-bit alpha drops.
+ void ps_hud_layer()
+ {
+-	const vec4 c = sample_c(v_tex);
++	vec4 c = sample_c(v_tex);
++	// GT4 rear-view mirror moved here from the 3D picture (alpha written as 1.0, rows v0..v1): it is
++	// still at the 3D target's brightness, the game's composite would have brightened it.
++	// u_stereo_separation = gain, u_stereo_convergence / u_stereo_debug = v0 / v1 (PresentHudRect).
++	if (u_stereo_separation > 0.0f && c.a > 0.99f && v_tex.y >= u_stereo_convergence && v_tex.y <= u_stereo_debug)
++		c.rgb = min(c.rgb * u_stereo_separation, vec3(1.0f));
+ 	const float a = max(clamp(c.a * (255.0f / 128.0f), 0.0f, 1.0f), max(c.r, max(c.g, c.b)));
+ 	o_col0 = vec4(c.rgb, a);
+ }
+diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.cpp b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+index 5308f469c4..8b2851a5e0 100644
+--- a/pcsx2/GS/Renderers/Common/GSRenderer.cpp
++++ b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+@@ -817,6 +817,7 @@ namespace GSStereo
+ 	GSTexture* s_hud_tex = nullptr;
+ 	GSVector4 s_hud_src = GSVector4::zero();
+ 	u32 s_hud_age = ~0u;
++	float s_mirror_gain = 0.0f, s_mirror_v0 = 0.0f, s_mirror_v1 = 0.0f;
+ 
+ 	// GSRrvSetStereoHudRects: set and read on the GS thread (the bridge calls it right before
+ 	// GSvsync), so no lock.
+diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.h b/pcsx2/GS/Renderers/Common/GSRenderer.h
+index 3fe855b7b5..e79a5b6c7d 100644
+--- a/pcsx2/GS/Renderers/Common/GSRenderer.h
++++ b/pcsx2/GS/Renderers/Common/GSRenderer.h
+@@ -50,6 +50,9 @@ namespace GSStereo
+ 	extern GSTexture* s_hud_tex;
+ 	extern GSVector4 s_hud_src;
+ 	extern u32 s_hud_age;
++	/// GT4 rear-view mirror on the HUD layer (RRV_GT4_MIRROR_HUD): its rows in s_hud_tex (v0, v1,
++	/// normalised) and the brightness gain the game's composite would have applied; gain 0 = none.
++	extern float s_mirror_gain, s_mirror_v0, s_mirror_v1;
+ 
+ 	// Depth rescue, GS thread only. Some games are done with their depth buffer before the frame
+ 	// is presented -- GT4 reuses its memory as a colour target for post effects, and the texture
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index 50bd056b2a..d2e57a8ee9 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -511,12 +511,20 @@ GSTexture* GSRendererHW::GetOutput(int i, GSVector2& scale, int& y_offset)
+ 				static_cast<float>(fr.z), static_cast<float>(fr.w + y_offset)) * GSScale4(rt->m_scale);
+ 			// The rear-view mirror cut out of the 3D picture goes onto the HUD layer at its place in
+ 			// the frame, opaque (the HUD shader reads PS2 alpha 0x80 as 1).
++			GSStereo::s_mirror_gain = 0.0f; // no mirror on this HUD (menus): nothing to brighten
+ 			if (rrv_mirror::s_ready && rrv_mirror::s_mirror)
+ 			{
+ 				const GSVector4 h = GSStereo::s_hud_src;
+ 				const GSVector4 n = rrv_mirror::s_norm;
+ 				const GSVector4 dst(h.x + n.x * (h.z - h.x), h.y + n.y * (h.w - h.y), h.x + n.z * (h.z - h.x), h.y + n.w * (h.w - h.y));
+ 				g_gs_device->StretchRectAuto(rrv_mirror::s_mirror, GSVector4(0, 0, 1, 1), GSStereo::s_hud_tex, dst, Biln);
++				// Brightness: GT4's composite brightens the 3D target ~2.4x (measured on a Spec II race:
++				// mirror 35 -> 83, scene 39 -> 93 mean value). RRV_GT4_MIRROR_GAIN overrides.
++				static const float s_gain = [] { const char* g = std::getenv("RRV_GT4_MIRROR_GAIN"); return g ? std::strtof(g, nullptr) : 2.35f; }();
++				const float th = static_cast<float>(GSStereo::s_hud_tex->GetHeight());
++				GSStereo::s_mirror_gain = s_gain;
++				GSStereo::s_mirror_v0 = dst.y / th;
++				GSStereo::s_mirror_v1 = dst.w / th;
+ 				if (rrv_mirror::Ensure(rrv_mirror::s_opaque, 4, 4))
+ 				{
+ 					g_gs_device->ClearRenderTarget(rrv_mirror::s_opaque, 0xFFFFFFFFu);
+diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
+index 27693d1b28..d1d15ebce7 100644
+--- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
++++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
+@@ -6609,7 +6609,8 @@ void GSDeviceVK::PresentHudRect(GSTexture* sTex, const GSVector4& sRect, const G
+ 	DisplayConstantBuffer cb;
+ 	cb.SetSource(sRect, sTex->GetSize());
+ 	cb.SetTarget(dRect, GetPresentationSize());
+-	cb.TimeAndPad = GSVector4::zero();
++	// .yzw: GT4 mirror gain and its rows (ps_hud_layer); the stereo values are unused here.
++	cb.TimeAndPad = GSVector4(0.0f, GSStereo::s_mirror_gain, GSStereo::s_mirror_v0, GSStereo::s_mirror_v1);
+ 	SetUtilityPushConstants(&cb, sizeof(cb));
+ 	DoStretchRect(static_cast<GSTextureVK*>(sTex), sRect, nullptr, dRect, m_present_hud, Filter::Biln, true);
+ }
+-- 
+2.53.0
+

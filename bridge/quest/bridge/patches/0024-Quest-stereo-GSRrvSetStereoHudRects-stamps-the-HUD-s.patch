@@ -1,0 +1,97 @@
+From e7a71fcf548239de65e700ebe0ea37d70568f0b2 Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 20:18:11 +0100
+Subject: [PATCH 24/44] Quest stereo: GSRrvSetStereoHudRects stamps the HUD's
+ rectangles into the packed depth (nearest), so the 2D layer sits on one plane
+
+---
+ pcsx2/GS/GS.h                            |  4 +++
+ pcsx2/GS/Renderers/Common/GSRenderer.cpp | 45 ++++++++++++++++++++++++
+ 2 files changed, 49 insertions(+)
+
+diff --git a/pcsx2/GS/GS.h b/pcsx2/GS/GS.h
+index fe3567ea7a..3dec9a3ff7 100644
+--- a/pcsx2/GS/GS.h
++++ b/pcsx2/GS/GS.h
+@@ -154,6 +154,10 @@ void GSRrvMarkAlignedSprite(u64 key);
+ /// fraction of their height, so the RoundSprite V fix (texels under the first and last NATIVE row)
+ /// would sample only part of a 6-row label; while on, far-plane sprites keep the game's V.
+ void GSRrvSetHudVr(bool on);
++// Quest VR (GT4): rectangles of this field's 2D layer in the presented frame (UV 0..1, x0 y0 x1 y1
++// each). The depth stereo gives them the nearest depth, so the HUD sits on one plane in both eyes
++// instead of taking the depth of the scene behind it. count 0 = none.
++void GSRrvSetStereoHudRects(const float* rects, u32 count);
+ /// Quest: cumulative TFX pipeline / fragment shader creations and pipeline cache flushes (Vulkan).
+ void GSRrvGetCompileStats(u64* pipelines, u64* pipeline_us, u64* shaders, u64* shader_us, u64* flush_us);
+ /// Quest (fukami bridge): skip every draw and the presentation of the current field. The bridge
+diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.cpp b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+index 53142571d5..e2423ce26c 100644
+--- a/pcsx2/GS/Renderers/Common/GSRenderer.cpp
++++ b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+@@ -812,6 +812,41 @@ namespace GSStereo
+ 	std::atomic<bool> flip_y{false};
+ 	std::atomic<float> depth_scale{0.0f};
+ 
++	// GSRrvSetStereoHudRects: set and read on the GS thread (the bridge calls it right before
++	// GSvsync), so no lock.
++	static std::vector<GSVector4> s_hud_rects;
++	static GSTexture* s_hud_white = nullptr;
++
++	static void StampHudRects(GSTexture* packed)
++	{
++		if (s_hud_rects.empty() || !packed)
++			return;
++		if (!s_hud_white)
++		{
++			s_hud_white = g_gs_device->CreateTexture(4, 4, 1, GSTexture::Format::Color);
++			if (!s_hud_white)
++				return;
++			const u32 white[16] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
++				0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
++				0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
++			s_hud_white->Update(GSVector4i(0, 0, 4, 4), white, 16);
++		}
++		const GSVector4 size = GSVector4(packed->GetSize()).xyxy();
++		std::vector<GSDevice::MultiStretchRect> draws;
++		draws.reserve(s_hud_rects.size());
++		for (const GSVector4& uv : s_hud_rects)
++		{
++			GSDevice::MultiStretchRect d;
++			d.src_rect = GSVector4(0.0f, 0.0f, 1.0f, 1.0f);
++			d.dst_rect = (uv * size).floor();
++			d.src = s_hud_white;
++			d.filter = Filter::Nearest;
++			d.wmask = GSHWDrawConfig::ColorMaskSelector(8); // alpha (the packed depth) only
++			draws.push_back(d);
++		}
++		g_gs_device->DrawMultiStretchRects(draws.data(), static_cast<u32>(draws.size()), packed);
++	}
++
+ 	static constexpr u32 NO_RESCUE_TARGET = ~0u;
+ 	static u32 s_rescue_bp = NO_RESCUE_TARGET;
+ 	static GSTexture* s_depth_snapshot = nullptr;
+@@ -1249,7 +1284,10 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
+ 				// Still consume the depth record when reprojection is off, so it cannot go stale.
+ 				GSTexture* stereo_depth = GetStereoDepthTexture();
+ 				if (stereo_depth && GSStereo::reproject.load(std::memory_order_relaxed))
++				{
+ 					stereo_packed = g_gs_device->PrepareStereoFrame(current, stereo_depth);
++					GSStereo::StampHudRects(stereo_packed);
++				}
+ 
+ 				// How often frames actually get depth, logged when that CHANGES (none / some / all per
+ 				// ~5 s window). A game can look flat because it never offers a usable depth buffer --
+@@ -1824,3 +1862,10 @@ void DumpGSPrivRegs(const GSPrivRegSet& r, const std::string& filename)
+ 
+ 	std::fprintf(fp.get(), "EXTWRITE: { EN: %u }\n", r.EXTWRITE.WRITE);
+ }
++
++void GSRrvSetStereoHudRects(const float* rects, u32 count)
++{
++	GSStereo::s_hud_rects.clear();
++	for (u32 i = 0; i < count; i++)
++		GSStereo::s_hud_rects.emplace_back(rects[4 * i], rects[4 * i + 1], rects[4 * i + 2], rects[4 * i + 3]);
++}
+-- 
+2.53.0
+

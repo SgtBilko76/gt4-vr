@@ -1,0 +1,74 @@
+From 22ee2b92622df79460f14908950aa91d61ebfdf1 Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 15:03:20 +0100
+Subject: [PATCH 36/44] Quest VR HUD layer: back to the size rule for picture
+ effects (reading the 3D target's address also matched GT4's HUD text); log
+ large draws after the split
+
+---
+ pcsx2/GS/Renderers/HW/GSRendererHW.cpp | 32 +++++++++++++++++++-------
+ 1 file changed, 24 insertions(+), 8 deletions(-)
+
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index 69901c159c..1f460f4caa 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -460,22 +460,35 @@ void GSRendererHW::RrvHudSplitNoteDraw()
+ 			RrvHudSplitAt(fbp);
+ 		return;
+ 	}
+-	if (test.ZTE && test.ZTST >= 2)
+-	{
+-		Note3d(fbp);
+-		return;
+-	}
+ 	const GSVector4 box = m_vt.m_min.p.xyxy(m_vt.m_max.p);
++	const bool tme = PRIM->TME;
++	const u32 tbp = m_cached_ctx.TEX0.TBP0;
+ 	// Full-screen effect (GT4 hit flash): belongs to the picture, not the HUD layer.
+ 	const bool full_screen = (box.z - box.x) >= 600.0f && (box.w - box.y) >= 400.0f;
+ 	if (s_split_fbp == static_cast<int>(fbp))
+ 	{
++		// Picture effects after the split (owner 2026-11-08, hit flash still on the HUD panel only with
++		// the size rule): GT4 may draw them in strips, so also anything that reads the 3D picture (a
++		// 3D target or the composite's source) or tests depth. The HUD never samples the 3D picture.
++		// "Reads the 3D picture" was tried and is wrong: GT4's HUD text/icons (lap time, position) sample
++		// textures at the 3D target's address (owner 2026-11-08 log: 600 HUD draws per 600 fields moved).
++		// Size rule only; big draws are logged to find the hit flash's real shape.
++		const bool picture = full_screen;
++#if defined(__ANDROID__)
++		static u32 s_dbg_after = 0;
++		if (s_dbg_after < 400 && ((box.z - box.x) >= 200.0f || (box.w - box.y) >= 150.0f) && ++s_dbg_after)
++			std::fprintf(stderr, "[hud-layer] after split: draw %d prims %u fbp 0x%x tme %d tbp 0x%x psm %u tpsm %u ztst %u%s box %.0f,%.0f-%.0f,%.0f rgba %u,%u,%u,%u alpha %016llx -> %s\n",
++				s_n, static_cast<unsigned>(m_index->tail), fbp, tme ? 1 : 0, tbp, static_cast<unsigned>(m_cached_ctx.FRAME.PSM),
++				static_cast<unsigned>(m_cached_ctx.TEX0.PSM), static_cast<unsigned>(test.ZTST), test.ZTE ? "" : " (off)", box.x, box.y, box.z, box.w,
++				m_vt.m_max.c.U32[0], m_vt.m_max.c.U32[1], m_vt.m_max.c.U32[2], m_vt.m_max.c.U32[3],
++				static_cast<unsigned long long>(m_context->ALPHA.U64), picture ? "picture" : "hud");
++#endif
+ 		if (Buffer* b = Pending(static_cast<int>(fbp)))
+ 		{
+ 			GSTextureCache::Target* rt = g_texture_cache->GetExactTarget(fbp << 5, m_cached_ctx.FRAME.FBW, GSTextureCache::RenderTarget, fbp << 5);
+ 			if (rt && rt->m_texture)
+ 			{
+-				if (full_screen)
++				if (picture)
+ 					Rejoin(*b, rt->m_texture);
+ 				else
+ 					Resplit(*b, rt->m_texture);
+@@ -483,8 +496,11 @@ void GSRendererHW::RrvHudSplitNoteDraw()
+ 		}
+ 		return;
+ 	}
+-	const bool tme = PRIM->TME;
+-	const u32 tbp = m_cached_ctx.TEX0.TBP0;
++	if (test.ZTE && test.ZTST >= 2)
++	{
++		Note3d(fbp);
++		return;
++	}
+ 	if (tme && (tbp & 31u) == 0 && (tbp >> 5) != fbp && Is3d(tbp >> 5) && (box.z - box.x) >= 600.0f)
+ 	{
+ 		s_comp_fbp = static_cast<int>(fbp);
+-- 
+2.53.0
+

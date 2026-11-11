@@ -1,0 +1,78 @@
+From a8c7d3825d4a1cc4a6b937f0998a14f94d7e8d8a Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 10:07:26 +0100
+Subject: [PATCH 14/44] Quest stereo: depth packing scale
+ (GSStereo::depth_scale) so a 24-bit Z scene survives the 8-bit packed depth
+
+---
+ bin/resources/shaders/vulkan/convert.glsl | 7 ++++++-
+ pcsx2/GS/Renderers/Common/GSRenderer.cpp  | 1 +
+ pcsx2/GS/Renderers/Common/GSRenderer.h    | 5 +++++
+ pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp  | 3 +++
+ 4 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/bin/resources/shaders/vulkan/convert.glsl b/bin/resources/shaders/vulkan/convert.glsl
+index 917800b051..000e5e7a12 100644
+--- a/bin/resources/shaders/vulkan/convert.glsl
++++ b/bin/resources/shaders/vulkan/convert.glsl
+@@ -652,9 +652,14 @@ void main()
+ #ifdef ps_depth_to_alpha
+ // Writes the depth buffer into the alpha channel of the packed present texture; the colour
+ // channels are masked off by the pipeline, so the frame already copied there survives.
++layout(push_constant) uniform cb_depth_to_alpha
++{
++	vec4 u_depth_scale; // x: GSStereo::depth_scale (1 = the raw depth)
++};
++
+ void ps_depth_to_alpha()
+ {
+-	o_col0 = vec4(0.0f, 0.0f, 0.0f, sample_c(v_tex).r);
++	o_col0 = vec4(0.0f, 0.0f, 0.0f, clamp(sample_c(v_tex).r * u_depth_scale.x, 0.0f, 1.0f));
+ }
+ #endif
+ 
+diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.cpp b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+index fb8fd37f96..1451b111ad 100644
+--- a/pcsx2/GS/Renderers/Common/GSRenderer.cpp
++++ b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+@@ -809,6 +809,7 @@ namespace GSStereo
+ 	std::atomic<bool> reproject{true};
+ 	std::atomic<float> debug_depth{0.0f};
+ 	std::atomic<bool> flip_y{false};
++	std::atomic<float> depth_scale{0.0f};
+ 
+ 	static constexpr u32 NO_RESCUE_TARGET = ~0u;
+ 	static u32 s_rescue_bp = NO_RESCUE_TARGET;
+diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.h b/pcsx2/GS/Renderers/Common/GSRenderer.h
+index f4dabd8f07..9c781cbeaf 100644
+--- a/pcsx2/GS/Renderers/Common/GSRenderer.h
++++ b/pcsx2/GS/Renderers/Common/GSRenderer.h
+@@ -29,6 +29,11 @@ namespace GSStereo
+ 	extern std::atomic<float> debug_depth;
+ 	/// Draw the frame vertically flipped, for XR runtimes whose compositor cannot flip it.
+ 	extern std::atomic<bool> flip_y;
++	/// Depth packing scale for the reprojection (0 = the raw depth value, as before). The packed
++	/// depth is 8 bits; a game whose depth only reaches small values (a 24-bit Z is at most 1/256 of
++	/// PCSX2's 32-bit depth range) loses its whole scene to 0 without it. With a scale, the packed
++	/// value is clamp(depth * scale, 0, 1).
++	extern std::atomic<float> depth_scale;
+ 
+ 	// Depth rescue, GS thread only. Some games are done with their depth buffer before the frame
+ 	// is presented -- GT4 reuses its memory as a colour target for post effects, and the texture
+diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
+index c29a513a0f..ef8c54813a 100644
+--- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
++++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
+@@ -6201,6 +6201,9 @@ GSTexture* GSDeviceVK::PrepareStereoFrame(GSTexture* sTex, GSTexture* depth)
+ 	// not), and sampling one through a linear sampler reads back as zero -- which is a frame with no
+ 	// depth at all, i.e. a flat picture. Nearest is also what depth wants: averaging across a
+ 	// silhouette invents a distance that is neither surface.
++	const float depth_scale = GSStereo::depth_scale.load(std::memory_order_relaxed);
++	const GSVector4 depth_cb(depth_scale > 0.0f ? depth_scale : 1.0f, 0.0f, 0.0f, 0.0f);
++	SetUtilityPushConstants(&depth_cb, sizeof(depth_cb));
+ 	DoStretchRect(static_cast<GSTextureVK*>(depth), full_uv, static_cast<GSTextureVK*>(m_stereo_packed),
+ 		full_rect, m_depth_to_alpha, Nearest, false);
+ 	return m_stereo_packed;
+-- 
+2.53.0
+

@@ -1,0 +1,100 @@
+From fe7ca738bbee793b6c04e2a1fef00445d398ff1c Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 21:16:54 +0100
+Subject: [PATCH 06/44] RRV bridge 0007-full-frame-round-sprite-u-only
+
+Fukami tools/patches/pcsx2/0007-full-frame-round-sprite-u-only.patch, applied to ARMSX2 by a clean three-way merge.
+---
+ pcsx2/GS/GS.cpp                        | 5 +++++
+ pcsx2/GS/GS.h                          | 7 +++++++
+ pcsx2/GS/GSState.cpp                   | 1 +
+ pcsx2/GS/GSState.h                     | 1 +
+ pcsx2/GS/Renderers/HW/GSRendererHW.cpp | 7 +++++--
+ 5 files changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/pcsx2/GS/GS.cpp b/pcsx2/GS/GS.cpp
+index b787c8d2f2..f953664381 100644
+--- a/pcsx2/GS/GS.cpp
++++ b/pcsx2/GS/GS.cpp
+@@ -94,6 +94,11 @@ u64 GSRrvGetFieldOfyCanonicalCount()
+ 	return GSState::s_rrv_ofy_canonical_count.load(std::memory_order_relaxed);
+ }
+ 
++void GSRrvSetRoundSpriteUOnly(bool u_only)
++{
++	GSState::s_rrv_round_sprite_u_only = u_only;
++}
++
+ static GSRendererType GSCurrentRenderer;
+ static bool GSCurrentPresenterOffsetsRead;
+ 
+diff --git a/pcsx2/GS/GS.h b/pcsx2/GS/GS.h
+index 317195af6b..5ddbc74044 100644
+--- a/pcsx2/GS/GS.h
++++ b/pcsx2/GS/GS.h
+@@ -93,6 +93,13 @@ u64 GSRrvGetDirectPresentCount();
+ // one progressive raster grid. from == to (the default) is a no-op.
+ void GSRrvSetFieldOfyCanonical(u32 from_ofy, u32 to_ofy);
+ u64 GSRrvGetFieldOfyCanonicalCount();
++// RRV Gate-6 full-frame extension. When set, the HW RoundSprite fix leaves V
++// alone on sprites that are vertically minified (texel span > pixel span, e.g.
++// RR5 fonts drawing a full-height glyph into a half-height field sprite, each
++// field sampling alternate texel rows). Full mode rasterizes 448 progressive
++// rows, so rounding V to the native field texel grid would drop the rows the
++// other field shows. 1:1 sprites (post-processing page strips) keep V rounding.
++void GSRrvSetRoundSpriteUOnly(bool u_only);
+ void GSvsync(u32 field, bool registers_written);
+ // Manual frameskip (Android low-end devices): present 1 of every (frames+1)
+ // VSyncs, skipping presentation of the rest. 0 disables. See GSRenderer::VSync.
+diff --git a/pcsx2/GS/GSState.cpp b/pcsx2/GS/GSState.cpp
+index 569c02b8af..86e5fe9026 100644
+--- a/pcsx2/GS/GSState.cpp
++++ b/pcsx2/GS/GSState.cpp
+@@ -27,6 +27,7 @@
+ u32 GSState::s_rrv_ofy_from = 0;
+ u32 GSState::s_rrv_ofy_to = 0;
+ std::atomic<u64> GSState::s_rrv_ofy_canonical_count{0};
++bool GSState::s_rrv_round_sprite_u_only = false;
+ 
+ GSHWAutoFlushLevel GSState::GetAutoFlushLevel() const
+ {
+diff --git a/pcsx2/GS/GSState.h b/pcsx2/GS/GSState.h
+index 0e995ba705..32a0bd0863 100644
+--- a/pcsx2/GS/GSState.h
++++ b/pcsx2/GS/GSState.h
+@@ -626,6 +626,7 @@ public:
+ 	static u32 s_rrv_ofy_from;
+ 	static u32 s_rrv_ofy_to;
+ 	static std::atomic<u64> s_rrv_ofy_canonical_count;
++	static bool s_rrv_round_sprite_u_only;
+ 
+ 	GSPerfMon m_perfmon_frame; // Track stat across a frame.
+ 	GSPerfMon m_perfmon_draw;  // Track stat across a draw.
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index 1045011a59..70a547ebd9 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -3147,7 +3147,10 @@ void GSRendererHW::RoundSpriteOffset()
+ 			}
+ 		}
+ #endif
+-#if 1
++		// RRV Gate-6 full-frame extension (GSRrvSetRoundSpriteUOnly): skip V
++		// rounding on vertically minified sprites.
++		if (!s_rrv_round_sprite_u_only || std::abs(static_cast<int>(v[i + 1].V) - static_cast<int>(v[i].V)) <= std::abs(Ly) + 8)
++		{
+ 		if (linear)
+ 		{
+ 			const int Lv = v[i + 1].V - v[i].V;
+@@ -3169,7 +3172,7 @@ void GSRendererHW::RoundSpriteOffset()
+ 				v[i + 1].V = ty1;
+ 			}
+ 		}
+-#endif
++		}
+ 
+ #ifdef DEBUG_U
+ 		if (debug)
+-- 
+2.53.0
+

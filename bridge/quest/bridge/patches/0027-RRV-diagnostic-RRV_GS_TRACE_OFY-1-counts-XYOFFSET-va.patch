@@ -1,0 +1,96 @@
+From bcb6ceebe967b17fae38fd3b0b4900cde0ec6733 Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 22:40:15 +0100
+Subject: [PATCH 27/44] RRV diagnostic: RRV_GS_TRACE_OFY=1 counts XYOFFSET
+ values per even/odd vsync
+
+---
+ pcsx2/GS/GS.h                          |  1 +
+ pcsx2/GS/GSState.cpp                   | 40 ++++++++++++++++++++++++++
+ pcsx2/GS/Renderers/HW/GSRendererHW.cpp |  1 +
+ 3 files changed, 42 insertions(+)
+
+diff --git a/pcsx2/GS/GS.h b/pcsx2/GS/GS.h
+index a9efd98c56..cadf9a4c03 100644
+--- a/pcsx2/GS/GS.h
++++ b/pcsx2/GS/GS.h
+@@ -92,6 +92,7 @@ u64 GSRrvGetDirectPresentCount();
+ // field parities of a half-line (sceGsSetHalfOffset-style) odd-field offset on
+ // one progressive raster grid. from == to (the default) is a no-op.
+ void GSRrvSetFieldOfyCanonical(u32 from_ofy, u32 to_ofy);
++void GSRrvOfyTraceVsync();
+ u64 GSRrvGetFieldOfyCanonicalCount();
+ // RRV Gate-6 full-frame extension. When set, the HW RoundSprite fix leaves V
+ // alone on sprites that are vertically minified (texel span > pixel span, e.g.
+diff --git a/pcsx2/GS/GSState.cpp b/pcsx2/GS/GSState.cpp
+index cca1bb7ad5..77b568a182 100644
+--- a/pcsx2/GS/GSState.cpp
++++ b/pcsx2/GS/GSState.cpp
+@@ -3159,12 +3159,52 @@ void GSState::GIFRegHandlerTEX2(const GIFReg* RESTRICT r)
+ 	ApplyTEX0<i>(TEX0);
+ }
+ 
++// RRV diagnostic (RRV_GS_TRACE_OFY=1): which XYOFFSET values a game writes on even and odd vsyncs,
++// printed every 600 vsyncs. Games that jitter OFY by half a line per field (for interlaced TVs)
++// make a progressive picture shimmer by one line.
++namespace rrv_ofy_trace
++{
++	static const bool s_on = [] { const char* v = std::getenv("RRV_GS_TRACE_OFY"); return v && v[0] == '1'; }();
++	struct Entry { u32 ofx, ofy, count[2]; };
++	static Entry s_e[24];
++	static u32 s_n = 0, s_vsync = 0;
++	static void Note(u64 v)
++	{
++		const u32 ofx = static_cast<u32>(v & 0xFFFFu), ofy = static_cast<u32>((v >> 32) & 0xFFFFu);
++		for (u32 k = 0; k < s_n; k++)
++			if (s_e[k].ofx == ofx && s_e[k].ofy == ofy)
++			{
++				s_e[k].count[s_vsync & 1]++;
++				return;
++			}
++		if (s_n < std::size(s_e))
++		{
++			s_e[s_n] = {ofx, ofy, {0, 0}};
++			s_e[s_n++].count[s_vsync & 1] = 1;
++		}
++	}
++} // namespace rrv_ofy_trace
++
++void GSRrvOfyTraceVsync()
++{
++	using namespace rrv_ofy_trace;
++	if (!s_on)
++		return;
++	if (++s_vsync % 600 != 0)
++		return;
++	for (u32 k = 0; k < s_n; k++)
++		std::fprintf(stderr, "[ofy] ofx 0x%04x ofy 0x%04x: even %u odd %u\n", s_e[k].ofx, s_e[k].ofy, s_e[k].count[0], s_e[k].count[1]);
++	s_n = 0;
++}
++
+ template <int i>
+ void GSState::GIFRegHandlerXYOFFSET(const GIFReg* RESTRICT r)
+ {
+ 	GL_REG("XYOFFSET_%d = 0x%x_%x", i, r->U32[1], r->U32[0]);
+ 
+ 	u64 r_masked = r->U64 & XYOFFSET_REG_MASK;
++	if (rrv_ofy_trace::s_on)
++		rrv_ofy_trace::Note(r_masked);
+ 
+ 	// RRV Gate-6 full-frame extension: canonical field OFY (off unless set).
+ 	if (s_rrv_ofy_from != s_rrv_ofy_to && static_cast<u32>((r_masked >> 32) & 0xFFFFu) == s_rrv_ofy_from)
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index cdd0fecd95..d46fafe8fd 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -263,6 +263,7 @@ void GSRendererHW::VSync(u32 field, bool registers_written, bool idle_frame)
+ 
+ 	GSRenderer::VSync(field, registers_written, idle_frame);
+ 	rrv_hud_split::FieldStart();
++	GSRrvOfyTraceVsync();
+ }
+ 
+ GSTexture* GSRendererHW::GetStereoDepthTexture()
+-- 
+2.53.0
+

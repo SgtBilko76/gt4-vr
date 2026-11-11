@@ -1,0 +1,30 @@
+From 0c98eda100b744d2e9f8f5973cb4052297d41fd5 Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 15:19:13 +0100
+Subject: [PATCH 44/44] Quest VR: flip_y also draws the HUD layer's strip
+ upside down (runtimes without a compositor flip, Pico)
+
+---
+ pcsx2/GS/Renderers/Common/GSRenderer.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.cpp b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+index d74c4e9a7c..9d41cb5403 100644
+--- a/pcsx2/GS/Renderers/Common/GSRenderer.cpp
++++ b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+@@ -1379,8 +1379,11 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
+ 					if (hud_rows > 0 && hud_rows <= pres_size.y / 2 && GSStereo::s_hud_tex && GSStereo::s_hud_age < 8 &&
+ 						GSStereo::hud_layer.load(std::memory_order_relaxed))
+ 					{
+-						const GSVector4 hud_rect(0.0f, static_cast<float>(pres_size.y - hud_rows),
++						GSVector4 hud_rect(0.0f, static_cast<float>(pres_size.y - hud_rows),
+ 							static_cast<float>(pres_size.x / 2), static_cast<float>(pres_size.y));
++						// Upside down like the eyes when the compositor has no flip (flip_y).
++						if (GSStereo::flip_y.load(std::memory_order_relaxed))
++							hud_rect = GSVector4(hud_rect.x, hud_rect.w, hud_rect.z, hud_rect.y);
+ 						const float tw = static_cast<float>(GSStereo::s_hud_tex->GetWidth());
+ 						const float th = static_cast<float>(GSStereo::s_hud_tex->GetHeight());
+ 						const GSVector4 hud_uv = GSStereo::s_hud_src / GSVector4(tw, th, tw, th);
+-- 
+2.53.0
+

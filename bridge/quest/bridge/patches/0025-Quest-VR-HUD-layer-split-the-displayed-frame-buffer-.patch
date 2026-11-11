@@ -1,0 +1,473 @@
+From d7ff1d9f2ea4fd6e87875c8bb5a7cc949871b170 Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 21:41:14 +0100
+Subject: [PATCH 25/44] Quest VR HUD layer: split the displayed frame buffer at
+ the first 2D draw after the composite; clean picture to the eyes, HUD on
+ transparent black into a strip of the surface
+
+---
+ bin/resources/shaders/vulkan/present.glsl |  13 ++
+ pcsx2/GS/Renderers/Common/GSDevice.h      |   6 +
+ pcsx2/GS/Renderers/Common/GSRenderer.cpp  |  31 +++-
+ pcsx2/GS/Renderers/Common/GSRenderer.h    |  15 ++
+ pcsx2/GS/Renderers/HW/GSRendererHW.cpp    | 169 ++++++++++++++++++++++
+ pcsx2/GS/Renderers/HW/GSRendererHW.h      |   3 +
+ pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp  |  44 ++++++
+ pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h    |   3 +
+ 8 files changed, 282 insertions(+), 2 deletions(-)
+
+diff --git a/bin/resources/shaders/vulkan/present.glsl b/bin/resources/shaders/vulkan/present.glsl
+index 3055ec88a5..779e6d1901 100644
+--- a/bin/resources/shaders/vulkan/present.glsl
++++ b/bin/resources/shaders/vulkan/present.glsl
+@@ -447,6 +447,19 @@ void ps_automagical_supersampling()
+ }
+ #endif
+ 
++#ifdef ps_hud_layer
++// Quest VR HUD layer. The HUD was drawn over transparent black, so its colour is premultiplied by
++// the PS2 alpha; the target's alpha is the PS2 one (0x80 = 1.0, a single bit in a 16-bit frame
++// buffer). A pixel is at least as opaque as it is bright -- a premultiplied colour cannot exceed
++// its alpha -- which recovers the soft edges a one-bit alpha drops.
++void ps_hud_layer()
++{
++	const vec4 c = sample_c(v_tex);
++	const float a = max(clamp(c.a * (255.0f / 128.0f), 0.0f, 1.0f), max(c.r, max(c.g, c.b)));
++	o_col0 = vec4(c.rgb, a);
++}
++#endif
++
+ #ifdef ps_stereo
+ // Depth-reprojected stereo for the Quest virtual screen. samp0 carries the frame in RGB and its
+ // depth buffer in A (packed by GSDeviceVK::PrepareStereoFrame). Each eye samples the frame at a
+diff --git a/pcsx2/GS/Renderers/Common/GSDevice.h b/pcsx2/GS/Renderers/Common/GSDevice.h
+index 6a73bbc726..8889e8b808 100644
+--- a/pcsx2/GS/Renderers/Common/GSDevice.h
++++ b/pcsx2/GS/Renderers/Common/GSDevice.h
+@@ -2050,6 +2050,12 @@ public:
+ 		const GSVector4& /*dRectRight*/, float /*separation*/, float /*convergence*/, float /*shaderTime*/,
+ 		Filter /*filter*/) {}
+ 
++	/// Quest VR HUD layer: draws the HUD texture (premultiplied, PS2 alpha) into its strip of the
++	/// surface with straight alpha, so the XR quad layer blends it. Inside the present pass.
++	virtual void PresentHudRect(GSTexture* /*sTex*/, const GSVector4& /*sRect*/, const GSVector4& /*dRect*/) {}
++	/// Makes the HUD texture sampleable. MUST be called BEFORE BeginPresentFrame.
++	virtual void PrepareHudTexture(GSTexture* /*tex*/) {}
++
+ 	/// Same as doing StretchRect for each item, except tries to batch together rectangles in as few draws as possible.
+ 	/// The provided list should be sorted by texture, the implementations only check if it's the same as the last.
+ 	void DrawMultiStretchRects(const MultiStretchRect* rects, u32 num_rects, GSTexture* dTex, ShaderConvertSelector shader = ShaderConvert::COPY)
+diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.cpp b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+index e2423ce26c..8e3838f5af 100644
+--- a/pcsx2/GS/Renderers/Common/GSRenderer.cpp
++++ b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+@@ -811,6 +811,11 @@ namespace GSStereo
+ 	std::atomic<float> debug_depth{0.0f};
+ 	std::atomic<bool> flip_y{false};
+ 	std::atomic<float> depth_scale{0.0f};
++	std::atomic<bool> hud_layer{false};
++	std::atomic<int> hud_rows{0};
++	GSTexture* s_hud_tex = nullptr;
++	GSVector4 s_hud_src = GSVector4::zero();
++	u32 s_hud_age = ~0u;
+ 
+ 	// GSRrvSetStereoHudRects: set and read on the GS thread (the bridge calls it right before
+ 	// GSvsync), so no lock.
+@@ -913,10 +918,12 @@ bool GSRenderer::CalculateStereoDrawRects(const GSVector4i& src_rect, const GSVe
+ 
+ 	const GSVector2i pres_size = g_gs_device->GetPresentationSize();
+ 	const int half_width = pres_size.x / 2;
+-	if (half_width <= 0)
++	// The eyes take the rows above the HUD layer's strip.
++	const int eye_height = pres_size.y - std::clamp(GSStereo::hud_rows.load(std::memory_order_relaxed), 0, pres_size.y / 2);
++	if (half_width <= 0 || eye_height <= 0)
+ 		return false;
+ 
+-	left_rect = CalculateDrawDstRect(half_width, pres_size.y, src_rect, src_size, s_display_alignment,
++	left_rect = CalculateDrawDstRect(half_width, eye_height, src_rect, src_size, s_display_alignment,
+ 		g_gs_device->UsesLowerLeftOrigin(), GetVideoMode() == GSVideoMode::SDTV_480P);
+ 	right_rect = left_rect + GSVector4(static_cast<float>(half_width), 0.0f, static_cast<float>(half_width), 0.0f);
+ 
+@@ -1319,6 +1326,9 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
+ 			}
+ 		}
+ 
++		if (stereo_eyes && GSStereo::s_hud_tex && GSStereo::hud_layer.load(std::memory_order_relaxed))
++			g_gs_device->PrepareHudTexture(GSStereo::s_hud_tex);
++
+ 		if (BeginPresentFrame(false))
+ 		{
+ 			if (current && !blank_frame)
+@@ -1347,6 +1357,23 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
+ 					g_gs_device->PresentRect(current, src_uv, nullptr, draw_rect,
+ 						s_tv_shader_indices[GSConfig.TVShader], shader_time, BilnIf(GSConfig.LinearPresent != GSPostBilinearMode::Off));
+ 				}
++				// The HUD layer's strip: the last split's HUD while it is fresh, else nothing (the
++				// present clear leaves it transparent).
++				if (stereo_eyes)
++				{
++					const int hud_rows = GSStereo::hud_rows.load(std::memory_order_relaxed);
++					const GSVector2i pres_size = g_gs_device->GetPresentationSize();
++					if (hud_rows > 0 && hud_rows <= pres_size.y / 2 && GSStereo::s_hud_tex && GSStereo::s_hud_age < 8 &&
++						GSStereo::hud_layer.load(std::memory_order_relaxed))
++					{
++						const GSVector4 hud_rect(0.0f, static_cast<float>(pres_size.y - hud_rows),
++							static_cast<float>(pres_size.x / 2), static_cast<float>(pres_size.y));
++						const float tw = static_cast<float>(GSStereo::s_hud_tex->GetWidth());
++						const float th = static_cast<float>(GSStereo::s_hud_tex->GetHeight());
++						const GSVector4 hud_uv = GSStereo::s_hud_src / GSVector4(tw, th, tw, th);
++						g_gs_device->PresentHudRect(GSStereo::s_hud_tex, hud_uv, hud_rect);
++					}
++				}
+ 				// This condition IS "the GS produced a frame this vsync" — every other present
+ 				// path either has no output to draw or redraws the previous one. Frame generation
+ 				// reads it so it does not interpolate motion into frames the game never drew.
+diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.h b/pcsx2/GS/Renderers/Common/GSRenderer.h
+index 9c781cbeaf..d39f2d55e1 100644
+--- a/pcsx2/GS/Renderers/Common/GSRenderer.h
++++ b/pcsx2/GS/Renderers/Common/GSRenderer.h
+@@ -35,6 +35,21 @@ namespace GSStereo
+ 	/// value is clamp(depth * scale, 0, 1).
+ 	extern std::atomic<float> depth_scale;
+ 
++	// Quest VR HUD layer (Wipeout Rewrite VR style: the race HUD on its own flat screen in front of
++	// the 3D view). With hud_layer on, the HW renderer splits the displayed frame buffer at the
++	// first 2D draw after the frame's composite (the full-width copy of a 3D target into it): the
++	// picture up to there is kept for the eyes, everything drawn after it lands on a transparent
++	// background and becomes the HUD. hud_rows reserves that many rows at the bottom of the
++	// presentation surface for the HUD (0 = none); the eyes get the rows above.
++	extern std::atomic<bool> hud_layer;
++	extern std::atomic<int> hud_rows;
++	/// GS thread: the last split's HUD (the frame buffer target after the 2D draws, on transparent
++	/// black) and the source rectangle the CRTC shows from it, in texels. hud_age counts vsyncs
++	/// since it was taken; a stale one is not shown.
++	extern GSTexture* s_hud_tex;
++	extern GSVector4 s_hud_src;
++	extern u32 s_hud_age;
++
+ 	// Depth rescue, GS thread only. Some games are done with their depth buffer before the frame
+ 	// is presented -- GT4 reuses its memory as a colour target for post effects, and the texture
+ 	// cache then destroys the depth target. The HW renderer names the frame's main depth target
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index ecd29554c9..86f01e686c 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -124,6 +124,83 @@ void GSRendererHW::UpdateSettings(const Pcsx2Config::GSOptions& old_config)
+ 	SetTCOffset();
+ }
+ 
++// Quest VR HUD layer, GS thread only. Per field: which frame buffers had depth-tested draws (the
++// 3D targets), the composite (a full-width textured copy of a 3D target into another buffer --
++// GT4's race picture into the frame buffer the CRTC shows) and whether that buffer was split.
++// The split copies the buffer's picture aside ("clean") and clears it to transparent black; the
++// HUD then draws onto nothing. GetOutput, when the CRTC reads the buffer, takes the HUD out and
++// puts the clean picture back, so the eyes get the scene and the HUD goes to its own layer.
++namespace rrv_hud_split
++{
++	static u32 s_3d[8];
++	static u32 s_3d_count = 0;
++	static int s_comp_fbp = -1;
++	static u32 s_comp_tbp = 0;
++	static int s_split_fbp = -1;
++	struct Buffer
++	{
++		int fbp = -1;
++		GSTexture* clean = nullptr;
++		bool pending = false;
++	};
++	static Buffer s_buf[2];
++	// Frame buffers the CRTC read recently (GetOutput). Only these are split: GT4 also copies 3D
++	// targets into its main 3D buffer (post effects), and clearing that one wipes the scene.
++	static int s_displayed[4] = {-1, -1, -1, -1};
++	static u32 s_displayed_next = 0;
++	static bool IsDisplayed(int fbp)
++	{
++		for (int d : s_displayed)
++			if (d == fbp)
++				return true;
++		return false;
++	}
++	static void NoteDisplayed(int fbp)
++	{
++		if (!IsDisplayed(fbp))
++			s_displayed[s_displayed_next++ & 3u] = fbp;
++	}
++	static u32 s_splits = 0, s_resolves = 0, s_fields = 0;
++
++	static bool Is3d(u32 fbp)
++	{
++		for (u32 i = 0; i < s_3d_count; i++)
++			if (s_3d[i] == fbp)
++				return true;
++		return false;
++	}
++	static void Note3d(u32 fbp)
++	{
++		if (!Is3d(fbp) && s_3d_count < std::size(s_3d))
++			s_3d[s_3d_count++] = fbp;
++	}
++	static Buffer& Slot(int fbp)
++	{
++		for (Buffer& b : s_buf)
++			if (b.fbp == fbp)
++				return b;
++		for (Buffer& b : s_buf)
++			if (!b.pending)
++				return b;
++		return s_buf[0];
++	}
++	static void FieldStart()
++	{
++		s_3d_count = 0;
++		s_comp_fbp = -1;
++		s_split_fbp = -1;
++		GSStereo::s_hud_age += (GSStereo::s_hud_age < 0x7fffffffu) ? 1u : 0u;
++		if (++s_fields >= 600)
++		{
++#if defined(__ANDROID__)
++			if (GSStereo::hud_layer.load(std::memory_order_relaxed))
++				std::fprintf(stderr, "[hud-layer] %u splits, %u shown in %u fields\n", s_splits, s_resolves, s_fields);
++#endif
++			s_splits = s_resolves = s_fields = 0;
++		}
++	}
++} // namespace rrv_hud_split
++
+ void GSRendererHW::VSync(u32 field, bool registers_written, bool idle_frame)
+ {
+ 	// Retire whatever the GPU finished since the last frame. Runs unconditionally: after the
+@@ -177,6 +254,7 @@ void GSRendererHW::VSync(u32 field, bool registers_written, bool idle_frame)
+ 	m_skip_offset = 0;
+ 
+ 	GSRenderer::VSync(field, registers_written, idle_frame);
++	rrv_hud_split::FieldStart();
+ }
+ 
+ GSTexture* GSRendererHW::GetStereoDepthTexture()
+@@ -202,6 +280,60 @@ GSTexture* GSRendererHW::GetStereoDepthTexture()
+ 	return rescued;
+ }
+ 
++
++void GSRendererHW::RrvHudSplitNoteDraw()
++{
++	using namespace rrv_hud_split;
++	const u32 fbp = m_cached_ctx.FRAME.FBP;
++	const GIFRegTEST& test = m_cached_ctx.TEST;
++	if (test.ZTE && test.ZTST >= 2)
++	{
++		Note3d(fbp);
++		return;
++	}
++	if (s_split_fbp == static_cast<int>(fbp))
++		return;
++	const bool tme = PRIM->TME;
++	const u32 tbp = m_cached_ctx.TEX0.TBP0;
++	const GSVector4 box = m_vt.m_min.p.xyxy(m_vt.m_max.p);
++	if (tme && (tbp & 31u) == 0 && (tbp >> 5) != fbp && Is3d(tbp >> 5) && (box.z - box.x) >= 600.0f)
++	{
++		s_comp_fbp = static_cast<int>(fbp);
++		s_comp_tbp = tbp;
++		return;
++	}
++	if (s_comp_fbp != static_cast<int>(fbp) || (tme && tbp == s_comp_tbp) || !IsDisplayed(static_cast<int>(fbp)))
++		return;
++
++	// The first draw over the composite that is not part of it: the HUD starts here.
++	s_split_fbp = static_cast<int>(fbp);
++	GSTextureCache::Target* rt = g_texture_cache->GetExactTarget(fbp << 5, m_cached_ctx.FRAME.FBW, GSTextureCache::RenderTarget, fbp << 5);
++	if (!rt || !rt->m_texture)
++		return;
++	GSTexture* const t = rt->m_texture;
++	Buffer& b = Slot(static_cast<int>(fbp));
++	if (b.clean && b.clean->GetSize() != t->GetSize())
++	{
++		g_gs_device->Recycle(b.clean);
++		b.clean = nullptr;
++	}
++	if (!b.clean)
++		b.clean = g_gs_device->CreateRenderTarget(t->GetWidth(), t->GetHeight(), GSTexture::Format::Color, false);
++	if (!b.clean)
++		return;
++	g_gs_device->CopyRect(t, b.clean, GSVector4i(0, 0, t->GetWidth(), t->GetHeight()), 0, 0);
++	g_gs_device->ClearRenderTarget(t, 0u);
++	b.fbp = static_cast<int>(fbp);
++	b.pending = true;
++	s_splits++;
++#if defined(__ANDROID__)
++	static u32 s_dbg = 0;
++	if (s_dbg < 40 && ++s_dbg)
++		std::fprintf(stderr, "[hud-layer] split fbp 0x%x fbw %u (comp tbp 0x%x) tex %dx%d draw %d\n", fbp, m_cached_ctx.FRAME.FBW,
++			s_comp_tbp, t->GetWidth(), t->GetHeight(), s_n);
++#endif
++}
++
+ GSTexture* GSRendererHW::GetOutput(int i, float& scale, int& y_offset)
+ {
+ 	int index = i >= 0 ? i : 1;
+@@ -239,6 +371,41 @@ GSTexture* GSRendererHW::GetOutput(int i, float& scale, int& y_offset)
+ 			GL_CACHE("HW: Frame y offset %d pixels, unit %d", y_offset, i);
+ 		}
+ 
++		// Quest VR HUD layer: a split buffer goes out as its clean picture; the HUD drawn over
++		// transparent black is kept for the HUD strip.
++		rrv_hud_split::NoteDisplayed(static_cast<int>(rt->m_TEX0.TBP0 >> 5));
++#if defined(__ANDROID__)
++		static u32 s_dbg_out = 0;
++		if (GSStereo::hud_layer.load(std::memory_order_relaxed) && s_dbg_out < 40 && ++s_dbg_out)
++			std::fprintf(stderr, "[hud-layer] output %d tbp 0x%x (dispfb fbp 0x%x) pend %d/0x%x %d/0x%x\n", i, rt->m_TEX0.TBP0,
++				curFramebuffer.Block() >> 5, rrv_hud_split::s_buf[0].pending, rrv_hud_split::s_buf[0].fbp,
++				rrv_hud_split::s_buf[1].pending, rrv_hud_split::s_buf[1].fbp);
++#endif
++		for (rrv_hud_split::Buffer& b : rrv_hud_split::s_buf)
++		{
++			if (!b.pending || b.fbp != static_cast<int>(rt->m_TEX0.TBP0 >> 5))
++				continue;
++			b.pending = false;
++			if (GSStereo::s_hud_tex && GSStereo::s_hud_tex->GetSize() != t->GetSize())
++			{
++				g_gs_device->Recycle(GSStereo::s_hud_tex);
++				GSStereo::s_hud_tex = nullptr;
++			}
++			if (!GSStereo::s_hud_tex)
++				GSStereo::s_hud_tex = g_gs_device->CreateRenderTarget(t->GetWidth(), t->GetHeight(), GSTexture::Format::Color, false);
++			if (!GSStereo::s_hud_tex || !b.clean)
++				break;
++			const GSVector4i full(0, 0, t->GetWidth(), t->GetHeight());
++			g_gs_device->CopyRect(t, GSStereo::s_hud_tex, full, 0, 0);
++			g_gs_device->CopyRect(b.clean, t, full.rintersect(GSVector4i(0, 0, b.clean->GetWidth(), b.clean->GetHeight())), 0, 0);
++			const GSVector4i fr = curFramebuffer.framebufferRect;
++			GSStereo::s_hud_src = GSVector4(static_cast<float>(fr.x), static_cast<float>(fr.y + y_offset),
++				static_cast<float>(fr.z), static_cast<float>(fr.w + y_offset)) * GSVector4(rt->m_scale, rt->m_scale, rt->m_scale, rt->m_scale);
++			GSStereo::s_hud_age = 0;
++			rrv_hud_split::s_resolves++;
++			break;
++		}
++
+ 		if (GSConfig.SaveFrame && GSConfig.ShouldDump(s_n, g_perfmon.GetFrame()))
+ 		{
+ 			t->Save(GetDrawDumpPath("%05lld_f%05lld_fr%d_%05x_%s.bmp", s_n, g_perfmon.GetFrame(), i, static_cast<int>(TEX0.TBP0), GSUtil::GetPSMName(TEX0.PSM)));
+@@ -3466,6 +3633,8 @@ void GSRendererHW::Draw()
+ 	}
+ 	if (s_rrv_skip_field.load(std::memory_order_relaxed))
+ 		return; // RRV_SKIP_FIELD: the bridge drops this field (GSRrvSetSkipField)
++	if (GSStereo::hud_layer.load(std::memory_order_relaxed))
++		RrvHudSplitNoteDraw();
+ 
+ 	// Sometimes everything will get reset and it will draw a single black point in the top left corner,
+ 	// which can cause invalid targets to be created, so might as well skip it.
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.h b/pcsx2/GS/Renderers/HW/GSRendererHW.h
+index c5c93f8b71..adbb22834f 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.h
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.h
+@@ -445,6 +445,9 @@ public:
+ 	void InvalidateLocalMem(const GIFRegBITBLTBUF& BITBLTBUF, const GSVector4i& r, bool clut = false) override;
+ 	void Move() override;
+ 	void Draw() override;
++	/// Quest VR HUD layer (GSStereo::hud_layer): finds the frame's composite and splits the frame
++	/// buffer at the first 2D draw over it.
++	void RrvHudSplitNoteDraw();
+ 
+ 	/// One-line PS2-level description of the draw about to be issued: primitive type,
+ 	/// framebuffer/depth/texture addresses and formats, blend and test state. Used for
+diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
+index 87de681f31..36eacd7a14 100644
+--- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
++++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
+@@ -262,7 +262,13 @@ static VkAttachmentLoadOp GetLoadOpForTexture(GSTextureVK* tex)
+ 	// clang-format on
+ }
+ 
++#if defined(__ANDROID__)
++// Quest: alpha 0, so the VR HUD layer's strip of the surface is see-through where nothing is drawn
++// (the eye layers are composited without alpha).
++static constexpr VkClearValue s_present_clear_color = {{{0.0f, 0.0f, 0.0f, 0.0f}}};
++#else
+ static constexpr VkClearValue s_present_clear_color = {{{0.0f, 0.0f, 0.0f, 1.0f}}};
++#endif
+ 
+ // We need to synchronize instance creation because of adapter enumeration from the UI thread.
+ static std::mutex s_instance_mutex;
+@@ -6421,6 +6427,17 @@ bool GSDeviceVK::CompileStereoPipelines()
+ 		if (!m_present_stereo)
+ 			return false;
+ 		Vulkan::SetObjectName(m_device, m_present_stereo, "Stereo present pipeline");
++
++		// HUD layer pass: same state, its own shader (alpha from PS2 alpha and coverage).
++		VkShaderModule hud_ps = GetUtilityFragmentShader(*present_source, "ps_hud_layer");
++		if (hud_ps == VK_NULL_HANDLE)
++			return false;
++		ScopedGuard hud_ps_guard([this, &hud_ps]() { vkDestroyShaderModule(m_device, hud_ps, nullptr); });
++		gpb.SetFragmentShader(hud_ps);
++		m_present_hud = gpb.Create(m_device, g_vulkan_shader_cache->GetPipelineCache(true), false);
++		if (!m_present_hud)
++			return false;
++		Vulkan::SetObjectName(m_device, m_present_hud, "HUD layer present pipeline");
+ 	}
+ 
+ 	// Depth-pack pass: writes ONLY alpha, so the frame already copied into the packed texture
+@@ -6538,6 +6555,31 @@ void GSDeviceVK::PresentStereoRect(GSTexture* sTex, const GSVector4& sRect, cons
+ 	}
+ }
+ 
++void GSDeviceVK::PresentHudRect(GSTexture* sTex, const GSVector4& sRect, const GSVector4& dRect)
++{
++	if (!m_stereo_compile_attempted)
++	{
++		m_stereo_compile_attempted = true;
++		if (!CompileStereoPipelines())
++			Console.Error("GS: Failed to compile stereo pipelines, VR stereo output is disabled.");
++	}
++	if (m_present_hud == VK_NULL_HANDLE || !sTex)
++		return;
++	DisplayConstantBuffer cb;
++	cb.SetSource(sRect, sTex->GetSize());
++	cb.SetTarget(dRect, GetPresentationSize());
++	cb.TimeAndPad = GSVector4::zero();
++	SetUtilityPushConstants(&cb, sizeof(cb));
++	DoStretchRect(static_cast<GSTextureVK*>(sTex), sRect, nullptr, dRect, m_present_hud, Filter::Biln, true);
++}
++
++void GSDeviceVK::PrepareHudTexture(GSTexture* tex)
++{
++	// Before the present pass: a layout transition inside it would end the swap chain's pass.
++	if (tex)
++		static_cast<GSTextureVK*>(tex)->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);
++}
++
+ bool GSDeviceVK::CompileConvertPipelines()
+ {
+ 	const std::optional<std::string> source = ReadShaderSource("shaders/vulkan/convert.glsl");
+@@ -7581,6 +7623,8 @@ void GSDeviceVK::DestroyResources()
+ 		vkDestroyPipeline(m_device, m_present_stereo, nullptr);
+ 	if (m_depth_to_alpha != VK_NULL_HANDLE)
+ 		vkDestroyPipeline(m_device, m_depth_to_alpha, nullptr);
++	if (m_present_hud != VK_NULL_HANDLE)
++		vkDestroyPipeline(m_device, m_present_hud, nullptr);
+ 	if (m_stereo_packed)
+ 	{
+ 		Recycle(m_stereo_packed);
+diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h
+index 3927be966d..603cd1c718 100644
+--- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h
++++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h
+@@ -540,6 +540,7 @@ private:
+ 	// runtime without them still starts, and a non-VR session never pays for them.
+ 	VkPipeline m_present_stereo = VK_NULL_HANDLE;
+ 	VkPipeline m_depth_to_alpha = VK_NULL_HANDLE;
++	VkPipeline m_present_hud = VK_NULL_HANDLE;
+ 	GSTexture* m_stereo_packed = nullptr;
+ 	bool m_stereo_compile_attempted = false;
+ 	std::array<VkPipeline, 2> m_merge{};
+@@ -773,6 +774,8 @@ public:
+ 	void PresentRect(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect,
+ 		PresentShader shader, float shaderTime, Filter filter) override;
+ 	GSTexture* PrepareStereoFrame(GSTexture* sTex, GSTexture* depth) override;
++	void PresentHudRect(GSTexture* sTex, const GSVector4& sRect, const GSVector4& dRect) override;
++	void PrepareHudTexture(GSTexture* tex) override;
+ 	void PresentStereoRect(GSTexture* sTex, const GSVector4& sRect, const GSVector4& dRectLeft,
+ 		const GSVector4& dRectRight, float separation, float convergence, float shaderTime, Filter filter) override;
+ 	bool CompileStereoPipelines();
+-- 
+2.53.0
+

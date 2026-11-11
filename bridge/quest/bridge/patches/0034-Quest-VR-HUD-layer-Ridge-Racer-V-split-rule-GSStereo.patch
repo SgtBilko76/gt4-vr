@@ -1,0 +1,124 @@
+From 9f3c4cd04ea1270ba881f01cb45010ef197c2c01 Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 18:41:57 +0100
+Subject: [PATCH 34/44] Quest VR HUD layer: Ridge Racer V split rule
+ (GSStereo::hud_split_z: first far-plane non-full-width 2D draw into a
+ displayed buffer after the field's 3D); split moved into RrvHudSplitAt
+
+---
+ pcsx2/GS/Renderers/Common/GSRenderer.cpp |  1 +
+ pcsx2/GS/Renderers/Common/GSRenderer.h   |  5 ++++
+ pcsx2/GS/Renderers/HW/GSRendererHW.cpp   | 34 ++++++++++++++++++++++--
+ pcsx2/GS/Renderers/HW/GSRendererHW.h     |  1 +
+ 4 files changed, 39 insertions(+), 2 deletions(-)
+
+diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.cpp b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+index 8b2851a5e0..d74c4e9a7c 100644
+--- a/pcsx2/GS/Renderers/Common/GSRenderer.cpp
++++ b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+@@ -814,6 +814,7 @@ namespace GSStereo
+ 	std::atomic<float> depth_mask{0.0f};
+ 	std::atomic<bool> hud_layer{false};
+ 	std::atomic<int> hud_rows{0};
++	std::atomic<u32> hud_split_z{0};
+ 	GSTexture* s_hud_tex = nullptr;
+ 	GSVector4 s_hud_src = GSVector4::zero();
+ 	u32 s_hud_age = ~0u;
+diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.h b/pcsx2/GS/Renderers/Common/GSRenderer.h
+index e79a5b6c7d..d12bfe76d7 100644
+--- a/pcsx2/GS/Renderers/Common/GSRenderer.h
++++ b/pcsx2/GS/Renderers/Common/GSRenderer.h
+@@ -44,6 +44,11 @@ namespace GSStereo
+ 	// presentation surface for the HUD (0 = none); the eyes get the rows above.
+ 	extern std::atomic<bool> hud_layer;
+ 	extern std::atomic<int> hud_rows;
++	/// Ridge Racer V rule (0 = the GT4 composite rule above): RR5 draws its 3D straight into the
++	/// displayed frame buffer and its HUD as 2D at the far plane, so the split comes at the first
++	/// draw into a displayed buffer whose vertices all have Z >= hud_split_z, after 3D was drawn
++	/// there in the field, and that is not full width (DoF copies and covers stay with the picture).
++	extern std::atomic<u32> hud_split_z;
+ 	/// GS thread: the last split's HUD (the frame buffer target after the 2D draws, on transparent
+ 	/// black) and the source rectangle the CRTC shows from it, in texels. hud_age counts vsyncs
+ 	/// since it was taken; a stale one is not shown.
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index d2e57a8ee9..cd5be7b9f2 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -214,6 +214,8 @@ namespace rrv_hud_split
+ 			s_displayed[s_displayed_next++ & 3u] = fbp;
+ 	}
+ 	static u32 s_splits = 0, s_resolves = 0, s_fields = 0;
++	// RR5 rule diagnostics: draws after the split that look like picture, not HUD.
++	static u32 s_late_3d = 0, s_late_wide = 0;
+ 
+ 	static bool Is3d(u32 fbp)
+ 	{
+@@ -248,9 +250,10 @@ namespace rrv_hud_split
+ 		{
+ #if defined(__ANDROID__)
+ 			if (GSStereo::hud_layer.load(std::memory_order_relaxed))
+-				std::fprintf(stderr, "[hud-layer] %u splits, %u shown in %u fields\n", s_splits, s_resolves, s_fields);
++				std::fprintf(stderr, "[hud-layer] %u splits, %u shown in %u fields (after a split: %u 3D draws, %u full-width)\n",
++					s_splits, s_resolves, s_fields, s_late_3d, s_late_wide);
+ #endif
+-			s_splits = s_resolves = s_fields = 0;
++			s_splits = s_resolves = s_fields = s_late_3d = s_late_wide = 0;
+ 		}
+ 	}
+ } // namespace rrv_hud_split
+@@ -394,6 +397,27 @@ void GSRendererHW::RrvHudSplitNoteDraw()
+ 	using namespace rrv_hud_split;
+ 	const u32 fbp = m_cached_ctx.FRAME.FBP;
+ 	const GIFRegTEST& test = m_cached_ctx.TEST;
++	if (const u32 split_z = GSStereo::hud_split_z.load(std::memory_order_relaxed); split_z != 0)
++	{
++		// Ridge Racer V (GSStereo::hud_split_z): HUD = 2D at the far plane, drawn last.
++		const float zf = static_cast<float>(split_z);
++		const bool far_plane = m_vt.m_min.p.z >= zf;
++		const bool wide = (m_vt.m_max.p.x - m_vt.m_min.p.x) >= 600.0f;
++		if (s_split_fbp == static_cast<int>(fbp))
++		{
++			s_late_3d += far_plane ? 0u : 1u;
++			s_late_wide += wide ? 1u : 0u;
++			return;
++		}
++		if (!far_plane)
++		{
++			Note3d(fbp);
++			return;
++		}
++		if (!wide && Is3d(fbp) && IsDisplayed(static_cast<int>(fbp)))
++			RrvHudSplitAt(fbp);
++		return;
++	}
+ 	if (test.ZTE && test.ZTST >= 2)
+ 	{
+ 		Note3d(fbp);
+@@ -414,6 +438,12 @@ void GSRendererHW::RrvHudSplitNoteDraw()
+ 		return;
+ 
+ 	// The first draw over the composite that is not part of it: the HUD starts here.
++	RrvHudSplitAt(fbp);
++}
++
++void GSRendererHW::RrvHudSplitAt(u32 fbp)
++{
++	using namespace rrv_hud_split;
+ 	s_split_fbp = static_cast<int>(fbp);
+ 	GSTextureCache::Target* rt = g_texture_cache->GetExactTarget(fbp << 5, m_cached_ctx.FRAME.FBW, GSTextureCache::RenderTarget, fbp << 5);
+ 	if (!rt || !rt->m_texture)
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.h b/pcsx2/GS/Renderers/HW/GSRendererHW.h
+index c6e2bcaf0b..34cb5c9012 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.h
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.h
+@@ -448,6 +448,7 @@ public:
+ 	/// Quest VR HUD layer (GSStereo::hud_layer): finds the frame's composite and splits the frame
+ 	/// buffer at the first 2D draw over it.
+ 	void RrvHudSplitNoteDraw();
++	void RrvHudSplitAt(u32 fbp);
+ 
+ 	/// One-line PS2-level description of the draw about to be issued: primitive type,
+ 	/// framebuffer/depth/texture addresses and formats, blend and test state. Used for
+-- 
+2.53.0
+

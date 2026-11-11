@@ -1,0 +1,130 @@
+From 9b1f6bc685a04f83d144594847be256d1b999fca Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 00:35:54 +0100
+Subject: [PATCH 43/44] Quest VR: skip GT4's hit flash in the VR view (previous
+ displayed frame blended over the shown one, (Cs-Cd)*FIX+Cd); it started the
+ HUD split and showed as a flat panel. RRV_GT4_HIT_FLASH_VR=1 keeps it
+
+---
+ pcsx2/GS/Renderers/HW/GSRendererHW.cpp | 48 +++++++++++++++++++-------
+ pcsx2/GS/Renderers/HW/GSRendererHW.h   |  2 +-
+ 2 files changed, 37 insertions(+), 13 deletions(-)
+
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index 82bcf189d5..6de9983c4f 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -387,8 +387,31 @@ GSTexture* GSRendererHW::GetStereoDepthTexture()
+ }
+ 
+ 
+-void GSRendererHW::RrvHudSplitNoteDraw()
+-{
++bool GSRendererHW::RrvHudSplitNoteDraw()
++{
++	// GT4 hit flash (owner 2026-11-09: in VR it showed only on the HUD panel; asked to switch it off in
++	// VR). Measured on the Quest: a full-screen copy of the OTHER displayed frame buffer (the previous
++	// picture) blended over the shown one, (Cs - Cd) * FIX + Cd with FIX ~0x53, drawn right after the
++	// composite - so it was the first "HUD" draw and started the split. In the VR view (HUD layer on) it
++	// is skipped: a see-through old frame does not fit a head-tracked view. RRV_GT4_HIT_FLASH_VR=1 keeps it.
++	{
++		static const bool keep = [] { const char* v = std::getenv("RRV_GT4_HIT_FLASH_VR"); return v && v[0] == '1'; }();
++		const GIFRegALPHA& a = m_context->ALPHA;
++		const int dst = static_cast<int>(m_cached_ctx.FRAME.FBP);
++		const u32 tbp = m_cached_ctx.TEX0.TBP0;
++		// GT4 only: Ridge Racer V (same fork) runs the HUD split by hud_split_z.
++		if (!keep && GSStereo::hud_split_z.load(std::memory_order_relaxed) == 0 && PRIM->TME && (tbp & 31u) == 0 && static_cast<int>(tbp >> 5) != dst && a.A == 0 && a.B == 1 && a.C == 2 && a.D == 1 &&
++			(m_vt.m_max.p.x - m_vt.m_min.p.x) >= 600.0f && (m_vt.m_max.p.y - m_vt.m_min.p.y) >= 400.0f &&
++			rrv_hud_split::IsDisplayed(dst) && rrv_hud_split::IsDisplayed(static_cast<int>(tbp >> 5)))
++		{
++#if defined(__ANDROID__)
++			static u32 s_flash_logged = 0;
++			if (s_flash_logged < 5 && ++s_flash_logged)
++				std::fprintf(stderr, "[hud-layer] hit flash (previous frame 0x%x over 0x%x, FIX 0x%x) skipped in VR\n", tbp >> 5, dst, a.FIX);
++#endif
++			return true;
++		}
++	}
+ 	if (rrv_mirror::Enabled())
+ 	{
+ 		using namespace rrv_mirror;
+@@ -491,16 +514,16 @@ void GSRendererHW::RrvHudSplitNoteDraw()
+ 		{
+ 			s_late_3d += far_plane ? 0u : 1u;
+ 			s_late_wide += wide ? 1u : 0u;
+-			return;
++			return false;
+ 		}
+ 		if (!far_plane)
+ 		{
+ 			Note3d(fbp);
+-			return;
++			return false;
+ 		}
+ 		if (!wide && Is3d(fbp) && IsDisplayed(static_cast<int>(fbp)))
+ 			RrvHudSplitAt(fbp);
+-		return;
++		return false;
+ 	}
+ 	const GSVector4 box = m_vt.m_min.p.xyxy(m_vt.m_max.p);
+ 	const bool tme = PRIM->TME;
+@@ -557,26 +580,27 @@ void GSRendererHW::RrvHudSplitNoteDraw()
+ 					Resplit(*b, rt->m_texture);
+ 			}
+ 		}
+-		return;
++		return false;
+ 	}
+ 	if (test.ZTE && test.ZTST >= 2)
+ 	{
+ 		Note3d(fbp);
+-		return;
++		return false;
+ 	}
+ 	if (tme && (tbp & 31u) == 0 && (tbp >> 5) != fbp && Is3d(tbp >> 5) && (box.z - box.x) >= 600.0f)
+ 	{
+ 		s_comp_fbp = static_cast<int>(fbp);
+ 		s_comp_tbp = tbp;
+-		return;
++		return false;
+ 	}
+ 	if (s_comp_fbp != static_cast<int>(fbp) || (tme && tbp == s_comp_tbp) || !IsDisplayed(static_cast<int>(fbp)))
+-		return;
++		return false;
+ 	if (full_screen)
+-		return; // an effect over the whole composite stays in the picture; the HUD comes after it
++		return false; // an effect over the whole composite stays in the picture; the HUD comes after it
+ 
+ 	// The first draw over the composite that is not part of it: the HUD starts here.
+ 	RrvHudSplitAt(fbp);
++	return false;
+ }
+ 
+ void GSRendererHW::RrvHudSplitAt(u32 fbp)
+@@ -3954,8 +3978,8 @@ void GSRendererHW::Draw()
+ 			a.FIX = static_cast<u8>(std::clamp(static_cast<float>(a.FIX) * gain + 0.5f, 0.0f, 255.0f));
+ 		}
+ 	}
+-	if (GSStereo::hud_layer.load(std::memory_order_relaxed))
+-		RrvHudSplitNoteDraw();
++	if (GSStereo::hud_layer.load(std::memory_order_relaxed) && RrvHudSplitNoteDraw())
++		return; // GT4 hit flash in the VR view
+ 
+ 	// Sometimes everything will get reset and it will draw a single black point in the top left corner,
+ 	// which can cause invalid targets to be created, so might as well skip it.
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.h b/pcsx2/GS/Renderers/HW/GSRendererHW.h
+index 34cb5c9012..367af77a52 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.h
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.h
+@@ -447,7 +447,7 @@ public:
+ 	void Draw() override;
+ 	/// Quest VR HUD layer (GSStereo::hud_layer): finds the frame's composite and splits the frame
+ 	/// buffer at the first 2D draw over it.
+-	void RrvHudSplitNoteDraw();
++	bool RrvHudSplitNoteDraw(); // true = skip this draw (GT4 hit flash in VR)
+ 	void RrvHudSplitAt(u32 fbp);
+ 
+ 	/// One-line PS2-level description of the draw about to be issued: primitive type,
+-- 
+2.53.0
+

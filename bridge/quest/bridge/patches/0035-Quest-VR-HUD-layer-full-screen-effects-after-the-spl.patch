@@ -1,0 +1,144 @@
+From e7b9df18a020e7c4937e04fd94cc4985105231b3 Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 14:44:29 +0100
+Subject: [PATCH 35/44] Quest VR HUD layer: full-screen effects after the split
+ (GT4 hit flash) stay in the picture - rejoin/resplit around them
+
+---
+ pcsx2/GS/Renderers/HW/GSRendererHW.cpp | 71 ++++++++++++++++++++++++--
+ 1 file changed, 66 insertions(+), 5 deletions(-)
+
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index cd5be7b9f2..69901c159c 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -195,6 +195,11 @@ namespace rrv_hud_split
+ 		int fbp = -1;
+ 		GSTexture* clean = nullptr;
+ 		bool pending = false;
++		// Full-screen effect after the split (GT4's hit flash, owner 2026-11-08: it showed on the HUD
++		// panel only): the HUD drawn so far waits in `hud`, the scene is back in the target for the
++		// effect, and the next HUD draw (or the output) splits again.
++		GSTexture* hud = nullptr;
++		bool rejoined = false;
+ 	};
+ 	static Buffer s_buf[2];
+ 	// Frame buffers the CRTC read recently (GetOutput). Only these are split: GT4 also copies 3D
+@@ -213,7 +218,7 @@ namespace rrv_hud_split
+ 		if (!IsDisplayed(fbp))
+ 			s_displayed[s_displayed_next++ & 3u] = fbp;
+ 	}
+-	static u32 s_splits = 0, s_resolves = 0, s_fields = 0;
++	static u32 s_splits = 0, s_resolves = 0, s_fields = 0, s_rejoins = 0;
+ 	// RR5 rule diagnostics: draws after the split that look like picture, not HUD.
+ 	static u32 s_late_3d = 0, s_late_wide = 0;
+ 
+@@ -250,12 +255,49 @@ namespace rrv_hud_split
+ 		{
+ #if defined(__ANDROID__)
+ 			if (GSStereo::hud_layer.load(std::memory_order_relaxed))
+-				std::fprintf(stderr, "[hud-layer] %u splits, %u shown in %u fields (after a split: %u 3D draws, %u full-width)\n",
+-					s_splits, s_resolves, s_fields, s_late_3d, s_late_wide);
++				std::fprintf(stderr, "[hud-layer] %u splits, %u shown in %u fields (after a split: %u 3D draws, %u full-width, %u full-screen effects kept in the picture)\n",
++					s_splits, s_resolves, s_fields, s_late_3d, s_late_wide, s_rejoins);
+ #endif
+-			s_splits = s_resolves = s_fields = s_late_3d = s_late_wide = 0;
++			s_splits = s_resolves = s_fields = s_late_3d = s_late_wide = s_rejoins = 0;
+ 		}
+ 	}
++	static Buffer* Pending(int fbp)
++	{
++		for (Buffer& b : s_buf)
++			if (b.pending && b.fbp == fbp)
++				return &b;
++		return nullptr;
++	}
++	// Scene back into the target, HUD so far aside (see Buffer::rejoined).
++	static void Rejoin(Buffer& b, GSTexture* t)
++	{
++		if (b.rejoined || !b.clean)
++			return;
++		if (b.hud && b.hud->GetSize() != t->GetSize())
++		{
++			g_gs_device->Recycle(b.hud);
++			b.hud = nullptr;
++		}
++		if (!b.hud)
++			b.hud = g_gs_device->CreateRenderTarget(t->GetWidth(), t->GetHeight(), GSTexture::Format::Color, false);
++		if (!b.hud)
++			return;
++		const GSVector4i full(0, 0, t->GetWidth(), t->GetHeight());
++		g_gs_device->CopyRect(t, b.hud, full, 0, 0);
++		g_gs_device->CopyRect(b.clean, t, full.rintersect(GSVector4i(0, 0, b.clean->GetWidth(), b.clean->GetHeight())), 0, 0);
++		b.rejoined = true;
++		s_rejoins++;
++	}
++	// Split again: scene (now with the effect) to `clean`, the HUD so far back into the target.
++	static void Resplit(Buffer& b, GSTexture* t)
++	{
++		if (!b.rejoined)
++			return;
++		b.rejoined = false;
++		const GSVector4i full(0, 0, t->GetWidth(), t->GetHeight());
++		g_gs_device->CopyRect(t, b.clean, full.rintersect(GSVector4i(0, 0, b.clean->GetWidth(), b.clean->GetHeight())), 0, 0);
++		g_gs_device->CopyRect(b.hud, t, full.rintersect(GSVector4i(0, 0, b.hud->GetWidth(), b.hud->GetHeight())), 0, 0);
++	}
+ } // namespace rrv_hud_split
+ 
+ void GSRendererHW::VSync(u32 field, bool registers_written, bool idle_frame)
+@@ -423,11 +465,26 @@ void GSRendererHW::RrvHudSplitNoteDraw()
+ 		Note3d(fbp);
+ 		return;
+ 	}
++	const GSVector4 box = m_vt.m_min.p.xyxy(m_vt.m_max.p);
++	// Full-screen effect (GT4 hit flash): belongs to the picture, not the HUD layer.
++	const bool full_screen = (box.z - box.x) >= 600.0f && (box.w - box.y) >= 400.0f;
+ 	if (s_split_fbp == static_cast<int>(fbp))
++	{
++		if (Buffer* b = Pending(static_cast<int>(fbp)))
++		{
++			GSTextureCache::Target* rt = g_texture_cache->GetExactTarget(fbp << 5, m_cached_ctx.FRAME.FBW, GSTextureCache::RenderTarget, fbp << 5);
++			if (rt && rt->m_texture)
++			{
++				if (full_screen)
++					Rejoin(*b, rt->m_texture);
++				else
++					Resplit(*b, rt->m_texture);
++			}
++		}
+ 		return;
++	}
+ 	const bool tme = PRIM->TME;
+ 	const u32 tbp = m_cached_ctx.TEX0.TBP0;
+-	const GSVector4 box = m_vt.m_min.p.xyxy(m_vt.m_max.p);
+ 	if (tme && (tbp & 31u) == 0 && (tbp >> 5) != fbp && Is3d(tbp >> 5) && (box.z - box.x) >= 600.0f)
+ 	{
+ 		s_comp_fbp = static_cast<int>(fbp);
+@@ -436,6 +493,8 @@ void GSRendererHW::RrvHudSplitNoteDraw()
+ 	}
+ 	if (s_comp_fbp != static_cast<int>(fbp) || (tme && tbp == s_comp_tbp) || !IsDisplayed(static_cast<int>(fbp)))
+ 		return;
++	if (full_screen)
++		return; // an effect over the whole composite stays in the picture; the HUD comes after it
+ 
+ 	// The first draw over the composite that is not part of it: the HUD starts here.
+ 	RrvHudSplitAt(fbp);
+@@ -463,6 +522,7 @@ void GSRendererHW::RrvHudSplitAt(u32 fbp)
+ 	g_gs_device->ClearRenderTarget(t, 0u);
+ 	b.fbp = static_cast<int>(fbp);
+ 	b.pending = true;
++	b.rejoined = false;
+ 	s_splits++;
+ #if defined(__ANDROID__)
+ 	static u32 s_dbg = 0;
+@@ -523,6 +583,7 @@ GSTexture* GSRendererHW::GetOutput(int i, GSVector2& scale, int& y_offset)
+ 		{
+ 			if (!b.pending || b.fbp != static_cast<int>(rt->m_TEX0.TBP0 >> 5))
+ 				continue;
++			rrv_hud_split::Resplit(b, t); // a full-screen effect was the last draw
+ 			b.pending = false;
+ 			if (GSStereo::s_hud_tex && GSStereo::s_hud_tex->GetSize() != t->GetSize())
+ 			{
+-- 
+2.53.0
+

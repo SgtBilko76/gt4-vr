@@ -1,0 +1,313 @@
+From 8417b8ada4358aee31c3eedf7d89234cf4c567b0 Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 21:16:23 +0100
+Subject: [PATCH 01/44] RRV bridge 0001: bridge target and local-memory entry
+ points
+
+Fukami tools/patches/pcsx2/0001 adapted to ARMSX2: the RewriteLargeST
+backport (Config.h, GSState, GSRendererHW) is already in this tree from
+upstream and is not duplicated; the local-memory entry points fail closed
+unless the GS runs as one unqueued object (GSBackThreadMode Off).
+---
+ CMakeLists.txt           | 15 +++++++
+ pcsx2/GS/GS.cpp          | 85 ++++++++++++++++++++++++++++++++++++++++
+ pcsx2/GS/GS.h            | 16 ++++++++
+ pcsx2/GS/GSLocalMemory.h |  1 +
+ pcsx2/GS/GSState.cpp     | 72 ++++++++++++++++++++++++++++++++++
+ pcsx2/GS/GSState.h       | 11 ++++++
+ 6 files changed, 200 insertions(+)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0b29dcfa14..79f86c074d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -48,6 +48,21 @@ add_subdirectory(common)
+ # make pcsx2
+ add_subdirectory(pcsx2)
+ 
++if(DEFINED RRV_PCSX2_GS_BRIDGE_SOURCE_DIR)
++    # Escape hatch only. Forcing PCSX2's C reference scanline was the bridge's
++    # original workaround for not owning PCSX2's code reserve, and on ARM64 that
++    # reference path does NOT match the JIT rasterizer the reference runner uses
++    # (measured: dark 0.083 vs 0.014 on the same stream) -- it was the whole of
++    # KNOWN_ISSUES #21. The bridge now allocates the code reserve itself, so the
++    # JIT is the default and this stays OFF.
++    option(RRV_PCSX2_GS_BRIDGE_C_SCANLINE
++           "Force PCSX2's C reference scanline instead of the SW JIT rasterizer" OFF)
++    if(RRV_PCSX2_GS_BRIDGE_C_SCANLINE)
++        target_compile_definitions(PCSX2 PRIVATE RRV_PCSX2_GS_C_SCANLINE=1)
++    endif()
++    add_subdirectory("${RRV_PCSX2_GS_BRIDGE_SOURCE_DIR}" pcsx2-gs-bridge)
++endif()
++
+ if(ENABLE_QT_UI)
+ 	add_subdirectory(pcsx2-qt)
+ endif()
+diff --git a/pcsx2/GS/GS.cpp b/pcsx2/GS/GS.cpp
+index 1570b24662..57fdc8a075 100644
+--- a/pcsx2/GS/GS.cpp
++++ b/pcsx2/GS/GS.cpp
+@@ -24,6 +24,9 @@
+ #include "GS/Renderers/HW/GSTextureReplacements.h"
+ #include "VMManager.h"
+ 
++#include <atomic>
++#include <cstring>
++
+ #ifdef ENABLE_OPENGL
+ #include "GS/Renderers/OpenGL/GSDeviceOGL.h"
+ #endif
+@@ -62,6 +65,22 @@
+ #include <string_view>
+ 
+ Pcsx2Config::GSOptions GSConfig;
++static std::atomic<u64> s_rrv_direct_present_count{0};
++
++void GSRrvResetDirectPresentCount()
++{
++	s_rrv_direct_present_count.store(0, std::memory_order_relaxed);
++}
++
++void GSRrvRecordDirectPresent()
++{
++	s_rrv_direct_present_count.fetch_add(1, std::memory_order_relaxed);
++}
++
++u64 GSRrvGetDirectPresentCount()
++{
++	return s_rrv_direct_present_count.load(std::memory_order_relaxed);
++}
+ 
+ static GSRendererType GSCurrentRenderer;
+ static bool GSCurrentPresenterOffsetsRead;
+@@ -510,6 +529,72 @@ void GSReadLocalMemoryUnsync(u8* mem, u32 qwc, u64 BITBLITBUF, u64 TRXPOS, u64 T
+ 	GSParseTarget()->ReadLocalMemoryUnsync(mem, qwc, GIFRegBITBLTBUF{BITBLITBUF}, GIFRegTRXPOS{TRXPOS}, GIFRegTRXREG{TRXREG});
+ }
+ 
++// ARMSX2 port of the RRV bridge entry points: ARMSX2's GS can split parsing and
++// rendering across a front object and a back thread (GSConfig.BackThreadMode).
++// The bridge reads and writes g_gs_renderer's transfer cursor and local memory
++// directly, which is only coherent with a single, unqueued GS object (mode Off,
++// the default). Fail closed otherwise instead of racing the back thread.
++static bool GSRrvDirectAccessSafe()
++{
++	return g_gs_renderer && !g_gs_front && !g_gs_renderer->m_back_queued;
++}
++
++void GSSyncRasterizer()
++{
++	// RRV GS-bridge extension. Every bridge entry point that reads GS local
++	// memory behind the renderer's back must call this first: with
++	// GSOptions::SWExtraThreads > 0 the software rasterizer's workers are still
++	// writing the framebuffer/Z pages when Transfer() returns, and PCSX2's own
++	// equivalents (GSInitAndReadFIFO -> InitReadFIFO -> InvalidateLocalMem,
++	// GetOutput -> Sync(1)) do exactly this on the paths it owns. Cheap when
++	// nothing is queued; a no-op with a single-threaded or hardware renderer.
++	if (g_gs_renderer)
++		g_gs_renderer->RrvSyncRasterizer();
++}
++
++bool GSReadLocalMemoryChecked(u8* mem, u32 byte_count, u64 BITBLITBUF, u64 TRXPOS, u64 TRXREG)
++{
++	if (!GSRrvDirectAccessSafe() || !mem)
++		return false;
++	GSSyncRasterizer();
++	return g_gs_renderer->RrvReadLocalMemoryChecked(
++		mem, byte_count, GIFRegBITBLTBUF{BITBLITBUF}, GIFRegTRXPOS{TRXPOS}, GIFRegTRXREG{TRXREG});
++}
++
++bool GSSnapshotLocalMemory(u8* mem, u32 size)
++{
++	if (!GSRrvDirectAccessSafe() || !mem || size != GSLocalMemory::m_vmsize)
++		return false;
++
++	// The bridge invokes this only in its serialized GS context. Flush finalizes
++	// the current primitive, ReadbackTextureCache materializes Hardware/Metal's
++	// authoritative render/depth targets into the CPU-visible GS VM, and the
++	// rasterizer sync retires multithreaded Software work. A bare memcpy here is
++	// not sufficient: on Hardware renderers m_mem deliberately trails the GPU
++	// target cache until PCSX2 performs this same readback operation.
++	g_gs_renderer->Flush(GSState::GSFlushReason::LOADSTATE);
++	g_gs_renderer->RrvSyncRasterizer();
++	g_gs_renderer->ReadbackTextureCache();
++	std::memcpy(mem, g_gs_renderer->m_mem.vm8(), GSLocalMemory::m_vmsize);
++	return true;
++}
++
++bool GSRestoreLocalMemory(const u8* mem, u32 size)
++{
++	if (!GSRrvDirectAccessSafe() || !mem || size != GSLocalMemory::m_vmsize)
++		return false;
++
++	g_gs_renderer->Flush(GSState::GSFlushReason::LOADSTATE);
++	// A queued draw would otherwise land on top of the image we just restored.
++	g_gs_renderer->RrvSyncRasterizer();
++	std::memcpy(g_gs_renderer->m_mem.vm8(), mem, GSLocalMemory::m_vmsize);
++	// The CPU-visible VM changed outside normal GS transfer paths. No cached
++	// source/target may outlive it, and CLUT state must reload on next use.
++	g_gs_renderer->m_mem.ResetCLUT();
++	g_gs_renderer->PurgeTextureCache(true, true, true);
++	return true;
++}
++
+ void GSgifTransfer(const u8* mem, u32 size)
+ {
+ 	GSParseTarget()->Transfer<3>(mem, size);
+diff --git a/pcsx2/GS/GS.h b/pcsx2/GS/GS.h
+index 2cadbf51b1..0b67acc31c 100644
+--- a/pcsx2/GS/GS.h
++++ b/pcsx2/GS/GS.h
+@@ -66,10 +66,26 @@ void GSgifSoftReset(u32 mask);
+ void GSwriteCSR(u32 csr);
+ void GSInitAndReadFIFO(u8* mem, u32 size);
+ void GSReadLocalMemoryUnsync(u8* mem, u32 qwc, u64 BITBLITBUF, u64 TRXPOS, u64 TRXREG);
++// RRV GS-bridge extension: validate and consume one already-issued native
++// local-to-host transaction. The GSState transfer cursor remains authoritative.
++bool GSReadLocalMemoryChecked(u8* mem, u32 byte_count, u64 BITBLITBUF, u64 TRXPOS, u64 TRXREG);
++// RRV GS-bridge extension: synchronous full 4 MiB GS local-memory transfer.
++// Callers serialize these with all GIF/CRTC work; restoring invalidates cached
++// renderer surfaces before they can be sampled again.
++bool GSSnapshotLocalMemory(u8* mem, u32 size);
++bool GSRestoreLocalMemory(const u8* mem, u32 size);
++// RRV GS-bridge extension: retire every queued software-rasterizer job. Must be
++// called before any direct read of GS local memory when SWExtraThreads > 0.
++void GSSyncRasterizer();
+ void GSgifTransfer(const u8* mem, u32 size);
+ void GSgifTransfer1(u8* mem, u32 addr);
+ void GSgifTransfer2(u8* mem, u32 size);
+ void GSgifTransfer3(u8* mem, u32 size);
++// RRV direct-present instrumentation. The Metal device records a count only
++// after it has acquired a drawable and scheduled its actual presentation.
++void GSRrvResetDirectPresentCount();
++void GSRrvRecordDirectPresent();
++u64 GSRrvGetDirectPresentCount();
+ void GSvsync(u32 field, bool registers_written);
+ // Manual frameskip (Android low-end devices): present 1 of every (frames+1)
+ // VSyncs, skipping presentation of the rest. 0 disables. See GSRenderer::VSync.
+diff --git a/pcsx2/GS/GSLocalMemory.h b/pcsx2/GS/GSLocalMemory.h
+index 8f7e949a05..78ae2222e9 100644
+--- a/pcsx2/GS/GSLocalMemory.h
++++ b/pcsx2/GS/GSLocalMemory.h
+@@ -520,6 +520,7 @@ public:
+ 	__forceinline u8* vm8() const { return m_vm8; }
+ 	__forceinline u16* vm16() const { return reinterpret_cast<u16*>(m_vm8); }
+ 	__forceinline u32* vm32() const { return reinterpret_cast<u32*>(m_vm8); }
++	void ResetCLUT() { m_clut.Reset(); }
+ 
+ 	GSOffset GetOffset(u32 bp, u32 bw, u32 psm) const
+ 	{
+diff --git a/pcsx2/GS/GSState.cpp b/pcsx2/GS/GSState.cpp
+index 5721b3e3bf..d0058de68f 100644
+--- a/pcsx2/GS/GSState.cpp
++++ b/pcsx2/GS/GSState.cpp
+@@ -4623,6 +4623,78 @@ void GSState::ExecPcrtcSyncRecord(const GSBackQueue::PcrtcSyncRecord& rec)
+ 	// at enqueue once the copies are distinct.
+ 	std::memcpy(&PCRTCDisplays, &rec.displays, sizeof(PCRTCDisplays));
+ 	m_scanmask_used = rec.scanmask_used;
++bool GSState::RrvReadLocalMemoryChecked(u8* mem, u32 byte_count, GIFRegBITBLTBUF BITBLTBUF,
++	GIFRegTRXPOS TRXPOS, GIFRegTRXREG TRXREG)
++{
++	// Keep descriptor validation in PCSX2 beside the transfer state. The
++	// bridge's ABI descriptors are provenance, never a second cursor.
++	constexpr u64 bitbltbuf_mask = 0x3fffull | (0x3full << 16) | (0x3full << 24) |
++		(0x3fffull << 32) | (0x3full << 48) | (0x3full << 56);
++	constexpr u64 trxpos_mask = 0x7ffull | (0x7ffull << 16) | (0x7ffull << 32) |
++		(0x7ffull << 48) | (0x3ull << 59);
++	constexpr u64 trxreg_mask = 0xfffull | (0xfffull << 32);
++	const auto descriptor_matches = [](u64 actual, u64 expected, u64 mask) {
++		return ((actual ^ expected) & mask) == 0;
++	};
++
++	if (!mem || byte_count == 0 || m_env.TRXDIR.XDIR != 1 || m_tr.write ||
++		!descriptor_matches(BITBLTBUF.U64, m_tr.m_blit.U64, bitbltbuf_mask) ||
++		!descriptor_matches(TRXPOS.U64, m_tr.m_pos.U64, trxpos_mask) ||
++		!descriptor_matches(TRXREG.U64, m_tr.m_reg.U64, trxreg_mask) ||
++		// A descriptor rewrite while a download is live must not turn the
++		// original cursor into a read of new environment state.
++		!descriptor_matches(m_env.BITBLTBUF.U64, m_tr.m_blit.U64, bitbltbuf_mask) ||
++		!descriptor_matches(m_env.TRXPOS.U64, m_tr.m_pos.U64, trxpos_mask) ||
++		!descriptor_matches(m_env.TRXREG.U64, m_tr.m_reg.U64, trxreg_mask))
++	{
++		return false;
++	}
++
++	const u64 width = m_tr.m_reg.RRW;
++	const u64 height = m_tr.m_reg.RRH;
++	// fd9d310c's native ReadImageX PSMT4 branch does not advance its output
++	// byte pointer. Do not expose a fabricated/corrupted FIFO for a format the
++	// pinned native reader cannot produce deterministically; this remains a
++	// fail-closed adapter, not a bridge-side decoder.
++	if (m_tr.m_blit.SPSM == PSMT4)
++		return false;
++	const u16 trbpp = GSLocalMemory::m_psm[m_tr.m_blit.SPSM].trbpp;
++	if (width == 0 || height == 0 || trbpp == 0)
++		return false;
++	const u64 transfer_bits = width * height * trbpp;
++	const u64 transfer_bytes = (transfer_bits + 7u) >> 3;
++	if (transfer_bytes == 0 || transfer_bytes > GSLocalMemory::m_vmsize)
++		return false;
++
++	if (m_tr.total == 0)
++	{
++		if (m_tr.start != 0 || m_tr.end != 0 || m_tr.w != static_cast<int>(width) ||
++			m_tr.h != static_cast<int>(height) || m_tr.x != static_cast<int>(m_tr.m_pos.SSAX) ||
++			m_tr.y != static_cast<int>(m_tr.m_pos.SSAY))
++			return false;
++	}
++	else if (m_tr.total != static_cast<int>(transfer_bytes) || m_tr.start != 0 ||
++		m_tr.end < 0 || m_tr.end >= m_tr.total)
++	{
++		return false;
++	}
++
++	const u64 consumed = static_cast<u64>(m_tr.end);
++	const u64 remaining = transfer_bytes - consumed;
++	if (byte_count > remaining || (byte_count != remaining && (byte_count & 15u) != 0))
++		return false;
++	const u64 qwc = (static_cast<u64>(byte_count) + 15u) / 16u;
++	if (qwc == 0 || qwc > static_cast<u64>(INT_MAX))
++		return false;
++
++	InitReadFIFO(mem, static_cast<int>(qwc));
++	ReadFIFO(mem, static_cast<int>(qwc));
++	const u64 expected_end = consumed + byte_count;
++	if (m_tr.end != static_cast<int>(expected_end))
++		return false;
++	if (expected_end == transfer_bytes)
++		return m_env.TRXDIR.XDIR == 3;
++	return m_env.TRXDIR.XDIR == 1;
+ }
+ 
+ void GSState::Move()
+diff --git a/pcsx2/GS/GSState.h b/pcsx2/GS/GSState.h
+index dd296a9555..844a711fb4 100644
+--- a/pcsx2/GS/GSState.h
++++ b/pcsx2/GS/GSState.h
+@@ -745,6 +745,13 @@ public:
+ 	virtual void InvalidateVideoMem(const GIFRegBITBLTBUF& BITBLTBUF, const GSVector4i& r) {}
+ 	virtual void InvalidateLocalMem(const GIFRegBITBLTBUF& BITBLTBUF, const GSVector4i& r, bool clut = false) {}
+ 
++	// RRV GS-bridge extension: block until every queued rasterizer job has
++	// retired. The bridge reads GS local memory directly (savestates, GS dumps
++	// and the guest's own local->host image downloads), which the software
++	// renderer's worker threads would otherwise still be writing into. A
++	// single-threaded renderer has nothing in flight, so the base is a no-op.
++	virtual void RrvSyncRasterizer() {}
++
+ 	virtual void Move();
+ 
+ 	// The front/back seam: the front builds a self-contained
+@@ -891,6 +898,10 @@ public:
+ 	/// Re-seeds the whole shadow from live local memory (boot, savestate load, mode enable).
+ 	void SyncAsyncReadbackMemory();
+ 
++	// RRV GS-bridge extension. This accepts only the live local-to-host
++	// transfer armed by GIFRegHandlerTRXDIR; it owns no bridge-side cursor.
++	bool RrvReadLocalMemoryChecked(u8* mem, u32 byte_count, GIFRegBITBLTBUF BITBLTBUF,
++		GIFRegTRXPOS TRXPOS, GIFRegTRXREG TRXREG);
+ 	template<int index> void Transfer(const u8* mem, u32 size);
+ 	int Freeze(freezeData* fd, bool sizeonly);
+ 	int Defrost(const freezeData* fd);
+-- 
+2.53.0
+

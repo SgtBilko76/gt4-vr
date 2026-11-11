@@ -1,0 +1,57 @@
+From 6f59896995f8dc6f906f43ffa19d669ca490870a Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 21:16:54 +0100
+Subject: [PATCH 08/44] RRV bridge 0009-full-frame-round-sprite-minified-v
+
+Fukami tools/patches/pcsx2/0009-full-frame-round-sprite-minified-v.patch, applied to ARMSX2 by a clean three-way merge.
+---
+ pcsx2/GS/Renderers/HW/GSRendererHW.cpp | 26 ++++++++++++++++++++++++--
+ 1 file changed, 24 insertions(+), 2 deletions(-)
+
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index 70a547ebd9..c31d94e640 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -3147,8 +3147,8 @@ void GSRendererHW::RoundSpriteOffset()
+ 			}
+ 		}
+ #endif
+-		// RRV Gate-6 full-frame extension (GSRrvSetRoundSpriteUOnly): skip V
+-		// rounding on vertically minified sprites.
++		// RRV Gate-6 full-frame extension (GSRrvSetRoundSpriteUOnly): vertically
++		// minified sprites round V on the progressive grid (else branch below).
+ 		if (!s_rrv_round_sprite_u_only || std::abs(static_cast<int>(v[i + 1].V) - static_cast<int>(v[i].V)) <= std::abs(Ly) + 8)
+ 		{
+ 		if (linear)
+@@ -3173,6 +3173,28 @@ void GSRendererHW::RoundSpriteOffset()
+ 			}
+ 		}
+ 		}
++		else if (!linear)
++		{
++			// Minified sprite in full-frame mode: round V on the progressive
++			// grid (twice the field rows) instead of the native field grid, so
++			// the first and last progressive rows sample exactly the first and
++			// last texel rows at every scale (no texel-row bleed at 4x).
++			const int pY0 = Y0 * 2;
++			const int pY1 = Y1 * 2;
++			const int pLy = Ly * 2;
++			const u16 pty0 = Interpolate_UV(alpha0(pLy, pY0, pY1), v[i].V, v[i + 1].V);
++			const u16 pty1 = Interpolate_UV(alpha1(pLy, pY0, pY1), v[i].V, v[i + 1].V);
++			if (pty0 <= pty1)
++			{
++				v[i].V = pty0;
++				v[i + 1].V = pty1 + 16;
++			}
++			else
++			{
++				v[i].V = pty0 + 15;
++				v[i + 1].V = pty1;
++			}
++		}
+ 
+ #ifdef DEBUG_U
+ 		if (debug)
+-- 
+2.53.0
+

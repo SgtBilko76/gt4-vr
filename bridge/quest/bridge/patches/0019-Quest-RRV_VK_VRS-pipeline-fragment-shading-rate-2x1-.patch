@@ -1,0 +1,161 @@
+From afc0f5388fe8a1d977a5229c4a004d466a0bb05c Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 14:38:19 +0100
+Subject: [PATCH 19/44] Quest: RRV_VK_VRS pipeline fragment shading rate (2x1)
+ for TFX draws into upscaled targets, driver capability log
+
+---
+ pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp | 74 ++++++++++++++++++++++++
+ pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h   |  7 ++-
+ pcsx2/GS/Renderers/Vulkan/VKBuilders.h   |  4 ++
+ 3 files changed, 84 insertions(+), 1 deletion(-)
+
+diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
+index c09ff72311..7835e106ed 100644
+--- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
++++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
+@@ -641,6 +641,27 @@ bool GSDeviceVK::SelectDeviceExtensions(ExtensionList* extension_list, bool enab
+ 	m_optional_extensions.vk_khr_vulkan_memory_model = SupportsExtension(VK_KHR_VULKAN_MEMORY_MODEL_EXTENSION_NAME, false);
+ 	m_optional_extensions.vk_ext_robustness2_null_descriptor = SupportsExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, false);
+ 
++	// RRV_VK_VRS: what the driver offers for reduced shading (logged always), and the
++	// fragment-shading-rate extension when RRV_VK_VRS=1|2.
++	{
++		auto has = [&available_extension_list](const char* name) {
++			return std::any_of(available_extension_list.begin(), available_extension_list.end(),
++				[name](const VkExtensionProperties& e) { return !strcmp(name, e.extensionName); });
++		};
++		std::fprintf(stderr, "[vk-vrs] driver: fragment_shading_rate=%d create_renderpass2=%d fragment_density_map=%d qcom_fdm_offset=%d\n",
++			has(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME), has(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME),
++			has("VK_EXT_fragment_density_map"), has("VK_QCOM_fragment_density_map_offset"));
++		const char* v = std::getenv("RRV_VK_VRS");
++		m_rrv_vrs_mode = (v && v[0] >= '1' && v[0] <= '2') ? v[0] - '0' : 0;
++		if (const char* s = std::getenv("RRV_VK_VRS_SIZE"); s && s[0] >= '1' && s[0] <= '4' && s[1] == 'x' && s[2] >= '1' && s[2] <= '4')
++			m_rrv_vrs_size = {static_cast<u32>(s[0] - '0'), static_cast<u32>(s[2] - '0')};
++		if (m_rrv_vrs_mode > 0 && has(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME))
++		{
++			SupportsExtension(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME, false);
++			m_rrv_vrs = SupportsExtension(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME, false);
++		}
++	}
++
+ 	return true;
+ }
+ 
+@@ -984,6 +1005,46 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
+ 		robustness2_feature.nullDescriptor = VK_TRUE;
+ 		Vulkan::AddPointerToChain(&device_info, &robustness2_feature);
+ 	}
++	// RRV_VK_VRS: pipeline shading rate only (no primitive or attachment rates).
++	VkPhysicalDeviceFragmentShadingRateFeaturesKHR rrv_vrs_feature = {
++		VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
++	if (m_rrv_vrs)
++	{
++		VkPhysicalDeviceFragmentShadingRateFeaturesKHR q = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
++		VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
++		f2.pNext = &q;
++		vkGetPhysicalDeviceFeatures2(m_physical_device, &f2);
++		VkPhysicalDeviceFragmentShadingRatePropertiesKHR pr = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR};
++		VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
++		p2.pNext = &pr;
++		vkGetPhysicalDeviceProperties2(m_physical_device, &p2);
++		std::fprintf(stderr,
++			"[vk-vrs] features: pipeline=%u primitive=%u attachment=%u; props: depth_stencil_writes=%u sample_mask=%u "
++			"interlock=%u non_trivial_combiners=%u max_fragment=%ux%u\n",
++			q.pipelineFragmentShadingRate, q.primitiveFragmentShadingRate, q.attachmentFragmentShadingRate,
++			pr.fragmentShadingRateWithShaderDepthStencilWrites, pr.fragmentShadingRateWithShaderSampleMask,
++			pr.fragmentShadingRateWithFragmentShaderInterlock, pr.fragmentShadingRateNonTrivialCombinerOps,
++			pr.maxFragmentSize.width, pr.maxFragmentSize.height);
++		if (auto rates_fn = reinterpret_cast<PFN_vkGetPhysicalDeviceFragmentShadingRatesKHR>(
++				vkGetInstanceProcAddr(m_instance, "vkGetPhysicalDeviceFragmentShadingRatesKHR")))
++		{
++			u32 n = 0;
++			rates_fn(m_physical_device, &n, nullptr);
++			std::vector<VkPhysicalDeviceFragmentShadingRateKHR> rates(n, {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_KHR});
++			rates_fn(m_physical_device, &n, rates.data());
++			for (const auto& r : rates)
++				std::fprintf(stderr, "[vk-vrs] rate %ux%u samples 0x%x\n", r.fragmentSize.width, r.fragmentSize.height, r.sampleCounts);
++		}
++		if (q.pipelineFragmentShadingRate)
++		{
++			rrv_vrs_feature.pipelineFragmentShadingRate = VK_TRUE;
++			Vulkan::AddPointerToChain(&device_info, &rrv_vrs_feature);
++			std::fprintf(stderr, "[vk-vrs] ON: %ux%u, mode %d (%s)\n", m_rrv_vrs_size.width, m_rrv_vrs_size.height,
++				m_rrv_vrs_mode, m_rrv_vrs_mode >= 2 ? "all draws" : "not on RT feedback-loop draws");
++		}
++		else
++			m_rrv_vrs = false;
++	}
+ 	if (m_optional_extensions.vk_ext_device_fault)
+ 	{
+ 		device_fault_feature.deviceFault = VK_TRUE;
+@@ -7936,6 +7997,15 @@ VkPipeline GSDeviceVK::CreateTFXPipeline(const PipelineSelector& p)
+ 		m_optional_extensions.vk_ext_roaa_depth)
+ 		gpb.AddDepthStencilFlags(VK_PIPELINE_DEPTH_STENCIL_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_DEPTH_ACCESS_BIT_EXT);
+ 
++	VkPipelineFragmentShadingRateStateCreateInfoKHR rrv_fsr = {
++		VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR}; // RRV_VK_VRS
++	if (p.rrv_coarse && m_rrv_vrs)
++	{
++		rrv_fsr.fragmentSize = m_rrv_vrs_size;
++		rrv_fsr.combinerOps[0] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
++		rrv_fsr.combinerOps[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
++		gpb.AddCreateInfoChain(&rrv_fsr);
++	}
+ 	VkPipeline pipeline = gpb.Create(m_device, g_vulkan_shader_cache->GetPipelineCache(true));
+ 	if (pipeline)
+ 	{
+@@ -9587,6 +9657,10 @@ void GSDeviceVK::UpdateHWPipelineSelector(GSHWDrawConfig& config, PipelineSelect
+ 
+ 	// enable point size in the vertex shader if we're rendering points regardless of upscaling.
+ 	pipe.vs.point_size |= (config.topology == GSHWDrawConfig::Topology::Point);
++
++	// RRV_VK_VRS: coarse shading only into upscaled targets (wider than any native GS target).
++	pipe.rrv_coarse = (m_rrv_vrs && pipe.rt && config.rt && config.rt->GetWidth() > 2048 &&
++						  (m_rrv_vrs_mode >= 2 || !pipe.IsRTFeedbackLoop())) ? 1 : 0;
+ }
+ 
+ void GSDeviceVK::UploadHWDrawVerticesAndIndices(GSHWDrawConfig& config)
+diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h
+index e2d19652ba..3927be966d 100644
+--- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h
++++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h
+@@ -452,7 +452,7 @@ public:
+ 		GSHWDrawConfig::VSSelector vs;
+ 		GSHWDrawConfig::DepthStencilSelector dss;
+ 		GSHWDrawConfig::ColorMaskSelector cms;
+-		u8 pad;
++		u8 rrv_coarse; // RRV_VK_VRS: 1 = draw with the coarse pipeline shading rate (was padding)
+ 
+ 		__fi bool operator==(const PipelineSelector& p) const { return BitEqual(*this, p); }
+ 		__fi bool operator!=(const PipelineSelector& p) const { return !BitEqual(*this, p); }
+@@ -656,6 +656,11 @@ private:
+ 	void RrvWarmPipelines();
+ 	void RrvRecordPipeline(const PipelineSelector& p);
+ 	std::FILE* m_rrv_pipeline_file = nullptr;
++	// RRV_VK_VRS (Quest): VK_KHR_fragment_shading_rate pipeline rate for TFX draws into upscaled
++	// render targets. 1 = coarse except RT feedback-loop draws, 2 = all; off when 0/unset.
++	bool m_rrv_vrs = false;
++	int m_rrv_vrs_mode = 0;
++	VkExtent2D m_rrv_vrs_size = {2, 1};
+ 	VkPipeline GetTFXPipeline(const PipelineSelector& p);
+ 
+ 	VkShaderModule GetUtilityVertexShader(const std::string& source, const char* replace_main);
+diff --git a/pcsx2/GS/Renderers/Vulkan/VKBuilders.h b/pcsx2/GS/Renderers/Vulkan/VKBuilders.h
+index 46b60f9fb3..5b03aceb7a 100644
+--- a/pcsx2/GS/Renderers/Vulkan/VKBuilders.h
++++ b/pcsx2/GS/Renderers/Vulkan/VKBuilders.h
+@@ -148,6 +148,10 @@ namespace Vulkan
+ 		/// attachments sit in FEEDBACK_LOOP_OPTIMAL. Ported from sashkinbro/EmuCoreX.
+ 		void AddPipelineFlags(VkPipelineCreateFlags flags);
+ 
++		/// RRV_VK_VRS: chain an extension struct (fragment shading rate state) into the create info.
++		/// The struct must live until Create().
++		void AddCreateInfoChain(const void* ptr) { AddPointerToChain(&m_ci, ptr); }
++
+ 	private:
+ 		VkGraphicsPipelineCreateInfo m_ci;
+ 		std::array<VkPipelineShaderStageCreateInfo, MAX_SHADER_STAGES> m_shader_stages;
+-- 
+2.53.0
+

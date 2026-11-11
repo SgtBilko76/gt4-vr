@@ -1,0 +1,7 @@
+/* Exported symbols of librrv_pcsx2_spu2.so: the C ABI of tools/pcsx2-spu2/rrv_pcsx2_spu2.h. */
+{
+  global:
+    rrv_spu2_*;
+  local:
+    *;
+};

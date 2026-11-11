@@ -1,0 +1,35 @@
+From 6e05c731954c74cf687f8d2af4b1ae19e67b741c Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 11:48:50 +0100
+Subject: [PATCH 16/44] Quest VR: ImGui follows the one-eye UI size when stereo
+ is switched on after the GS started
+
+---
+ pcsx2/ImGui/ImGuiManager.cpp | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/pcsx2/ImGui/ImGuiManager.cpp b/pcsx2/ImGui/ImGuiManager.cpp
+index 2bcf7f4821..4c485977b9 100644
+--- a/pcsx2/ImGui/ImGuiManager.cpp
++++ b/pcsx2/ImGui/ImGuiManager.cpp
+@@ -370,6 +370,17 @@ void ImGuiManager::NewFrame()
+ 	ImGuiIO& io = ImGui::GetIO();
+ 	io.DeltaTime = s_last_render_time.GetTimeSecondsAndReset();
+ 
++	// Quest VR: stereo can be switched on (or off) after the UI was laid out, e.g. when the XR host
++	// enables it once the GS is running. The layout then still spans both eyes, and each eye shows
++	// half of it (the in-game menu came out on the right eye only). Follow the one-eye size.
++	if (g_gs_device)
++	{
++		const GSVector2i ui_size = GetUIPresentationSize();
++		if (ui_size.x > 0 && ui_size.y > 0 &&
++			(static_cast<float>(ui_size.x) != s_window_width || static_cast<float>(ui_size.y) != s_window_height))
++			WindowResized();
++	}
++
+ 	if (s_scale_changed)
+ 	{
+ 		s_scale_changed = false;
+-- 
+2.53.0
+

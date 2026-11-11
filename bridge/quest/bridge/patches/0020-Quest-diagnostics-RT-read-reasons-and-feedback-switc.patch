@@ -1,0 +1,200 @@
+From 640557d4e1803f90efdc2ca91ea060374f5d0f8d Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 15:46:43 +0100
+Subject: [PATCH 20/44] Quest diagnostics: RT-read reasons and feedback
+ switches per present, software-blend reasons (RRV_VKDIAG); RRV_DATE_STENCIL
+ A/B switch (off: wrong colours on Adreno 740)
+
+---
+ pcsx2/GS/GS.h                            |  3 +
+ pcsx2/GS/Renderers/HW/GSRendererHW.cpp   | 74 +++++++++++++++++++++++-
+ pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp | 49 ++++++++++++++++
+ 3 files changed, 125 insertions(+), 1 deletion(-)
+
+diff --git a/pcsx2/GS/GS.h b/pcsx2/GS/GS.h
+index 88f26e337e..fe3567ea7a 100644
+--- a/pcsx2/GS/GS.h
++++ b/pcsx2/GS/GS.h
+@@ -160,6 +160,9 @@ void GSRrvGetCompileStats(u64* pipelines, u64* pipeline_us, u64* shaders, u64* s
+ /// sets it when the GS fell behind real time, so the game keeps its speed (and the SPU2, which runs
+ /// in guest time, keeps producing sound) instead of slowing down. RRV_SKIP_FIELD marker.
+ void GSRrvSetSkipField(bool skip);
++/// RRV_BLEND_DIAG: why draws take software blending (reason bits, ALPHA register), printed by the
++/// Vulkan RRV_VKDIAG summary every 600 presents.
++void GSRrvBlendDiagPrint(unsigned presents);
+ bool GSRrvGetSkipField();
+ bool GSRrvIsAlignedSprite(u64 key);
+ void GSRrvClearAlignedSprites();
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index d88f2cac4b..3d662496a2 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -6867,7 +6867,18 @@ void GSRendererHW::EmulateDATESelectMethod(DATEOptions& date_options, GSTextureC
+ 	if (!date_options.enabled)
+ 		return;
+ 
+-	const GSDevice::FeatureSupport& features = g_gs_device->Features();
++	// RRV_DATE_STENCIL=1 (Quest): pick the DATE method as if the device had no texture barrier,
++	// i.e. the stencil pre-pass instead of an in-pass RT read. On the Adreno 740 every RT-reading
++	// draw needs a feedback-loop render pass, and DATE (plus the software blending it then prefers)
++	// is nearly all of them in RR5's race (RRV_VKDIAG).
++	static const bool s_rrv_date_stencil = [] { const char* v = std::getenv("RRV_DATE_STENCIL"); return v && v[0] == '1'; }();
++	GSDevice::FeatureSupport rrv_features = g_gs_device->Features();
++	if (s_rrv_date_stencil)
++	{
++		rrv_features.texture_barrier = false;
++		rrv_features.multidraw_fb_copy = false;
++	}
++	const GSDevice::FeatureSupport& features = rrv_features;
+ 
+ 	// Date one can run with complex alpha test if there's no overlap.
+ 	const bool complex_alpha_test = m_cached_ctx.TEST.ATE &&
+@@ -7932,6 +7943,48 @@ __ri u32 GSRendererHW::EmulateChannelShuffle(GSTextureCache::Target* src, bool t
+ 	return true;
+ }
+ 
++#if defined(__ANDROID__)
++// RRV_BLEND_DIAG histogram (GS thread only).
++namespace
++{
++struct RrvBlendKey
++{
++	u32 why, abcd, afix, overlap, prim, amin, amax;
++	bool operator==(const RrvBlendKey& o) const { return std::memcmp(this, &o, sizeof(*this)) == 0; }
++};
++std::vector<std::pair<RrvBlendKey, u64>> s_rrv_blend;
++} // namespace
++static void GSRrvBlendDiagHit(u32 why, u32 abcd, u32 afix, u32 overlap, u32 prim, int amin, int amax)
++{
++	static const bool on = [] { const char* v = std::getenv("RRV_VKDIAG"); return v && v[0] == '1'; }();
++	if (!on)
++		return;
++	const RrvBlendKey k{why, abcd, afix, overlap, prim, static_cast<u32>(amin), static_cast<u32>(amax)};
++	for (auto& e : s_rrv_blend)
++		if (e.first == k)
++		{
++			++e.second;
++			return;
++		}
++	if (s_rrv_blend.size() < 256)
++		s_rrv_blend.push_back({k, 1});
++}
++void GSRrvBlendDiagPrint(unsigned presents)
++{
++	std::sort(s_rrv_blend.begin(), s_rrv_blend.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
++	for (size_t i = 0; i < s_rrv_blend.size() && i < 12; ++i)
++	{
++		const RrvBlendKey& k = s_rrv_blend[i].first;
++		std::fprintf(stderr, "[vkdiag] swblend n/f=%6.1f why=0x%03x ABCD=%u%u%u%u FIX=%u overlap=%u prim=%u alpha=%u..%u\n",
++			s_rrv_blend[i].second / static_cast<double>(presents), k.why, k.abcd & 3, (k.abcd >> 2) & 3, (k.abcd >> 4) & 3,
++			(k.abcd >> 6) & 3, k.afix, k.overlap, k.prim, k.amin, k.amax);
++	}
++	s_rrv_blend.clear();
++}
++#else
++void GSRrvBlendDiagPrint(unsigned) {}
++#endif
++
+ void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, DATEOptions& date_options,
+ 	GSTextureCache::Target* rt, bool can_scale_rt_alpha, bool& new_rt_alpha_scale)
+ {
+@@ -8376,6 +8429,25 @@ void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, DATEOptio
+ 		color_dest_blend2 = false;
+ 		blend_zero_to_one_range = false;
+ 	}
++#if defined(__ANDROID__)
++	if (sw_blending) // RRV_BLEND_DIAG
++	{
++		u32 why = 0;
++		why |= (blend_flag & BLEND_A_MAX) ? 1u : 0u;
++		why |= (one_barrier && (no_prim_overlap || features.framebuffer_fetch)) ? 2u : 0u;
++		why |= (!(blend_flag & BLEND_HW2) && !blend_multipass_group && (alpha_c2_high_one || alpha_c0_high_max_one) && no_prim_overlap) ? 4u : 0u;
++		why |= (blend_ad && !blend_multipass_group && no_prim_overlap && !new_rt_alpha_scale) ? 8u : 0u;
++		why |= prefer_sw_blend ? 16u : 0u;
++		why |= free_blend ? 32u : 0u;
++		why |= blend_mix_alpha_over_one ? 64u : 0u;
++		why |= blend_mix ? 128u : 0u;
++		why |= force_sw_blending ? 256u : 0u;
++		why |= date_options.enabled ? 512u : 0u;
++		why |= PABE ? 1024u : 0u;
++		GSRrvBlendDiagHit(why, (m_conf.ps.blend_a) | (m_conf.ps.blend_b << 2) | (m_conf.ps.blend_c << 4) | (m_conf.ps.blend_d << 6),
++			AFIX, static_cast<u32>(m_prim_overlap), static_cast<u32>(m_vt.m_primclass), GetAlphaMinMax().min, GetAlphaMinMax().max);
++	}
++#endif
+ 
+ 	// Color clip
+ 	if (COLCLAMP.CLAMP == 0)
+diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
+index 7835e106ed..87de681f31 100644
+--- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
++++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
+@@ -133,10 +133,56 @@ static void Hit(int kind, u64 px)
+ 	s.px = px;
+ 	s_slots.push_back(s);
+ }
++// RRV_VKDIAG_REASONS: per draw, why it reads the render target, and whether it switches the
++// feedback state against the previous draw into the same target (each switch ends the pass).
++enum Reason
++{
++	R_DRAWS, R_READ, R_TEX_IS_FB, R_FBMASK, R_DATE5, R_SWBLEND, R_AFAIL, R_HAZARD, R_DEPTHREAD,
++	R_SWITCH, R_NEW_TARGET, R_COUNT
++};
++static const char* const kReasonNames[R_COUNT] = {"draws", "read-rt", "tex_is_fb", "fbmask", "date>=5",
++	"sw_blend", "afail", "tex_hazard", "read-depth", "fb-switch", "target-change"};
++static u64 s_reason[R_COUNT] = {};
++static const void* s_last_rt = nullptr;
++static bool s_last_read = false;
++static void Draw(const GSHWDrawConfig& c, bool read_rt, bool read_depth)
++{
++	if (!On())
++		return;
++	const auto& ps = c.ps;
++	s_reason[R_DRAWS]++;
++	if (read_rt)
++	{
++		s_reason[R_READ]++;
++		const u32 sw = ps.blend_a | ps.blend_b | ps.blend_d;
++		if (ps.tex_is_fb) s_reason[R_TEX_IS_FB]++;
++		if (ps.fbmask) s_reason[R_FBMASK]++;
++		if (ps.date >= 5) s_reason[R_DATE5]++;
++		if ((sw != 0 && ((sw | ps.blend_c) & 1u)) || ((ps.a_masked & ps.blend_c) != 0)) s_reason[R_SWBLEND]++;
++		if (ps.afail == GSHWDrawConfig::PS_AFAIL::ZB_ONLY || ps.afail == GSHWDrawConfig::PS_AFAIL::RGB_ONLY || ps.afail == GSHWDrawConfig::PS_AFAIL::RGB_ONLY_SW_Z)
++			s_reason[R_AFAIL]++;
++		if (c.tex_hazard == GSHWDrawConfig::TEX_HAZARD_RT) s_reason[R_HAZARD]++;
++	}
++	if (read_depth)
++		s_reason[R_DEPTHREAD]++;
++	if (c.rt != s_last_rt)
++		s_reason[R_NEW_TARGET]++;
++	else if (read_rt != s_last_read)
++		s_reason[R_SWITCH]++;
++	s_last_rt = c.rt;
++	s_last_read = read_rt;
++}
++
+ static void Present()
+ {
+ 	if (!On() || ++s_presents % 600u != 0u)
+ 		return;
++	std::fprintf(stderr, "[vkdiag] per present:");
++	for (int i = 0; i < R_COUNT; ++i)
++		std::fprintf(stderr, " %s=%.1f", kReasonNames[i], s_reason[i] / 600.0);
++	std::fprintf(stderr, "\n");
++	std::fill(std::begin(s_reason), std::end(s_reason), 0);
++	GSRrvBlendDiagPrint(600); // RRV_BLEND_DIAG
+ 	Dl_info info{};
+ 	dladdr(reinterpret_cast<void*>(&Present), &info);
+ 	const uintptr_t base = reinterpret_cast<uintptr_t>(info.dli_fbase);
+@@ -9657,6 +9703,9 @@ void GSDeviceVK::UpdateHWPipelineSelector(GSHWDrawConfig& config, PipelineSelect
+ 
+ 	// enable point size in the vertex shader if we're rendering points regardless of upscaling.
+ 	pipe.vs.point_size |= (config.topology == GSHWDrawConfig::Topology::Point);
++#if defined(__ANDROID__)
++	rrv_vkdiag::Draw(config, config.IsFeedbackLoopRT(config.ps), config.IsFeedbackLoopDepth(config.ps)); // RRV_VKDIAG_REASONS
++#endif
+ 
+ 	// RRV_VK_VRS: coarse shading only into upscaled targets (wider than any native GS target).
+ 	pipe.rrv_coarse = (m_rrv_vrs && pipe.rt && config.rt && config.rt->GetWidth() > 2048 &&
+-- 
+2.53.0
+

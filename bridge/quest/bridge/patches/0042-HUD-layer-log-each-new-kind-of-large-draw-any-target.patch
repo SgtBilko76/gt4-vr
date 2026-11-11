@@ -1,0 +1,52 @@
+From eef302ba65a0f241c92a6716e0c822481c116dc4 Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 00:31:06 +0100
+Subject: [PATCH 42/44] HUD layer: log each new kind of large draw (any target,
+ before/after the split) - hit flash hunt
+
+---
+ pcsx2/GS/Renderers/HW/GSRendererHW.cpp | 28 ++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index f2d3e71341..82bcf189d5 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -453,6 +453,34 @@ void GSRendererHW::RrvHudSplitNoteDraw()
+ 	using namespace rrv_hud_split;
+ 	const u32 fbp = m_cached_ctx.FRAME.FBP;
+ 	const GIFRegTEST& test = m_cached_ctx.TEST;
++#if defined(__ANDROID__)
++	// Hit-flash hunt (owner 2026-11-09: the flash shows only on the HUD panel, and no large draw comes
++	// after the split): every NEW kind of large draw (>= 600 x 200, any target, before or after the
++	// split) once, with where the split stands. Signature: target, texture, blend, colour.
++	{
++		const GSVector4 b = m_vt.m_min.p.xyxy(m_vt.m_max.p);
++		if ((b.z - b.x) >= 600.0f && (b.w - b.y) >= 200.0f)
++		{
++			static std::vector<u64> s_big_seen;
++			static u32 s_big_logged = 0;
++			const u64 sig = static_cast<u64>(fbp & 0x1FF) | (static_cast<u64>(PRIM->TME ? (m_cached_ctx.TEX0.TBP0 & 0x3FFF) : 0x3FFF) << 9) |
++							(static_cast<u64>(m_context->ALPHA.U64 & 0xFF) << 23) | (static_cast<u64>(m_context->ALPHA.FIX) << 31) |
++							(static_cast<u64>(m_vt.m_max.c.U32[0] >> 4 & 0xF) << 39) | (static_cast<u64>(m_vt.m_max.c.U32[3] >> 4 & 0xF) << 43) |
++							(static_cast<u64>(m_cached_ctx.FRAME.FBMSK != 0 ? 1 : 0) << 47) | (static_cast<u64>((b.w - b.y) >= 400.0f ? 1 : 0) << 48);
++			if (s_big_logged < 300 && std::find(s_big_seen.begin(), s_big_seen.end(), sig) == s_big_seen.end())
++			{
++				s_big_seen.push_back(sig);
++				++s_big_logged;
++				std::fprintf(stderr, "[hud-layer] big draw %d prims %u fbp 0x%x psm %u fbmsk %08x tme %d tbp 0x%x tpsm %u box %.0f,%.0f-%.0f,%.0f rgba %u,%u,%u,%u alpha %016llx | split %d comp fbp %d tbp 0x%x displayed %d 3d %d\n",
++					s_n, static_cast<unsigned>(m_index->tail), fbp, static_cast<unsigned>(m_cached_ctx.FRAME.PSM), static_cast<unsigned>(m_cached_ctx.FRAME.FBMSK),
++					PRIM->TME ? 1 : 0, m_cached_ctx.TEX0.TBP0, static_cast<unsigned>(m_cached_ctx.TEX0.PSM), b.x, b.y, b.z, b.w,
++					m_vt.m_max.c.U32[0], m_vt.m_max.c.U32[1], m_vt.m_max.c.U32[2], m_vt.m_max.c.U32[3],
++					static_cast<unsigned long long>(m_context->ALPHA.U64), s_split_fbp == static_cast<int>(fbp) ? 1 : 0, s_comp_fbp, s_comp_tbp,
++					IsDisplayed(static_cast<int>(fbp)) ? 1 : 0, Is3d(fbp) ? 1 : 0);
++			}
++		}
++	}
++#endif
+ 	if (const u32 split_z = GSStereo::hud_split_z.load(std::memory_order_relaxed); split_z != 0)
+ 	{
+ 		// Ridge Racer V (GSStereo::hud_split_z): HUD = 2D at the far plane, drawn last.
+-- 
+2.53.0
+

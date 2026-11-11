@@ -1,0 +1,94 @@
+From 7c6bf42581b76b709138a8475ad506f6d31db9d0 Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 20:08:33 +0100
+Subject: [PATCH 31/44] Quest stereo: depth mask (raw depth above it packs as
+ 0, flat), opt-in via GSRrvSetStereoDepthMask
+
+---
+ bin/resources/shaders/vulkan/convert.glsl | 10 ++++++++--
+ pcsx2/GS/Renderers/Common/GSRenderer.cpp  |  9 +++++++++
+ pcsx2/GS/Renderers/Common/GSRenderer.h    |  1 +
+ pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp  |  3 ++-
+ 4 files changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/bin/resources/shaders/vulkan/convert.glsl b/bin/resources/shaders/vulkan/convert.glsl
+index 6031636ac8..a32d367dab 100644
+--- a/bin/resources/shaders/vulkan/convert.glsl
++++ b/bin/resources/shaders/vulkan/convert.glsl
+@@ -660,12 +660,18 @@ void main()
+ // channels are masked off by the pipeline, so the frame already copied there survives.
+ layout(push_constant) uniform cb_depth_to_alpha
+ {
+-	vec4 u_depth_scale; // x: GSStereo::depth_scale (1 = the raw depth)
++	vec4 u_depth_scale; // x: GSStereo::depth_scale (1 = the raw depth), y: GSStereo::depth_mask
+ };
+ 
+ void ps_depth_to_alpha()
+ {
+-	o_col0 = vec4(0.0f, 0.0f, 0.0f, clamp(sample_c(v_tex).r * u_depth_scale.x, 0.0f, 1.0f));
++	// A raw depth above depth_mask (> 0) is not scene geometry but a mask the game wrote (GT4's
++	// rear-view mirror area at the maximum Z): it gets depth 0, i.e. flat on the screen plane,
++	// instead of the nearest depth that shifted it and its surroundings sideways in each eye.
++	float d = sample_c(v_tex).r;
++	if (u_depth_scale.y > 0.0f && d > u_depth_scale.y)
++		d = 0.0f;
++	o_col0 = vec4(0.0f, 0.0f, 0.0f, clamp(d * u_depth_scale.x, 0.0f, 1.0f));
+ }
+ #endif
+ 
+diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.cpp b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+index 4fb9e482e2..5308f469c4 100644
+--- a/pcsx2/GS/Renderers/Common/GSRenderer.cpp
++++ b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+@@ -811,6 +811,7 @@ namespace GSStereo
+ 	std::atomic<float> debug_depth{0.0f};
+ 	std::atomic<bool> flip_y{false};
+ 	std::atomic<float> depth_scale{0.0f};
++	std::atomic<float> depth_mask{0.0f};
+ 	std::atomic<bool> hud_layer{false};
+ 	std::atomic<int> hud_rows{0};
+ 	GSTexture* s_hud_tex = nullptr;
+@@ -1900,6 +1901,14 @@ void DumpGSPrivRegs(const GSPrivRegSet& r, const std::string& filename)
+ 	std::fprintf(fp.get(), "EXTWRITE: { EN: %u }\n", r.EXTWRITE.WRITE);
+ }
+ 
++// Quest stereo: raw depth above `mask` packs as depth 0 (flat). GT4 writes its rear-view mirror area at
++// the maximum Z; with the scene's tiny Z range scaled up, that area was the nearest thing in the frame
++// and slid sideways per eye (owner 2026-11-02). 0 = off (default; RR5 keeps its behaviour).
++void GSRrvSetStereoDepthMask(float mask)
++{
++	GSStereo::depth_mask.store(mask > 0.0f ? mask : 0.0f, std::memory_order_relaxed);
++}
++
+ void GSRrvSetStereoHudRects(const float* rects, u32 count)
+ {
+ 	GSStereo::s_hud_rects.clear();
+diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.h b/pcsx2/GS/Renderers/Common/GSRenderer.h
+index 0bebde7f2c..3fe855b7b5 100644
+--- a/pcsx2/GS/Renderers/Common/GSRenderer.h
++++ b/pcsx2/GS/Renderers/Common/GSRenderer.h
+@@ -34,6 +34,7 @@ namespace GSStereo
+ 	/// PCSX2's 32-bit depth range) loses its whole scene to 0 without it. With a scale, the packed
+ 	/// value is clamp(depth * scale, 0, 1).
+ 	extern std::atomic<float> depth_scale;
++	extern std::atomic<float> depth_mask; // raw depth above it packs as 0 (game-written masks); 0 = off
+ 
+ 	// Quest VR HUD layer (Wipeout Rewrite VR style: the race HUD on its own flat screen in front of
+ 	// the 3D view). With hud_layer on, the HW renderer splits the displayed frame buffer at the
+diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
+index bf42ce1a95..27693d1b28 100644
+--- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
++++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
+@@ -6560,7 +6560,8 @@ GSTexture* GSDeviceVK::PrepareStereoFrame(GSTexture* sTex, GSTexture* depth)
+ 	// depth at all, i.e. a flat picture. Nearest is also what depth wants: averaging across a
+ 	// silhouette invents a distance that is neither surface.
+ 	const float depth_scale = GSStereo::depth_scale.load(std::memory_order_relaxed);
+-	const GSVector4 depth_cb(depth_scale > 0.0f ? depth_scale : 1.0f, 0.0f, 0.0f, 0.0f);
++	const GSVector4 depth_cb(depth_scale > 0.0f ? depth_scale : 1.0f,
++		GSStereo::depth_mask.load(std::memory_order_relaxed), 0.0f, 0.0f);
+ 	SetUtilityPushConstants(&depth_cb, sizeof(depth_cb));
+ 	DoStretchRect(static_cast<GSTextureVK*>(depth), full_uv, static_cast<GSTextureVK*>(m_stereo_packed),
+ 		full_rect, m_depth_to_alpha, Nearest, false);
+-- 
+2.53.0
+

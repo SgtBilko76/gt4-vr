@@ -1,0 +1,47 @@
+From d76539cb1ad995cc2dfa572899fb0a6ccddfb74a Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 18:44:59 +0100
+Subject: [PATCH 29/44] Quest stereo: CAS upscales to one eye's rect, not the
+ whole double-width surface (RRV_STEREO_EYE_UPSCALE)
+
+---
+ pcsx2/GS/Renderers/Common/GSRenderer.cpp | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.cpp b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+index 32874893a3..4fb9e482e2 100644
+--- a/pcsx2/GS/Renderers/Common/GSRenderer.cpp
++++ b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+@@ -1186,6 +1186,16 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
+ 				GetVideoMode() == GSVideoMode::SDTV_480P);
+ 			s_last_draw_rect = draw_rect;
+ 
++			// Quest VR stereo: the presentation surface is two eyes side by side (plus the HUD
++			// strip), and each eye draws the frame into its own half. Upscaling to the whole
++			// surface made CAS write a double-width frame (6144x4152 for 3072x3072 eyes) that the
++			// stereo pack then copied and depth-packed at that size, and every eye squeezed back
++			// 2:1 -- the most expensive passes of the frame, for a softer picture. Upscale to one
++			// eye's rect instead (RRV_STEREO_EYE_UPSCALE).
++			GSVector4 cas_rect = draw_rect;
++			if (GSVector4 eye_l, eye_r; CalculateStereoDrawRects(src_rect, current->GetSize(), eye_l, eye_r))
++				cas_rect = GSVector4(0.0f, 0.0f, std::abs(eye_l.z - eye_l.x), std::abs(eye_l.w - eye_l.y));
++
+ 			// MetalFX spatial upscale runs before CAS/present, and only when actually upscaling
+ 			// (source smaller than the on-screen draw rect). CAS can still sharpen afterward.
+ 			if (GSConfig.Upscaler == GSUpscaler::MetalFXSpatial)
+@@ -1260,9 +1270,9 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
+ 				{
+ 					// sharpen only if the IR is higher than the display resolution
+ 					const bool sharpen_only = (GSConfig.CASMode == GSCASMode::SharpenOnly ||
+-					                           (current->GetWidth() > g_gs_device->GetWindowWidth() &&
+-					                            current->GetHeight() > g_gs_device->GetWindowHeight()));
+-					g_gs_device->CAS(current, src_rect, src_uv, draw_rect, sharpen_only);
++					                           (current->GetWidth() > static_cast<int>(cas_rect.z - cas_rect.x) &&
++					                            current->GetHeight() > static_cast<int>(cas_rect.w - cas_rect.y)));
++					g_gs_device->CAS(current, src_rect, src_uv, cas_rect, sharpen_only);
+ 				}
+ 				else if (!cas_log_once)
+ 				{
+-- 
+2.53.0
+

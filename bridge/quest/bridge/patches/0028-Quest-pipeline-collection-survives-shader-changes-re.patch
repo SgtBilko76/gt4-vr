@@ -1,0 +1,139 @@
+From a4bcf1c5c8b09d17b191bcdff1dc454ef6c7f4bc Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 15:53:41 +0100
+Subject: [PATCH 28/44] Quest: pipeline collection survives shader changes
+ (rebuilt, not dropped); RRV_PIPELINE_SEED merges a shipped list,
+ RRV_PIPELINE_EXPORT mirrors the collection outside the app data
+
+---
+ pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp | 72 ++++++++++++++++++------
+ pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h   |  1 +
+ 2 files changed, 56 insertions(+), 17 deletions(-)
+
+diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
+index 3a38c03398..bf42ce1a95 100644
+--- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
++++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
+@@ -3220,17 +3220,37 @@ void GSDeviceVK::RrvWarmPipelines()
+ 		return;
+ 	const std::string path = Path::Combine(EmuFolders::Cache, "rrv_tfx_pipelines.bin");
+ 	const RrvPipelineFileHeader want{kRrvPipelineMagic, static_cast<u32>(sizeof(PipelineSelector)), RrvSourceHash(m_tfx_source)};
++	// Selectors from the collection, then from the seed (RRV_PIPELINE_SEED: a collection shipped with the
++	// app). A file whose tfx.glsl hash differs is kept and rebuilt (owner request 2026-11-01: a shader
++	// change used to throw away everything collected); only the magic and the selector size must match,
++	// since a selector of another layout is meaningless. A selector the new shader cannot build counts as
++	// failed and drops out of the rewritten file.
+ 	std::vector<PipelineSelector> sels;
+-	bool valid = false;
+-	if (std::FILE* f = std::fopen(path.c_str(), "rb"))
+-	{
++	u32 stale_files = 0;
++	const auto load = [&](const char* label, const std::string& file) {
++		std::FILE* f = std::fopen(file.c_str(), "rb");
++		if (!f)
++			return;
+ 		RrvPipelineFileHeader have{};
+-		valid = std::fread(&have, sizeof(have), 1, f) == 1 && std::memcmp(&have, &want, sizeof(have)) == 0;
+-		PipelineSelector p;
+-		while (valid && std::fread(&p, sizeof(p), 1, f) == 1)
+-			sels.push_back(p);
++		size_t n = 0;
++		if (std::fread(&have, sizeof(have), 1, f) == 1 && have.magic == want.magic && have.selector_size == want.selector_size)
++		{
++			PipelineSelector p;
++			while (std::fread(&p, sizeof(p), 1, f) == 1)
++			{
++				sels.push_back(p);
++				++n;
++			}
++			if (have.source_hash != want.source_hash)
++				++stale_files;
++		}
+ 		std::fclose(f);
+-	}
++		std::fprintf(stderr, "[vk-pipelines] %s %s: %zu selectors%s\n", label, file.c_str(), n,
++			have.source_hash != want.source_hash && n ? " (other shader source: rebuilt)" : "");
++	};
++	load("collection", path);
++	if (const char* seed = std::getenv("RRV_PIPELINE_SEED"); seed && seed[0] != '\0')
++		load("seed", seed);
+ 	const Common::Timer::Value t0 = Common::Timer::GetCurrentValue();
+ 	u32 built = 0, failed = 0;
+ 	for (const PipelineSelector& p : sels)
+@@ -3246,20 +3266,28 @@ void GSDeviceVK::RrvWarmPipelines()
+ 		m_tfx_pipelines.emplace(p, pipeline);
+ 		++built;
+ 	}
+-	std::fprintf(stderr, "[vk-pipelines] collection %s: %zu entries, %u built up front in %.0f ms (%u failed)\n",
++	std::fprintf(stderr, "[vk-pipelines] collection %s: %zu entries, %u built up front in %.0f ms (%u failed%s)\n",
+ 		path.c_str(), sels.size(), built,
+-		Common::Timer::ConvertValueToMilliseconds(Common::Timer::GetCurrentValue() - t0), failed);
++		Common::Timer::ConvertValueToMilliseconds(Common::Timer::GetCurrentValue() - t0), failed,
++		stale_files ? ", after a shader change" : "");
+ 	if (built > 0 && g_vulkan_shader_cache)
+ 		g_vulkan_shader_cache->FlushPipelineCache();
+ 	// Rewrite the file deduplicated (and with the current header), then append new ones as they come.
+-	m_rrv_pipeline_file = std::fopen(path.c_str(), "wb");
+-	if (m_rrv_pipeline_file)
+-	{
+-		std::fwrite(&want, sizeof(want), 1, m_rrv_pipeline_file);
++	// RRV_PIPELINE_EXPORT: the same list mirrored to a file outside the app's private data (the Quest
++	// app is not debuggable, so this is how a collection is taken off the device to seed new installs).
++	const auto open_list = [&](const std::string& file) -> std::FILE* {
++		std::FILE* f = std::fopen(file.c_str(), "wb");
++		if (!f)
++			return nullptr;
++		std::fwrite(&want, sizeof(want), 1, f);
+ 		for (const auto& it : m_tfx_pipelines)
+-			std::fwrite(&it.first, sizeof(it.first), 1, m_rrv_pipeline_file);
+-		std::fflush(m_rrv_pipeline_file);
+-	}
++			std::fwrite(&it.first, sizeof(it.first), 1, f);
++		std::fflush(f);
++		return f;
++	};
++	m_rrv_pipeline_file = open_list(path);
++	if (const char* exp = std::getenv("RRV_PIPELINE_EXPORT"); exp && exp[0] != '\0')
++		m_rrv_pipeline_export = open_list(exp);
+ }
+ 
+ void GSDeviceVK::RrvRecordPipeline(const PipelineSelector& p)
+@@ -3268,6 +3296,11 @@ void GSDeviceVK::RrvRecordPipeline(const PipelineSelector& p)
+ 		return;
+ 	std::fwrite(&p, sizeof(p), 1, m_rrv_pipeline_file);
+ 	std::fflush(m_rrv_pipeline_file); // the app is killed, not exited
++	if (m_rrv_pipeline_export)
++	{
++		std::fwrite(&p, sizeof(p), 1, m_rrv_pipeline_export);
++		std::fflush(m_rrv_pipeline_export);
++	}
+ }
+ 
+ void GSDeviceVK::Destroy()
+@@ -3290,6 +3323,11 @@ void GSDeviceVK::Destroy()
+ 		std::fclose(m_rrv_pipeline_file); // RRV_PIPELINE_COLLECTION
+ 		m_rrv_pipeline_file = nullptr;
+ 	}
++	if (m_rrv_pipeline_export)
++	{
++		std::fclose(m_rrv_pipeline_export);
++		m_rrv_pipeline_export = nullptr;
++	}
+ 
+ 	GSDevice::Destroy();
+ 
+diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h
+index 537aa5ce8b..e6441895b9 100644
+--- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h
++++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h
+@@ -657,6 +657,7 @@ private:
+ 	void RrvWarmPipelines();
+ 	void RrvRecordPipeline(const PipelineSelector& p);
+ 	std::FILE* m_rrv_pipeline_file = nullptr;
++	std::FILE* m_rrv_pipeline_export = nullptr; // RRV_PIPELINE_EXPORT mirror
+ 	// RRV_VK_VRS (Quest): VK_KHR_fragment_shading_rate pipeline rate for TFX draws into upscaled
+ 	// render targets. 1 = coarse except RT feedback-loop draws, 2 = all; off when 0/unset.
+ 	bool m_rrv_vrs = false;
+-- 
+2.53.0
+

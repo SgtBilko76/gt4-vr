@@ -1,0 +1,26 @@
+From a763b17ad2a33c3c5dbc51e79dbf36e633551794 Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 21:38:58 +0100
+Subject: [PATCH 13/44] RRV bridge 0001 fix: close ExecPcrtcSyncRecord before
+ RrvReadLocalMemoryChecked
+
+---
+ pcsx2/GS/GSState.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/pcsx2/GS/GSState.cpp b/pcsx2/GS/GSState.cpp
+index f504af4e51..5809919ced 100644
+--- a/pcsx2/GS/GSState.cpp
++++ b/pcsx2/GS/GSState.cpp
+@@ -4640,6 +4640,8 @@ void GSState::ExecPcrtcSyncRecord(const GSBackQueue::PcrtcSyncRecord& rec)
+ 	// at enqueue once the copies are distinct.
+ 	std::memcpy(&PCRTCDisplays, &rec.displays, sizeof(PCRTCDisplays));
+ 	m_scanmask_used = rec.scanmask_used;
++}
++
+ bool GSState::RrvReadLocalMemoryChecked(u8* mem, u32 byte_count, GIFRegBITBLTBUF BITBLTBUF,
+ 	GIFRegTRXPOS TRXPOS, GIFRegTRXREG TRXREG)
+ {
+-- 
+2.53.0
+

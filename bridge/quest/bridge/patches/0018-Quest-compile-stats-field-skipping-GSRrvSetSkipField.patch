@@ -1,0 +1,260 @@
+From 1c41871f4cc491980ff02a2bf9fb832d8a041f7d Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 14:08:12 +0100
+Subject: [PATCH 18/44] Quest: compile stats, field skipping
+ (GSRrvSetSkipField: no draws, no present), TFX pipeline collection + warm-up
+ (rrv_tfx_pipelines.bin)
+
+---
+ pcsx2/GS/GS.h                            |   7 ++
+ pcsx2/GS/Renderers/Common/GSRenderer.cpp |   2 +
+ pcsx2/GS/Renderers/HW/GSRendererHW.cpp   |  11 +++
+ pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp | 111 +++++++++++++++++++++++
+ pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h   |   6 ++
+ 5 files changed, 137 insertions(+)
+
+diff --git a/pcsx2/GS/GS.h b/pcsx2/GS/GS.h
+index aad0ba5169..88f26e337e 100644
+--- a/pcsx2/GS/GS.h
++++ b/pcsx2/GS/GS.h
+@@ -154,6 +154,13 @@ void GSRrvMarkAlignedSprite(u64 key);
+ /// fraction of their height, so the RoundSprite V fix (texels under the first and last NATIVE row)
+ /// would sample only part of a 6-row label; while on, far-plane sprites keep the game's V.
+ void GSRrvSetHudVr(bool on);
++/// Quest: cumulative TFX pipeline / fragment shader creations and pipeline cache flushes (Vulkan).
++void GSRrvGetCompileStats(u64* pipelines, u64* pipeline_us, u64* shaders, u64* shader_us, u64* flush_us);
++/// Quest (fukami bridge): skip every draw and the presentation of the current field. The bridge
++/// sets it when the GS fell behind real time, so the game keeps its speed (and the SPU2, which runs
++/// in guest time, keeps producing sound) instead of slowing down. RRV_SKIP_FIELD marker.
++void GSRrvSetSkipField(bool skip);
++bool GSRrvGetSkipField();
+ bool GSRrvIsAlignedSprite(u64 key);
+ void GSRrvClearAlignedSprites();
+ // RRV Gate-6 extension: when set, UserHacks_RewriteLargeST also collapses
+diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.cpp b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+index 1451b111ad..c3c59525da 100644
+--- a/pcsx2/GS/Renderers/Common/GSRenderer.cpp
++++ b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+@@ -956,6 +956,8 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
+ 	// Manual skipping omits presentation only. Platform-opted FPS caps may additionally omit final
+ 	// composition after Merge() has verified the current outputs; emulation and GS writes still run.
+ 	bool fps_cap_present_skip = false;
++	if (GSRrvGetSkipField())
++		skip_frame = true; // RRV_SKIP_FIELD: nothing was drawn, keep the last picture
+ 	{
+ 		const u32 manual_skip = GSGetManualFrameSkip();
+ 		if (manual_skip > 0)
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index e879771565..d88f2cac4b 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -3172,6 +3172,15 @@ void GSRendererHW::RrvLinearSpriteEdges(float scale)
+ }
+ 
+ static std::atomic<bool> s_rrv_hud_vr{false};
++static std::atomic<bool> s_rrv_skip_field{false}; // RRV_SKIP_FIELD
++void GSRrvSetSkipField(bool skip)
++{
++	s_rrv_skip_field.store(skip, std::memory_order_relaxed);
++}
++bool GSRrvGetSkipField()
++{
++	return s_rrv_skip_field.load(std::memory_order_relaxed);
++}
+ void GSRrvSetHudVr(bool on)
+ {
+ 	s_rrv_hud_vr.store(on, std::memory_order_relaxed);
+@@ -3455,6 +3464,8 @@ void GSRendererHW::Draw()
+ 		GL_INS("HW: Warning skipping a draw call (%lld)", s_n);
+ 		return;
+ 	}
++	if (s_rrv_skip_field.load(std::memory_order_relaxed))
++		return; // RRV_SKIP_FIELD: the bridge drops this field (GSRrvSetSkipField)
+ 
+ 	// Sometimes everything will get reset and it will draw a single black point in the top left corner,
+ 	// which can cause invalid targets to be created, so might as well skip it.
+diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
+index 2fbbb14bb3..c09ff72311 100644
+--- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
++++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
+@@ -3077,9 +3077,86 @@ bool GSDeviceVK::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
+ 		return false;
+ 
+ 	InitializeState();
++	RrvWarmPipelines(); // RRV_PIPELINE_COLLECTION
+ 	return true;
+ }
+ 
++namespace
++{
++// File layout: magic, selector size, hash of tfx.glsl, then 32-byte PipelineSelectors.
++struct RrvPipelineFileHeader
++{
++	u32 magic;
++	u32 selector_size;
++	u64 source_hash;
++};
++constexpr u32 kRrvPipelineMagic = 0x31505252u; // "RRP1"
++u64 RrvSourceHash(const std::string& s)
++{
++	u64 h = 1469598103934665603ull; // FNV-1a
++	for (const unsigned char c : s)
++		h = (h ^ c) * 1099511628211ull;
++	return h;
++}
++} // namespace
++
++void GSDeviceVK::RrvWarmPipelines()
++{
++	const char* env = std::getenv("RRV_PIPELINE_WARMUP");
++	if (env && env[0] == '0')
++		return;
++	const std::string path = Path::Combine(EmuFolders::Cache, "rrv_tfx_pipelines.bin");
++	const RrvPipelineFileHeader want{kRrvPipelineMagic, static_cast<u32>(sizeof(PipelineSelector)), RrvSourceHash(m_tfx_source)};
++	std::vector<PipelineSelector> sels;
++	bool valid = false;
++	if (std::FILE* f = std::fopen(path.c_str(), "rb"))
++	{
++		RrvPipelineFileHeader have{};
++		valid = std::fread(&have, sizeof(have), 1, f) == 1 && std::memcmp(&have, &want, sizeof(have)) == 0;
++		PipelineSelector p;
++		while (valid && std::fread(&p, sizeof(p), 1, f) == 1)
++			sels.push_back(p);
++		std::fclose(f);
++	}
++	const Common::Timer::Value t0 = Common::Timer::GetCurrentValue();
++	u32 built = 0, failed = 0;
++	for (const PipelineSelector& p : sels)
++	{
++		if (m_tfx_pipelines.find(p) != m_tfx_pipelines.end())
++			continue;
++		VkPipeline pipeline = CreateTFXPipeline(p);
++		if (pipeline == VK_NULL_HANDLE)
++		{
++			++failed;
++			continue;
++		}
++		m_tfx_pipelines.emplace(p, pipeline);
++		++built;
++	}
++	std::fprintf(stderr, "[vk-pipelines] collection %s: %zu entries, %u built up front in %.0f ms (%u failed)\n",
++		path.c_str(), sels.size(), built,
++		Common::Timer::ConvertValueToMilliseconds(Common::Timer::GetCurrentValue() - t0), failed);
++	if (built > 0 && g_vulkan_shader_cache)
++		g_vulkan_shader_cache->FlushPipelineCache();
++	// Rewrite the file deduplicated (and with the current header), then append new ones as they come.
++	m_rrv_pipeline_file = std::fopen(path.c_str(), "wb");
++	if (m_rrv_pipeline_file)
++	{
++		std::fwrite(&want, sizeof(want), 1, m_rrv_pipeline_file);
++		for (const auto& it : m_tfx_pipelines)
++			std::fwrite(&it.first, sizeof(it.first), 1, m_rrv_pipeline_file);
++		std::fflush(m_rrv_pipeline_file);
++	}
++}
++
++void GSDeviceVK::RrvRecordPipeline(const PipelineSelector& p)
++{
++	if (!m_rrv_pipeline_file)
++		return;
++	std::fwrite(&p, sizeof(p), 1, m_rrv_pipeline_file);
++	std::fflush(m_rrv_pipeline_file); // the app is killed, not exited
++}
++
+ void GSDeviceVK::Destroy()
+ {
+ 	// Free the libretro backbuffers while the device is still alive; the
+@@ -3095,6 +3172,11 @@ void GSDeviceVK::Destroy()
+ 	}
+ 
+ 	std::unique_lock lock(s_instance_mutex);
++	if (m_rrv_pipeline_file)
++	{
++		std::fclose(m_rrv_pipeline_file); // RRV_PIPELINE_COLLECTION
++		m_rrv_pipeline_file = nullptr;
++	}
+ 
+ 	GSDevice::Destroy();
+ 
+@@ -7586,11 +7668,33 @@ VkShaderModule GSDeviceVK::GetTFXVertexShader(GSHWDrawConfig::VSSelector sel)
+ 	return mod;
+ }
+ 
++// RRV Quest: compile statistics for the bridge's hitch log (GSRrvGetCompileStats, GS.h).
++static std::atomic<u64> s_rrv_pipe_n{0}, s_rrv_pipe_us{0}, s_rrv_shader_n{0}, s_rrv_shader_us{0}, s_rrv_flush_us{0};
++void GSRrvGetCompileStats(u64* pipelines, u64* pipeline_us, u64* shaders, u64* shader_us, u64* flush_us)
++{
++	*pipelines = s_rrv_pipe_n.load(std::memory_order_relaxed);
++	*pipeline_us = s_rrv_pipe_us.load(std::memory_order_relaxed);
++	*shaders = s_rrv_shader_n.load(std::memory_order_relaxed);
++	*shader_us = s_rrv_shader_us.load(std::memory_order_relaxed);
++	*flush_us = s_rrv_flush_us.load(std::memory_order_relaxed);
++}
++
+ VkShaderModule GSDeviceVK::GetTFXFragmentShader(const GSHWDrawConfig::PSSelector& sel)
+ {
+ 	const auto it = m_tfx_fragment_shaders.find(sel);
+ 	if (it != m_tfx_fragment_shaders.end())
+ 		return it->second;
++	const Common::Timer::Value rrv_t0 = Common::Timer::GetCurrentValue();
++	struct RrvShaderTime
++	{
++		Common::Timer::Value t0;
++		~RrvShaderTime()
++		{
++			s_rrv_shader_n.fetch_add(1, std::memory_order_relaxed);
++			s_rrv_shader_us.fetch_add(static_cast<u64>(
++				1000.0 * Common::Timer::ConvertValueToMilliseconds(Common::Timer::GetCurrentValue() - t0)), std::memory_order_relaxed);
++		}
++	} rrv_shader_time{rrv_t0};
+ 
+ 	std::stringstream ss;
+ 	AddShaderHeader(ss);
+@@ -7865,12 +7969,16 @@ VkPipeline GSDeviceVK::GetTFXPipeline(const PipelineSelector& p)
+ 		pipeline = CreateTFXPipeline(p);
+ 		const double tfx_compile_ms =
+ 			Common::Timer::ConvertValueToMilliseconds(Common::Timer::GetCurrentValue() - tfx_compile_start);
++		s_rrv_pipe_n.fetch_add(1, std::memory_order_relaxed);
++		s_rrv_pipe_us.fetch_add(static_cast<u64>(tfx_compile_ms * 1000.0), std::memory_order_relaxed);
+ 		if (tfx_compile_ms >= 20.0)
+ 		{
+ 			Console.Warning("@@ANDROID_TFXCOMPILE@@ %.1f ms for one pipeline (n=%u since last cache flush)",
+ 				tfx_compile_ms, m_tfx_pipeline_compile_counter + 1);
+ 		}
+ 		m_tfx_pipelines.emplace(p, pipeline);
++		if (pipeline != VK_NULL_HANDLE)
++			RrvRecordPipeline(p); // RRV_PIPELINE_COLLECTION
+ 
+ 		// Persist the pipeline cache every N new compiles so an Android OOM-kill
+ 		// or crash mid-session doesn't throw away pipelines that compiled after
+@@ -7885,7 +7993,10 @@ VkPipeline GSDeviceVK::GetTFXPipeline(const PipelineSelector& p)
+ 		if (g_vulkan_shader_cache && ++m_tfx_pipeline_compile_counter >= PIPELINE_CACHE_FLUSH_THRESHOLD)
+ 		{
+ 			m_tfx_pipeline_compile_counter = 0;
++			const Common::Timer::Value rrv_f0 = Common::Timer::GetCurrentValue();
+ 			g_vulkan_shader_cache->FlushPipelineCache();
++			s_rrv_flush_us.fetch_add(static_cast<u64>(
++				1000.0 * Common::Timer::ConvertValueToMilliseconds(Common::Timer::GetCurrentValue() - rrv_f0)), std::memory_order_relaxed);
+ 		}
+ 	}
+ 	if (pipeline != VK_NULL_HANDLE)
+diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h
+index 4811b28e6b..e2d19652ba 100644
+--- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h
++++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h
+@@ -650,6 +650,12 @@ private:
+ 	VkShaderModule GetTFXVertexShader(GSHWDrawConfig::VSSelector sel);
+ 	VkShaderModule GetTFXFragmentShader(const GSHWDrawConfig::PSSelector& sel);
+ 	VkPipeline CreateTFXPipeline(const PipelineSelector& p);
++	// RRV pipeline collection (Quest): every TFX pipeline created is appended to
++	// <cache>/rrv_tfx_pipelines.bin, and Create() builds all collected ones up front, so a race
++	// does not compile pipelines while it runs (RRV_PIPELINE_COLLECTION).
++	void RrvWarmPipelines();
++	void RrvRecordPipeline(const PipelineSelector& p);
++	std::FILE* m_rrv_pipeline_file = nullptr;
+ 	VkPipeline GetTFXPipeline(const PipelineSelector& p);
+ 
+ 	VkShaderModule GetUtilityVertexShader(const std::string& source, const char* replace_main);
+-- 
+2.53.0
+

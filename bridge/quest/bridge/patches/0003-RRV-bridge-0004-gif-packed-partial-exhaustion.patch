@@ -1,0 +1,32 @@
+From 8d567fc1fda2ca934701b85737dcb15a7ba7aa0a Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 21:16:38 +0100
+Subject: [PATCH 03/44] RRV bridge 0004-gif-packed-partial-exhaustion
+
+Fukami tools/patches/pcsx2/0004-gif-packed-partial-exhaustion.patch, applied to ARMSX2 by a clean three-way merge.
+---
+ pcsx2/GS/GSState.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/pcsx2/GS/GSState.cpp b/pcsx2/GS/GSState.cpp
+index d0058de68f..7b73546a13 100644
+--- a/pcsx2/GS/GSState.cpp
++++ b/pcsx2/GS/GSState.cpp
+@@ -5003,6 +5003,14 @@ void GSState::Transfer(const u8* mem, u32 size)
+ 							break;
+ 					}
+ 
++					// A split path-3 PACKED payload can finish the current loop while retaining
++					// a residual QWC for the next GIFtag. Do not enter PACKED fallback here.
++					if constexpr (index == 3)
++					{
++						if (size == 0 || path.nloop == 0)
++							break;
++					}
++
+ 					// all data available? usually is
+ 
+ 					total = path.nloop * path.nreg;
+-- 
+2.53.0
+

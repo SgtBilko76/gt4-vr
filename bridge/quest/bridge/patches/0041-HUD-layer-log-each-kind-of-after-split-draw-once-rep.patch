@@ -1,0 +1,39 @@
+From fca965ddbb9542e34242dd3e251e7e6c19bc08f6 Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 00:24:00 +0100
+Subject: [PATCH 41/44] HUD layer log: each kind of after-split draw once
+ (repeating HUD boxes filled the capped log)
+
+---
+ pcsx2/GS/Renderers/HW/GSRendererHW.cpp | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index 3cb7a30b2c..f2d3e71341 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -499,9 +499,19 @@ void GSRendererHW::RrvHudSplitNoteDraw()
+ #if defined(__ANDROID__)
+ 		// Log what was not seen yet (the centre HUD box 194,163-446,211 repeats every field and filled
+ 		// the old log before the crash), plus every frame-reading draw.
++		// Each kind of draw once (owner 2026-11-08: two repeating HUD boxes filled the capped log before
++		// he crashed, twice): signature = box in 16-px steps, texture on/off and format, blend, colour.
+ 		static u32 s_dbg_after = 0;
+-		const bool centre_hud = box.x >= 190.0f && box.x <= 198.0f && box.z >= 442.0f && box.z <= 450.0f;
+-		if (s_dbg_after < 400 && !black_fill && (reads_frame || (!centre_hud && ((box.z - box.x) >= 200.0f || (box.w - box.y) >= 150.0f))) && ++s_dbg_after)
++		static std::vector<u64> s_dbg_seen;
++		const u64 sig = (static_cast<u64>(static_cast<int>(box.x) >> 4 & 0x3F)) | (static_cast<u64>(static_cast<int>(box.y) >> 4 & 0x3F) << 6) |
++						(static_cast<u64>(static_cast<int>(box.z) >> 4 & 0x3F) << 12) | (static_cast<u64>(static_cast<int>(box.w) >> 4 & 0x3F) << 18) |
++						(static_cast<u64>(tme ? 1 : 0) << 24) | (static_cast<u64>(m_cached_ctx.TEX0.PSM & 0x3F) << 25) |
++						(static_cast<u64>(m_context->ALPHA.U64 & 0xFF) << 31) | (static_cast<u64>(m_context->ALPHA.FIX) << 39) |
++						(static_cast<u64>(m_vt.m_max.c.U32[0] >> 4 & 0xF) << 47) | (static_cast<u64>(m_vt.m_max.c.U32[3] >> 4 & 0xF) << 51);
++		const bool new_kind = std::find(s_dbg_seen.begin(), s_dbg_seen.end(), sig) == s_dbg_seen.end();
++		if (new_kind && s_dbg_seen.size() < 4096)
++			s_dbg_seen.push_back(sig);
++		if (s_dbg_after < 400 && !black_fill && new_kind && ++s_dbg_after)
+ 			std::fprintf(stderr, "[hud-layer] after split: draw %d prims %u fbp 0x%x tme %d tbp 0x%x psm %u tpsm %u ztst %u%s box %.0f,%.0f-%.0f,%.0f rgba %u,%u,%u,%u alpha %016llx -> %s\n",
+ 				s_n, static_cast<unsigned>(m_index->tail), fbp, tme ? 1 : 0, tbp, static_cast<unsigned>(m_cached_ctx.FRAME.PSM),
+ 				static_cast<unsigned>(m_cached_ctx.TEX0.PSM), static_cast<unsigned>(test.ZTST), test.ZTE ? "" : " (off)", box.x, box.y, box.z, box.w,
+-- 
+2.53.0
+

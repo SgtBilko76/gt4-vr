@@ -1,0 +1,36 @@
+From 10e6e9b99da98116e85ceade9f87d9aa237a4def Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 16:23:47 +0100
+Subject: [PATCH 23/44] Quest: stereo depth statistics to stderr every 5 s
+ (Console reaches no log in the bridge)
+
+---
+ pcsx2/GS/Renderers/Common/GSRenderer.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.cpp b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+index c3c59525da..53142571d5 100644
+--- a/pcsx2/GS/Renderers/Common/GSRenderer.cpp
++++ b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-3.0+
+ 
+ #include "ImGui/FullscreenUI.h"
++#include <cstdio>
+ #include "ImGui/ImGuiManager.h"
+ #include "GS/Renderers/Common/GSRenderer.h"
+ #include "GS/Renderers/Common/GSInterlaceModePolicy.h"
+@@ -1264,6 +1265,10 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
+ 				if (Common::Timer::ConvertValueToSeconds(stereo_now - stereo_report_at) >= 5.0)
+ 				{
+ 					const int state = (stereo_frames_with_depth == 0) ? 0 : (stereo_frames_with_depth == stereo_frames) ? 2 : 1;
++#if defined(__ANDROID__)
++					// Quest bridge: Console output reaches no log there; stderr does (the host's log.txt).
++					std::fprintf(stderr, "[stereo] %u of %u frames reprojected with depth\n", stereo_frames_with_depth, stereo_frames);
++#endif
+ 					if (state != stereo_last_state)
+ 					{
+ 						Console.WriteLnFmt("GS: Stereo: {} of {} frames reprojected with depth", stereo_frames_with_depth, stereo_frames);
+-- 
+2.53.0
+

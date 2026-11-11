@@ -1,0 +1,4826 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team; 2026 RRV-Recomp
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Provenance: lifecycle/config/window glue is adapted from
+// pcsx2-gsrunner/Main.cpp at PCSX2 d5f75c9e42064a77036466f1f4594b0507888633
+// (GPL-3.0+).  The exact PCSX2 GS API calls below are from pcsx2/GS/GS.h and
+// pcsx2/GS/GS.cpp at the same revision.  This file is built only by the
+// clean-worktree script; it never modifies the pinned, dirty PCSX2 checkout.
+
+#define RRV_PCSX2_GS_BRIDGE_BUILD 1
+#include "rrv_pcsx2_gs_bridge.h"
+#if defined(RRV_PCSX2_GS_CANONICAL_RECEIPTS)
+#include "canonical_receipt.h"
+#endif
+
+#include "common/FileSystem.h"
+#include "common/FPControl.h"
+#include "common/MemorySettingsInterface.h"
+#include "common/Path.h"
+#include "pcsx2/Config.h"
+#include "pcsx2/GS.h"
+#include "pcsx2/GS/GSPerfMon.h"
+#include "pcsx2/GS/Renderers/Common/GSDevice.h"
+#include "pcsx2/GS/Renderers/Common/GSRenderer.h"
+#include "pcsx2/PerformanceMetrics.h"
+#include "pcsx2/Host.h"
+#include "pcsx2/ImGui/ImGuiManager.h"
+#include "pcsx2/Memory.h"
+#include "pcsx2/VMManager.h"
+
+#include "imgui.h"
+
+// pcsx2 GSRenderer.cpp (fork): Quest stereo depth mask, GT4 profile only.
+void GSRrvSetStereoDepthMask(float mask);
+
+#include <string_view>
+// pcsx2/GS/GS.h (not included here): the GameDB getSkipCount name -> function id.
+s16 GSLookupGetSkipCountFunctionId(const std::string_view name);
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cfloat>
+#include <chrono>
+#include <cmath>
+#include <mutex>
+#include <cstddef>
+#include <cstdarg>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
+#include <ctime>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#if defined(_WIN32)
+#include "common/RedtapeWindows.h"
+#include "common/StringUtil.h"
+#include <dxgi1_6.h>
+#include <wil/com.h>
+#pragma comment(lib, "dxgi.lib")
+#else
+#include <dlfcn.h>
+#endif
+
+namespace {
+
+#if defined(_WIN32)
+// Which graphics adapter renders, on a PC with more than one (a laptop with an integrated and a discrete GPU).
+// PCSX2 takes the adapter whose description equals GSConfig.Adapter, or the first one DXGI lists, which on such a
+// laptop is the integrated GPU. RRV_PCSX2_GS_ADAPTER (`[rendering] gpu`):
+//   unset   the first adapter, as before
+//   high    the one Windows ranks as high performance (the discrete GPU)
+//   low     the one Windows ranks as minimum power (the integrated GPU)
+//   other   the adapter with exactly that description
+// Measured on a Radeon 780M + RTX 5060 laptop whose panel hangs on the Radeon (docs/TESTING.md T-WIN-PACING-2):
+// rendering on the RTX was worse there (every frame crosses adapters), so nothing chooses it by default; it is
+// for a display wired to the discrete GPU.
+std::string RrvAdapterName()
+{
+    const char* requested = std::getenv("RRV_PCSX2_GS_ADAPTER");
+    if (!requested || !requested[0])
+        return {};
+    const bool high = std::strcmp(requested, "high") == 0;
+    if (!high && std::strcmp(requested, "low") != 0)
+    {
+        std::fprintf(stderr, "[pcsx2-gs-bridge] adapter requested by name: %s\n", requested);
+        return requested;
+    }
+    wil::com_ptr_nothrow<IDXGIFactory6> factory;
+    wil::com_ptr_nothrow<IDXGIAdapter1> adapter;
+    DXGI_ADAPTER_DESC1 desc{};
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(factory.put()))) ||
+        FAILED(factory->EnumAdapterByGpuPreference(
+            0, high ? DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE : DXGI_GPU_PREFERENCE_MINIMUM_POWER,
+            IID_PPV_ARGS(adapter.put()))) ||
+        FAILED(adapter->GetDesc1(&desc)))
+    {
+        std::fprintf(stderr, "[pcsx2-gs-bridge] adapter=%s: Windows named none; the first adapter is used\n", requested);
+        return {};
+    }
+    const std::string name = StringUtil::WideStringToUTF8String(desc.Description);
+    std::fprintf(stderr, "[pcsx2-gs-bridge] adapter=%s: %s\n", requested, name.c_str());
+    return name;
+}
+#endif
+
+extern "C" void rrv_pcsx2_gs_bridge_initialize_host_console();
+extern "C" int rrv_pcsx2_gs_bridge_configure_native_surface(
+    uint32_t kind, uint32_t flags, void* native_view, void* native_layer,
+    uint32_t width_pixels, uint32_t height_pixels, float backing_scale,
+    char* error, uint32_t error_capacity);
+extern "C" void rrv_pcsx2_gs_bridge_clear_native_surface();
+extern "C" int rrv_pcsx2_gs_bridge_validate_macos_surface(
+    void* native_view, void* native_layer, char* error, uint32_t error_capacity);
+extern "C" int rrv_pcsx2_gs_bridge_is_macos_main_thread();
+extern "C" int rrv_pcsx2_gs_bridge_consume_owner_surface(
+    const RrvPcsx2GsBridgeSurface* surface, char* error, uint32_t error_capacity);
+#if defined(_WIN32)
+// win32_surface_adapter.cpp: handle checks for the Win32 kind (IsWindow on the HWND).
+extern "C" int rrv_pcsx2_gs_bridge_validate_win32_surface(
+    const RrvPcsx2GsBridgeSurface* surface, char* error, uint32_t error_capacity);
+#elif defined(__ANDROID__)
+// quest/bridge/android_surface_adapter.cpp: the ANativeWindow kind, and where the
+// resources and the writable data directory are (not beside the APK's native library).
+extern "C" int rrv_pcsx2_gs_bridge_validate_android_surface(
+    const RrvPcsx2GsBridgeSurface* surface, char* error, uint32_t error_capacity);
+extern "C" const char* rrv_quest_bridge_resource_directory();
+extern "C" void rrv_quest_bridge_apply_data_directory();
+#elif !defined(__APPLE__)
+// linux_surface_adapter.cpp: handle-shape checks for the X11/Wayland kinds.
+extern "C" int rrv_pcsx2_gs_bridge_validate_linux_surface(
+    const RrvPcsx2GsBridgeSurface* surface, char* error, uint32_t error_capacity);
+#endif
+
+// The GPU renderer the bridge presents through on this platform: Metal on
+// macOS, Vulkan elsewhere (Linux/Steam Deck, Gate 5; Windows). RENDERER_AUTO
+// resolves to it. Windows can also ask for PCSX2's Direct3D 11 renderer
+// (RRV_PCSX2_GS_RENDERER_D3D11): direct presentation and the RR5 hardware
+// profile apply to every renderer IsPlatformGpuRenderer() accepts.
+#if defined(__APPLE__)
+constexpr GSRendererType kPlatformGpuRenderer = GSRendererType::Metal;
+#else
+constexpr GSRendererType kPlatformGpuRenderer = GSRendererType::VK;
+#endif
+
+constexpr bool IsPlatformGpuRenderer(GSRendererType renderer)
+{
+#if defined(_WIN32)
+    if (renderer == GSRendererType::DX11)
+        return true;
+#endif
+    return renderer == kPlatformGpuRenderer;
+}
+
+constexpr const char* GpuBackendName(GSRendererType renderer)
+{
+    return renderer == GSRendererType::Metal ? "Metal" :
+           renderer == GSRendererType::VK ? "Vulkan" :
+           renderer == GSRendererType::DX11 ? "Direct3D 11" : "non-Metal";
+}
+
+// Display sync (RRV_PCSX2_GS_VSYNC=1): how a frame waits for the display.
+// FIFO on every platform and renderer: each frame is queued for a vertical
+// blank, so nothing tears. On a display faster than the game (a 165 Hz laptop
+// panel) PCSX2's Vulkan FIFO once made the GS thread wait for a blank per
+// present and a heavy field took three refreshes (55 starts/s); the swap-chain
+// acquire on a helper thread (pcsx2-gs-bridge-linux.patch, T-DECK-GS-WAIT)
+// removed that wait, on Windows too (docs/TESTING.md "Windows presentation
+// sync"). Direct3D 11's flip-model swap chain never had it. FIFO alone does
+// not make the frames even on Windows: that is the present pacer of
+// pcsx2-gs-bridge-windows-d3d11.patch (RRVPresentPacer.h, Direct3D 11), which
+// on a variable-refresh display replaces the FIFO present by one without
+// display sync at the frame's slot (docs/TESTING.md T-WIN-PACING).
+// RRV_PCSX2_GS_DISPLAY_SYNC=fifo|mailbox (developer variable) overrides the
+// mode, to measure one against the other. Mailbox showed tearing and uneven
+// motion in fullscreen on Direct3D 11 (owner observation, 2026-10-11); a
+// Vulkan driver without a mailbox mode then presents without display sync
+// (ApplyDisplaySync). `refresh_hz` is the Windows monitor's rate, for the log.
+GSVSyncMode DisplaySyncMode(const RrvPcsx2GsBridgeSurface* surface, unsigned* refresh_hz)
+{
+    *refresh_hz = 0;
+#if defined(_WIN32)
+    if (surface && surface->kind == RRV_PCSX2_GS_SURFACE_WIN32 && surface->native_view)
+    {
+        MONITORINFOEXW monitor{};
+        monitor.cbSize = sizeof(monitor);
+        DEVMODEW mode{};
+        mode.dmSize = sizeof(mode);
+        if (GetMonitorInfoW(MonitorFromWindow(static_cast<HWND>(surface->native_view), MONITOR_DEFAULTTONEAREST),
+                            static_cast<MONITORINFO*>(&monitor)) &&
+            EnumDisplaySettingsW(monitor.szDevice, ENUM_CURRENT_SETTINGS, &mode) && mode.dmDisplayFrequency > 1)
+            *refresh_hz = mode.dmDisplayFrequency;
+    }
+#else
+    (void)surface;
+#endif
+    if (const char* value = std::getenv("RRV_PCSX2_GS_DISPLAY_SYNC"); value && value[0] != '\0')
+    {
+        if (std::strcmp(value, "mailbox") == 0)
+            return GSVSyncMode::Mailbox;
+        if (std::strcmp(value, "fifo") != 0)
+            std::fprintf(stderr, "[pcsx2-gs-bridge] ignoring RRV_PCSX2_GS_DISPLAY_SYNC=%s (expected fifo or mailbox)\n",
+                         value);
+    }
+    return GSVSyncMode::FIFO;
+}
+
+const char* SyncModeName(GSVSyncMode mode)
+{
+    return mode == GSVSyncMode::FIFO ? "FIFO" : mode == GSVSyncMode::Mailbox ? "Mailbox" : "off";
+}
+
+// Turns display sync on (at open, or when a fast-forward ends). A Vulkan
+// driver without a mailbox present mode makes PCSX2 fall back to FIFO, the
+// blocking mode Mailbox was chosen to avoid: present immediately instead. In
+// a window the compositor still shows whole frames.
+void ApplyDisplaySync(GSVSyncMode wanted, bool set)
+{
+    if (set)
+        GSSetVSyncMode(wanted, false);
+    if (wanted == GSVSyncMode::Mailbox && g_gs_device && g_gs_device->GetVSyncMode() == GSVSyncMode::FIFO)
+    {
+        GSSetVSyncMode(GSVSyncMode::Disabled, false);
+        std::fprintf(stderr, "[pcsx2-gs-bridge] presentation vsync: no mailbox present mode on this device; "
+                             "presenting without display sync\n");
+    }
+}
+
+constexpr size_t kPrivRegsBytes = 0x2000;
+constexpr size_t kSlotCount = RRV_PCSX2_GS_BRIDGE_PRIV_REG_COUNT;
+constexpr std::array<size_t, kSlotCount> kPcsx2Offsets = {
+    0, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224,
+    0x1000, 0x1010, 0x1040, 0x1080,
+};
+
+static_assert(kPcsx2Offsets.size() == kSlotCount);
+
+void SetError(char* destination, uint32_t capacity, const char* format, ...)
+{
+    if (!destination || capacity == 0)
+        return;
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(destination, capacity, format, args);
+    va_end(args);
+    destination[capacity - 1] = '\0';
+}
+
+std::string GetBridgeDirectory()
+{
+#if defined(_WIN32)
+    // The directory of this DLL (the staged resources sit beside it), whichever process loaded it and from wherever.
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(&GetBridgeDirectory), &module))
+        return {};
+    std::wstring path(MAX_PATH, L'\0');
+    for (;;)
+    {
+        const DWORD length = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
+        if (length == 0)
+            return {};
+        if (length < path.size())
+        {
+            path.resize(length);
+            break;
+        }
+        path.resize(path.size() * 2);
+    }
+    const std::string library_path = Path::Canonicalize(StringUtil::WideStringToUTF8String(path));
+    return std::string(Path::GetDirectory(library_path));
+#else
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<const void*>(&GetBridgeDirectory), &info) == 0 || !info.dli_fname)
+        return {};
+    const std::string library_path = Path::Canonicalize(info.dli_fname);
+    return std::string(Path::GetDirectory(library_path));
+#endif
+}
+
+bool InitializePcsx2BaseSettings(std::string& error)
+{
+    // gsrunner uses these same in-memory settings layers.  GSopen(SW) still
+    // initializes ImGui's presentation plumbing, so its font setup is required
+    // even though this bridge is surfaceless and never draws an OSD.
+    static bool initialized = false;
+    static MemorySettingsInterface settings;
+    if (initialized)
+        return true;
+
+    rrv_pcsx2_gs_bridge_initialize_host_console();
+
+    EmuFolders::SetAppRoot();
+    // The canonical package reader has already verified the loaded image. Its
+    // resources live beside that image and must remain the only resource root:
+    // environment, bundle, and default-library fallbacks would sever that
+    // source-derived authority.
+#if defined(__ANDROID__)
+    // Android: the library sits in the APK's read-only native library directory, so the
+    // app copies the resources out of its assets and names the directory
+    // (rrv_pcsx2_gs_bridge_android_set_paths or RRV_PCSX2_GS_RESOURCE_DIR); without
+    // either, beside the library as on the desktop. The data directory is applied
+    // before SetDataDirectory below reads it.
+    const std::string staged_resources = rrv_quest_bridge_resource_directory();
+    rrv_quest_bridge_apply_data_directory();
+#else
+    const std::string bridge_directory = GetBridgeDirectory();
+    const std::string staged_resources = bridge_directory.empty() ? std::string{} :
+        Path::Combine(bridge_directory, "resources");
+#endif
+    if (!staged_resources.empty() && FileSystem::DirectoryExists(staged_resources.c_str()))
+        EmuFolders::Resources = Path::Canonicalize(staged_resources);
+    else
+    {
+        error = "PCSX2 resources directory is unavailable beside the verified bridge";
+        return false;
+    }
+
+    if (!FileSystem::DirectoryExists(EmuFolders::Resources.c_str()) ||
+        !EmuFolders::SetDataDirectory(nullptr))
+    {
+        error = "PCSX2 resources/data directory setup failed";
+        return false;
+    }
+    // SetDataDirectory creates writable user paths. Pin its resource override
+    // slot to the verified immutable package before any PCSX2 subsystem can
+    // resolve fonts or shaders through GetOverridableResourcePath().
+    EmuFolders::UserResources = EmuFolders::Resources;
+
+    const char* hardware_error = nullptr;
+    if (!VMManager::PerformEarlyHardwareChecks(&hardware_error))
+    {
+        error = hardware_error ? hardware_error : "PCSX2 early hardware checks failed";
+        return false;
+    }
+
+    Host::Internal::SetBaseSettingsLayer(&settings);
+    VMManager::SetDefaultSettings(settings, true, true, true, true, true);
+    VMManager::Internal::LoadStartupSettings();
+    std::fprintf(stderr, "[pcsx2-gs-bridge] shader cache folder %s\n", EmuFolders::Cache.c_str());
+
+    const std::string roboto_path =
+        EmuFolders::GetOverridableResourcePath("fonts" FS_OSPATH_SEPARATOR_STR "Roboto-Regular.ttf");
+    const auto roboto_data = FileSystem::MapBinaryFileForRead(roboto_path.c_str());
+    if (roboto_data.empty())
+    {
+        error = "PCSX2 resource font is unavailable: " + roboto_path;
+        return false;
+    }
+
+    std::vector<ImGuiManager::FontInfo> fonts;
+    ImGuiManager::FontInfo font{};
+    font.data = roboto_data;
+    fonts.push_back(font);
+    ImGuiManager::SetFonts(std::move(fonts));
+    initialized = true;
+    return true;
+}
+
+// PCSX2's software rasterizer JIT emits into the host code reserve
+// (HostMemoryMap::SWrec), which every PCSX2 frontend allocates through
+// SysMemory before opening the GS. The product bridge no longer runs that
+// JIT: the SW rasterizer (CPU sprite rendering) uses ahead-of-time specialised
+// C functions, verified pixel-identical to the ARM64 JIT (the ARM64 C-path
+// defects behind KNOWN_ISSUES #21 are fixed in pcsx2-gs-bridge-target.patch),
+// so nothing is mapped. Only the diagnostic JIT build
+// (RRV_PCSX2_GS_BRIDGE_SW_JIT=ON, which defines RRV_PCSX2_GS_SW_JIT) owns the
+// map. The EE/IOP/VU regions it also reserves are unused by RRV; they are
+// address-space reservations, not commitments.
+//
+// Release is mandatory, not tidiness: SharedMemoryMappingArea's destructor
+// asserts "No mappings left", and reaching that assert during static
+// destruction aborts the process on an already-destroyed mutex.
+bool s_host_memory_allocated = false;
+
+bool AcquireHostMemory(std::string& error)
+{
+    if (s_host_memory_allocated)
+        return true;
+#if !defined(RRV_PCSX2_GS_SW_JIT)
+    (void)error;
+    return true;
+#endif
+    if (!SysMemory::Allocate())
+    {
+        error = "PCSX2 host memory map allocation failed (required by the SW rasterizer JIT)";
+        return false;
+    }
+    s_host_memory_allocated = true;
+    return true;
+}
+
+void ReleaseHostMemory()
+{
+    if (!s_host_memory_allocated)
+        return;
+    SysMemory::Release();
+    s_host_memory_allocated = false;
+}
+
+// AcquireHostMemory() reserves process-global PCSX2 mappings.  A failed
+// bridge create must release them before returning: otherwise a later create
+// observes stale ownership and the static PCSX2 teardown can assert.
+class HostMemoryReleaseGuard
+{
+public:
+    ~HostMemoryReleaseGuard()
+    {
+        if (m_armed)
+            ReleaseHostMemory();
+    }
+
+    void disarm() { m_armed = false; }
+
+private:
+    bool m_armed = true;
+};
+
+// Env hatches for the KNOWN_ISSUES #24 differential. All default to the
+// bridge's existing behaviour, so an unset environment changes nothing.
+bool EnvFlag(const char* name, bool fallback)
+{
+    const char* v = std::getenv(name);
+    if (!v || v[0] == '\0')
+        return fallback;
+    return v[0] != '0';
+}
+
+// Take the merged texture at PCSX2's own internal resolution (window 0x0),
+// which is exactly what `pcsx2-gsrunner`'s ScreenshotSize=InternalResolution-
+// Uncorrected does. Passing a real window size instead makes PCSX2 run
+// CalculateDrawDstRect (aspect correction) + a bilinear StretchRect fit, i.e. a
+// different image operation from the reference, and the frontend then presents
+// that already-resampled image -- two transforms where there should be none.
+// That resample WAS all of KNOWN_ISSUES #24: matching it collapses direct-vs-
+// MTGS from MAE 20.43 to 0.71 on A1 and 11.52 to 0.31 on A2, both inside the
+// self-drift floor. RRV_PCSX2_GS_SNAPSHOT_INTERNAL=0 restores the old fit.
+bool SnapshotAtInternalResolution()
+{
+    static const bool v = EnvFlag("RRV_PCSX2_GS_SNAPSHOT_INTERNAL", true);
+    return v;
+}
+
+// RRV_PCSX2_GS_VSYNC_REGWRITTEN=0 passes registers_written=false, which is what
+// GSDumpReplayer does (MTGS::PostVsyncStart(false)) on every frame. It feeds
+// GSRenderer::VSync's SkipDuplicateFrames / PerformanceMetrics decision only.
+bool VsyncRegistersWritten()
+{
+    static const bool v = EnvFlag("RRV_PCSX2_GS_VSYNC_REGWRITTEN", true);
+    return v;
+}
+
+// RRV_PCSX2_GS_VSYNC_FIELD_FROM_CSR=1 stops forcing CSR.FIELD from RRV's own
+// field parity and derives the GSvsync field argument from the delivered CSR
+// exactly as MTGS does. `field` is the argument Merge() composes with, so this
+// is the one vsync input that can change the composed image.
+bool VsyncFieldFromCsr()
+{
+    static const bool v = EnvFlag("RRV_PCSX2_GS_VSYNC_FIELD_FROM_CSR", false);
+    return v;
+}
+
+bool BridgeDiagEnabled()
+{
+    const char* value = std::getenv("RRV_PCSX2_GS_DIAG");
+    return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+bool BridgeDiagVerbose()
+{
+    const char* value = std::getenv("RRV_PCSX2_GS_DIAG");
+    return value && std::strcmp(value, "verbose") == 0;
+}
+
+// Inline GS calls can arrive inside the producer's VU rounding scope. PCSX2's
+// MTGS thread instead starts with GetDefault(), so isolate only when requested
+// and restore the caller's FPCR before returning to guest execution.
+class ScopedBridgeGsFpcr
+{
+public:
+    explicit ScopedBridgeGsFpcr(bool isolated)
+    {
+        if (isolated)
+            m_backup.emplace(FPControlRegister::GetDefault());
+    }
+
+private:
+    std::optional<FPControlRegisterBackup> m_backup;
+};
+
+// PCSX2's GameIndex gives Ridge Racer V (SLUS-20002) textureInsideRT=1 to
+// repair its post-processing feedback passes. The bridge never boots a disc,
+// so it has no serial/CRC through which PCSX2 could select that profile. The
+// remaining values below each have an independent, capture-backed reason:
+// CPU sprite rendering fixes the car material feedback path, while the
+// large-ST rewrite is limited to the reflection-map draws which need it.
+// Keep this as a deliberately small, named hardware profile until each
+// additional GameIndex setting has its own capture-backed justification.
+constexpr const char* kMetalTextureInsideRtEnv = "RRV_PCSX2_GS_METAL_TEXTURE_INSIDE_RT";
+constexpr const char* kMetalCpuSpriteBwEnv = "RRV_PCSX2_GS_CPU_SPRITE_BW";
+// RR5 Metal profile: PCSX2 GPU palette conversion (paltex) is on. 8-bit
+// textures stay indexed and the CLUT lookup runs in the shader, so the hash
+// cache no longer keys on the CLUT. Gate-4 G4-6 KEEP (owner visual acceptance
+// VIS-004, 2026-09-25): window R +28.6%, traces/digests identical, image
+// differs from the CPU-expanded path in sampling detail. RRV_PCSX2_GS_PALTEX=0
+// is the rollback to PCSX2's default (off); =1 is accepted and changes nothing.
+constexpr const char* kMetalPaltexEnv = "RRV_PCSX2_GS_PALTEX";
+
+const char* TextureInsideRtModeName(GSTextureInRtMode mode)
+{
+    switch (mode)
+    {
+        case GSTextureInRtMode::Disabled:
+            return "Disabled";
+        case GSTextureInRtMode::InsideTargets:
+            return "InsideTargets";
+        case GSTextureInRtMode::MergeTargets:
+            return "MergeTargets";
+        default:
+            return "Unknown";
+    }
+}
+
+bool ParseMetalTextureInsideRtOverride(GSTextureInRtMode& mode)
+{
+    const char* value = std::getenv(kMetalTextureInsideRtEnv);
+    if (!value || value[0] == '\0')
+        return false;
+
+    if (value[0] >= '0' && value[0] <= '2' && value[1] == '\0')
+    {
+        mode = static_cast<GSTextureInRtMode>(value[0] - '0');
+        return true;
+    }
+
+    std::fprintf(stderr,
+                 "[pcsx2-gs-bridge] ignoring invalid %s=%s (expected 0=Disabled, "
+                 "1=InsideTargets, or 2=MergeTargets)\n",
+                 kMetalTextureInsideRtEnv, value);
+    return false;
+}
+
+bool ParseMetalPaltexOverride(bool& paltex)
+{
+    const char* value = std::getenv(kMetalPaltexEnv);
+    if (!value || value[0] == '\0')
+        return false;
+    if ((value[0] == '0' || value[0] == '1') && value[1] == '\0')
+    {
+        paltex = value[0] == '1';
+        return true;
+    }
+    std::fprintf(stderr, "[pcsx2-gs-bridge] ignoring invalid %s=%s (expected 0 or 1)\n",
+                 kMetalPaltexEnv, value);
+    return false;
+}
+
+bool ParseMetalCpuSpriteBwOverride(unsigned& bw)
+{
+    const char* value = std::getenv(kMetalCpuSpriteBwEnv);
+    if (!value || value[0] == '\0')
+        return false;
+    if ((value[0] == '0' || value[0] == '1') && value[1] == '\0')
+    {
+        bw = static_cast<unsigned>(value[0] - '0');
+        return true;
+    }
+    std::fprintf(stderr, "[pcsx2-gs-bridge] ignoring invalid %s=%s (expected 0 or 1)\n",
+                 kMetalCpuSpriteBwEnv, value);
+    return false;
+}
+
+// The RR5 hardware profile. Every setting here is a PCSX2 HW-renderer option
+// (GSRendererHW / GSTextureCache), not a Metal one, so the Vulkan renderer on
+// Linux gets the same profile; the env names keep their historical METAL
+// spelling so launchers and captures stay comparable across platforms.
+void ApplyRrvMetalHardwareProfile(GSRendererType renderer, Pcsx2Config::GSOptions& options)
+{
+#if defined(__APPLE__)
+    // GSopen(Auto) resolves to Metal on macOS (GSUtil::GetPreferredRenderer).
+    // Keep the software renderer's defaults untouched.
+    if (renderer != GSRendererType::Metal && renderer != GSRendererType::Auto)
+        return;
+#else
+    // Off macOS the bridge resolves AUTO to Vulkan itself (ResolveRenderer),
+    // so GSopen never sees Auto here; OpenGL is not a supported product path.
+    // Windows Direct3D 11 runs the same GSRendererHW and gets the same profile.
+    if (!IsPlatformGpuRenderer(renderer))
+        return;
+#endif
+
+    GSTextureInRtMode texture_inside_rt = GSTextureInRtMode::InsideTargets;
+    const bool overridden = ParseMetalTextureInsideRtOverride(texture_inside_rt);
+    unsigned cpu_sprite_bw = 1;
+    const bool cpu_sprite_overridden = ParseMetalCpuSpriteBwOverride(cpu_sprite_bw);
+    options.UserHacks_TextureInsideRt = texture_inside_rt;
+    options.UserHacks_CPUSpriteRenderBW = cpu_sprite_bw;
+    options.UserHacks_CPUSpriteRenderLevel = 1;
+    options.UserHacks_RewriteLargeST = true;
+    bool paltex = true;
+    const bool paltex_overridden = ParseMetalPaltexOverride(paltex);
+    options.GPUPaletteConversion = paltex;
+    std::fprintf(stderr,
+                 "[pcsx2-gs-bridge] RR5 %s profile: TextureInsideRt=%u (%s)%s "
+                 "CPUSpriteRenderBW=%u%s CPUSpriteRenderLevel=%u RewriteLargeST=%u "
+                 "GPUPaletteConversion=%u%s\n",
+                 GpuBackendName(renderer == GSRendererType::Auto ? kPlatformGpuRenderer : renderer),
+                 static_cast<unsigned>(texture_inside_rt), TextureInsideRtModeName(texture_inside_rt),
+                 overridden ? " [env override]" : "",
+                 static_cast<unsigned>(options.UserHacks_CPUSpriteRenderBW),
+                 cpu_sprite_overridden ? " [diagnostic override]" : "",
+                 static_cast<unsigned>(options.UserHacks_CPUSpriteRenderLevel),
+                 static_cast<unsigned>(options.UserHacks_RewriteLargeST),
+                 static_cast<unsigned>(options.GPUPaletteConversion),
+                 paltex_overridden ? " [env override]" : "");
+}
+
+bool ResolveRendererFromEnvironment(GSRendererType& renderer, const char*& name,
+                                    uint32_t& kind, const char*& display_name,
+                                    std::string& error)
+{
+    const char* requested = std::getenv("RRV_PCSX2_GS_RENDERER");
+    if (!requested || requested[0] == '\0' || std::strcmp(requested, "software") == 0)
+    {
+        renderer = GSRendererType::SW;
+        name = "software";
+        kind = RRV_PCSX2_GS_RENDERER_SOFTWARE;
+        display_name = "PCSX2 Software";
+        return true;
+    }
+    if (std::strcmp(requested, "auto") == 0)
+    {
+#if defined(__APPLE__)
+        renderer = GSRendererType::Auto;
+#else
+        // PCSX2's own Auto may pick OpenGL on Linux; the product is Vulkan.
+        renderer = GSRendererType::VK;
+#endif
+        name = "auto";
+        kind = RRV_PCSX2_GS_RENDERER_AUTO;
+        display_name = "PCSX2 Auto";
+        return true;
+    }
+    if (std::strcmp(requested, "metal") == 0)
+    {
+#if defined(__APPLE__)
+        renderer = GSRendererType::Metal;
+        name = "metal";
+        kind = RRV_PCSX2_GS_RENDERER_METAL;
+        display_name = "PCSX2 Metal";
+        return true;
+#else
+        error = "RRV_PCSX2_GS_RENDERER=metal is only available on macOS";
+        return false;
+#endif
+    }
+    if (std::strcmp(requested, "vulkan") == 0)
+    {
+#if !defined(__APPLE__)
+        renderer = GSRendererType::VK;
+        name = "vulkan";
+        kind = RRV_PCSX2_GS_RENDERER_VULKAN;
+        display_name = "PCSX2 Vulkan";
+        return true;
+#else
+        error = "RRV_PCSX2_GS_RENDERER=vulkan is not available on macOS (use metal)";
+        return false;
+#endif
+    }
+
+    if (std::strcmp(requested, "d3d11") == 0)
+    {
+#if defined(_WIN32)
+        renderer = GSRendererType::DX11;
+        name = "d3d11";
+        kind = RRV_PCSX2_GS_RENDERER_D3D11;
+        display_name = "PCSX2 Direct3D 11";
+        return true;
+#else
+        error = "RRV_PCSX2_GS_RENDERER=d3d11 is only available on Windows";
+        return false;
+#endif
+    }
+
+    error = "invalid RRV_PCSX2_GS_RENDERER='" + std::string(requested) +
+        "' (expected software, metal, vulkan, d3d11, or auto)";
+    return false;
+}
+
+bool ResolveRenderer(uint32_t requested_kind, GSRendererType& renderer, const char*& name,
+                     uint32_t& kind, const char*& display_name, std::string& error)
+{
+    if (requested_kind == RRV_PCSX2_GS_RENDERER_UNKNOWN)
+        return ResolveRendererFromEnvironment(renderer, name, kind, display_name, error);
+
+    switch (requested_kind)
+    {
+        case RRV_PCSX2_GS_RENDERER_SOFTWARE:
+            renderer = GSRendererType::SW;
+            name = "software";
+            kind = requested_kind;
+            display_name = "PCSX2 Software";
+            return true;
+        case RRV_PCSX2_GS_RENDERER_AUTO:
+#if defined(__APPLE__)
+            renderer = GSRendererType::Auto;
+#else
+            // AUTO resolves to Vulkan off macOS (bridge ABI contract).
+            renderer = GSRendererType::VK;
+#endif
+            name = "auto";
+            kind = requested_kind;
+            display_name = "PCSX2 Auto";
+            return true;
+        case RRV_PCSX2_GS_RENDERER_METAL:
+#if defined(__APPLE__)
+            renderer = GSRendererType::Metal;
+            name = "metal";
+            kind = requested_kind;
+            display_name = "PCSX2 Metal";
+            return true;
+#else
+            error = "Metal renderer requested through the bridge ABI on a non-macOS host";
+            return false;
+#endif
+        case RRV_PCSX2_GS_RENDERER_VULKAN:
+#if !defined(__APPLE__)
+            renderer = GSRendererType::VK;
+            name = "vulkan";
+            kind = requested_kind;
+            display_name = "PCSX2 Vulkan";
+            return true;
+#else
+            error = "Vulkan renderer requested through the bridge ABI on macOS";
+            return false;
+#endif
+        case RRV_PCSX2_GS_RENDERER_D3D11:
+#if defined(_WIN32)
+            renderer = GSRendererType::DX11;
+            name = "d3d11";
+            kind = requested_kind;
+            display_name = "PCSX2 Direct3D 11";
+            return true;
+#else
+            error = "Direct3D 11 renderer requested through the bridge ABI on a non-Windows host";
+            return false;
+#endif
+        default:
+            error = "invalid renderer kind value " + std::to_string(requested_kind);
+            return false;
+    }
+}
+
+// Gate-4 G4-I4 GS attribution recorder. Off by default; host-only; never
+// read by the guest or by any GS decision. RRV_GATE4_GS_COUNTERS=<path>
+// records, per bridge VSync (one GS field service):
+//   - the steady_clock ns at VSync entry, on the same clock as the G4-I1
+//     start clock, so fields can be mapped to effective-start ordinals;
+//   - GIF packets, bytes and host ns inside GSgifTransfer since the previous
+//     VSync, and host ns inside this GSvsync;
+//   - bridge CSR/SIGLBLID readback calls and the submits after which PCSX2's
+//     CSR or SIGLBLID changed (SIGNAL/FINISH/LABEL results an async GS would
+//     have to wait for), and local-to-host reads (count, bytes, host ns);
+//   - Gate 7: GPU ms of the Metal command buffers (Vulkan: timestamp-query
+//     GPU time, when the device supports timestamps) that completed since the
+//     previous read (GSDevice accumulated GPU time, read and reset just
+//     before and just after this GSvsync, because PCSX2's present path
+//     resets it inside GSvsync). Buffers complete asynchronously, so a
+//     field's value can include earlier fields' work; the sum is complete.
+//     The second value is PCSX2's own per-present GPU average (0.5 s
+//     metrics interval), which the first read now starves;
+//   - PCSX2's own g_perfmon counters accumulated between the previous VSync
+//     return and this VSync entry, and inside this GSvsync when PCSX2 did not
+//     reset them there (it resets every 32 frames; then the value is -1).
+// Rows are kept in a preallocated array and written once at bridge destroy or
+// process exit. This is an attribution instrument: its clock pairs cost time,
+// so runs that enable it are never timing runs.
+//
+// RRV_GATE4_GS_CAPTURE_DIR=<dir> with RRV_GATE4_GS_CAPTURE_FIELDS=<spec>
+// (comma-separated N or A-B or A-B/S, in bridge field indices) writes the
+// merged display output at internal resolution after each selected GSvsync as
+// <dir>/field-<N>-<W>x<H>.rgba (raw RGBA8). This is a synchronous GPU readback
+// for the G4-6 pixel check; capture runs are never timing runs.
+struct Gate4GsObserverV1;
+Gate4GsObserverV1& Gate4GsObserver();
+
+// Sprite coverage (RRV_PCSX2_GS_SPRITE_FILTER, set at bridge init): what the HUD
+// un-stretch needs to know of it.
+struct SpriteCoverageV1
+{
+    bool on = false;
+    // Sprites the HUD un-stretch moved: point-sampled ones whose U it aligned,
+    // and ones whose filter it had not seen (older rule).
+    uint64_t hud_sprites = 0, hud_unknown = 0;
+};
+SpriteCoverageV1& SpriteCoverage()
+{
+    static SpriteCoverageV1 c;
+    return c;
+}
+
+struct Gate4GsFieldV1
+{
+    uint64_t field_index = 0, entry_ns = 0, packets = 0, bytes = 0, gif_ns = 0, vsync_ns = 0;
+    uint64_t readbacks = 0, result_changes = 0, local_reads = 0, local_read_bytes = 0, local_read_ns = 0;
+    uint32_t parity = 0;
+    float gpu_ms = 0.0f, gpu_avg_ms = 0.0f;
+    bool vsync_perf_valid = false;
+    std::array<double, GSPerfMon::CounterLast> perf{};
+    std::array<double, GSPerfMon::CounterLast> vsync_perf{};
+};
+
+struct Gate4GsObserverV1
+{
+    bool enabled = false, written = false;
+    std::string path;
+    std::vector<Gate4GsFieldV1> rows;
+    uint64_t dropped = 0;
+    Gate4GsFieldV1 open_field;
+    std::array<double, GSPerfMon::CounterLast> last_post{};
+    // Capture.
+    std::string capture_dir;
+    std::vector<std::array<uint64_t, 3>> capture_ranges; // first, last, step
+    uint64_t captures = 0, capture_failures = 0;
+
+    static uint64_t Now()
+    {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+    static std::array<double, GSPerfMon::CounterLast> Perf()
+    {
+        std::array<double, GSPerfMon::CounterLast> out{};
+        for (size_t i = 0; i < out.size(); ++i)
+            out[i] = g_perfmon.GetCounter(static_cast<GSPerfMon::counter_t>(i));
+        return out;
+    }
+    bool WantCapture(uint64_t field) const
+    {
+        for (const auto& r : capture_ranges)
+            if (field >= r[0] && field <= r[1] && (field - r[0]) % r[2] == 0u)
+                return true;
+        return false;
+    }
+    void Configure()
+    {
+        written = false;
+        enabled = false;
+        capture_dir.clear();
+        capture_ranges.clear();
+        if (const char* v = std::getenv("RRV_GATE4_GS_COUNTERS"); v && v[0] != '\0')
+        {
+            enabled = true;
+            path = v;
+            rows.clear();
+            rows.reserve(32768u);
+            dropped = 0;
+            open_field = {};
+            last_post = Perf();
+            static const bool at_exit = [] { std::atexit([] { Gate4GsObserver().Write(); }); return true; }();
+            (void)at_exit;
+            std::fprintf(stderr, "[gate4-gs] counters -> %s\n", path.c_str());
+        }
+        const char* dir = std::getenv("RRV_GATE4_GS_CAPTURE_DIR");
+        const char* spec = std::getenv("RRV_GATE4_GS_CAPTURE_FIELDS");
+        if (dir && dir[0] != '\0' && spec && spec[0] != '\0')
+        {
+            capture_dir = dir;
+            capture_ranges.clear();
+            const char* p = spec;
+            while (*p)
+            {
+                char* end = nullptr;
+                const uint64_t first = std::strtoull(p, &end, 10);
+                uint64_t last = first, step = 1;
+                if (end == p) break;
+                p = end;
+                if (*p == '-') { last = std::strtoull(p + 1, &end, 10); p = end; }
+                if (*p == '/') { step = std::strtoull(p + 1, &end, 10); p = end; }
+                if (step == 0u || last < first) break;
+                capture_ranges.push_back({first, last, step});
+                if (*p == ',') ++p; else break;
+            }
+            if (*p != '\0')
+            {
+                std::fprintf(stderr, "[gate4-gs] invalid RRV_GATE4_GS_CAPTURE_FIELDS=%s; capture off\n", spec);
+                capture_ranges.clear();
+            }
+            else
+                std::fprintf(stderr, "[gate4-gs] capture -> %s (%zu ranges)\n",
+                             capture_dir.c_str(), capture_ranges.size());
+        }
+    }
+    void Write()
+    {
+        if (written)
+            return;
+        written = true;
+        if (!capture_dir.empty() && !capture_ranges.empty())
+            std::fprintf(stderr, "[gate4-gs] captures=%llu failures=%llu\n",
+                         static_cast<unsigned long long>(captures),
+                         static_cast<unsigned long long>(capture_failures));
+        if (!enabled)
+            return;
+        FILE* f = std::fopen(path.c_str(), "w");
+        if (!f)
+        {
+            std::fprintf(stderr, "[gate4-gs] cannot open %s\n", path.c_str());
+            return;
+        }
+        std::setvbuf(f, nullptr, _IOFBF, 1 << 20);
+        // perf columns are PCSX2 HW names: Prim Draw DrawCalls Readbacks Swizzle
+        // Unswizzle TextureCopies(Fillrate) TextureUploads(SyncPoint) Barriers
+        // RenderPasses TextureCopiesROV DrawCallsROV BarriersROV.
+        std::fprintf(f, "# gate4-gs v1 columns: field parity entry_ns packets bytes gif_ns vsync_ns "
+                        "readbacks result_changes local_reads local_read_bytes local_read_ns "
+                        "p:Prim,Draw,DrawCalls,Readbacks,Swizzle,Unswizzle,TextureCopies,TextureUploads,"
+                        "Barriers,RenderPasses,TextureCopiesROV,DrawCallsROV,BarriersROV "
+                        "v:<same, inside GSvsync, -1 if PCSX2 reset> g:gpu_ms,pcsx2_avg_gpu_ms\n");
+        for (const Gate4GsFieldV1& r : rows)
+        {
+            std::fprintf(f, "%llu %u %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu p:",
+                static_cast<unsigned long long>(r.field_index), r.parity,
+                static_cast<unsigned long long>(r.entry_ns), static_cast<unsigned long long>(r.packets),
+                static_cast<unsigned long long>(r.bytes), static_cast<unsigned long long>(r.gif_ns),
+                static_cast<unsigned long long>(r.vsync_ns), static_cast<unsigned long long>(r.readbacks),
+                static_cast<unsigned long long>(r.result_changes), static_cast<unsigned long long>(r.local_reads),
+                static_cast<unsigned long long>(r.local_read_bytes),
+                static_cast<unsigned long long>(r.local_read_ns));
+            for (size_t i = 0; i < r.perf.size(); ++i)
+                std::fprintf(f, i ? ",%.0f" : "%.0f", r.perf[i]);
+            std::fprintf(f, " v:");
+            for (size_t i = 0; i < r.vsync_perf.size(); ++i)
+                std::fprintf(f, i ? ",%.0f" : "%.0f", r.vsync_perf_valid ? r.vsync_perf[i] : -1.0);
+            std::fprintf(f, " g:%.4f,%.4f\n", r.gpu_ms, r.gpu_avg_ms);
+        }
+        std::fclose(f);
+        std::fprintf(stderr, "[gate4-gs] fields=%zu dropped=%llu path=%s\n", rows.size(),
+                     static_cast<unsigned long long>(dropped), path.c_str());
+    }
+};
+
+Gate4GsObserverV1& Gate4GsObserver()
+{
+    static Gate4GsObserverV1 observer;
+    return observer;
+}
+
+#if defined(__linux__)
+// Gate 5 Deck attribution: where the thread that runs GSvsync (rrv-gs-owner
+// under split_gs) spends its time. pcsx2-gs-bridge-linux.patch times every
+// point where PCSX2's Vulkan device makes that thread wait for the GPU, and the
+// HW renderer's CPU fallbacks; this prints them every ~2 s as one line, per
+// field (ms/f) and per field count (/f), next to the [cpu] log:
+//   [gs-wait] t=12s fields=120 cpu=6.10ms/f max=9.80 wait=3.20ms/f max=8.10
+//     forced=.. rotation=.. stream=.. other=.. acquire=.. present=..
+//     submits=3.0/f midframe=2.0/f swprim=0.40ms/f(6.0/f)
+//     read:swprim=.. read:local=.. read:other=.. read-px=../f images=2
+//     async-acquire=0 acquire-bg=..
+// cpu is this thread's CPU time (CLOCK_THREAD_CPUTIME_ID); wait is the time it
+// spent blocked on the GPU or the swap chain (fence waits plus acquire); max is
+// the worst field in the interval. With even frame pacing on the acquire after a
+// present runs on a helper thread: acquire is then only what this thread still
+// had to wait for, and acquire-bg is the helper's time in the call. A field's budget is 16.7 ms. Default on with
+// direct presentation; RRV_PCSX2_GS_WAIT_LOG=0 turns it off, =1 also headless.
+// Host observation only: nothing here feeds back into the GS.
+struct GsWaitLog
+{
+    bool configured = false, enabled = false, primed = false;
+    uint64_t start_wall = 0, last_wall = 0, last_cpu = 0, field_cpu = 0, field_wait = 0;
+    uint64_t fields = 0, max_cpu = 0, max_wait = 0;
+    GSRrvWaitStats last{};
+
+    static uint64_t ThreadCpuNs()
+    {
+        timespec ts{};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+        return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
+    }
+    static uint64_t WaitNs(const GSRrvWaitStats& s)
+    {
+        uint64_t total = s.acquire_ns;
+        for (const uint64_t ns : s.wait_ns)
+            total += ns;
+        return total;
+    }
+
+    void Field(bool direct_present)
+    {
+        if (!configured)
+        {
+            configured = true;
+            enabled = EnvFlag("RRV_PCSX2_GS_WAIT_LOG", direct_present);
+        }
+        if (!enabled)
+            return;
+        const uint64_t wall = Gate4GsObserverV1::Now();
+        const uint64_t cpu = ThreadCpuNs();
+        const uint64_t wait = WaitNs(g_rrv_wait_stats);
+        if (!primed)
+        {
+            primed = true;
+            start_wall = last_wall = wall;
+            last_cpu = field_cpu = cpu;
+            field_wait = wait;
+            last = g_rrv_wait_stats;
+            return;
+        }
+        ++fields;
+        max_cpu = std::max(max_cpu, cpu - field_cpu);
+        max_wait = std::max(max_wait, wait - field_wait);
+        field_cpu = cpu;
+        field_wait = wait;
+        if (wall - last_wall < 2000000000ull)
+            return;
+        Print(wall, cpu);
+        last_wall = wall;
+        last_cpu = cpu;
+        last = g_rrv_wait_stats;
+        fields = max_cpu = max_wait = 0;
+    }
+
+    void Print(uint64_t wall, uint64_t cpu) const
+    {
+        const GSRrvWaitStats& now = g_rrv_wait_stats;
+        const double n = static_cast<double>(fields);
+        const auto ms = [n](uint64_t ns) { return static_cast<double>(ns) / 1e6 / n; };
+        const auto per = [n](uint64_t count) { return static_cast<double>(count) / n; };
+        const auto bucket = [&](GSRrvWait w) {
+            const size_t i = static_cast<size_t>(w);
+            return std::make_pair(ms(now.wait_ns[i] - last.wait_ns[i]), per(now.waits[i] - last.waits[i]));
+        };
+        const auto read = [&](GSRrvRead r) {
+            const size_t i = static_cast<size_t>(r);
+            return std::make_pair(ms(now.read_ns[i] - last.read_ns[i]), per(now.reads[i] - last.reads[i]));
+        };
+        const auto forced = bucket(GSRrvWait::Forced), rotation = bucket(GSRrvWait::Rotation),
+                   stream = bucket(GSRrvWait::Stream), other = bucket(GSRrvWait::Other);
+        const auto read_sw = read(GSRrvRead::SwPrim), read_local = read(GSRrvRead::LocalRead),
+                   read_other = read(GSRrvRead::Other);
+        std::fprintf(stderr,
+                     "[gs-wait] t=%llus fields=%llu cpu=%.2fms/f max=%.2f wait=%.2fms/f max=%.2f "
+                     "forced=%.2fms/f(%.1f/f) rotation=%.2fms/f(%.1f/f) stream=%.2fms/f(%.1f/f) other=%.2fms/f(%.1f/f) "
+                     "acquire=%.2fms/f(%.1f/f) present=%.2fms/f submits=%.1f/f midframe=%.1f/f "
+                     "swprim=%.2fms/f(%.1f/f) read:swprim=%.2fms/f(%.1f/f) read:local=%.2fms/f(%.1f/f) "
+                     "read:other=%.2fms/f(%.1f/f) read-px=%.0f/f images=%u async-acquire=%d acquire-bg=%.2fms/f\n",
+                     static_cast<unsigned long long>((wall - start_wall) / 1000000000ull),
+                     static_cast<unsigned long long>(fields), ms(cpu - last_cpu),
+                     static_cast<double>(max_cpu) / 1e6, ms(WaitNs(now) - WaitNs(last)),
+                     static_cast<double>(max_wait) / 1e6, forced.first, forced.second, rotation.first,
+                     rotation.second, stream.first, stream.second, other.first, other.second,
+                     ms(now.acquire_ns - last.acquire_ns), per(now.acquires - last.acquires),
+                     ms(now.present_ns - last.present_ns), per(now.submits - last.submits),
+                     per(now.midframe_submits - last.midframe_submits), ms(now.sw_prim_ns - last.sw_prim_ns),
+                     per(now.sw_prims - last.sw_prims), read_sw.first, read_sw.second, read_local.first,
+                     read_local.second, read_other.first, read_other.second,
+                     per(now.read_pixels - last.read_pixels), now.swapchain_images, now.async_acquire ? 1 : 0,
+                     ms(now.acquire_bg_ns - last.acquire_bg_ns));
+    }
+};
+
+GsWaitLog& GsWaitLogger()
+{
+    static GsWaitLog log;
+    return log;
+}
+#endif
+
+} // namespace
+
+struct RrvPcsx2GsBridge {
+    alignas(16) std::array<uint8_t, kPrivRegsBytes> pcsx2_regs{};
+    std::vector<uint32_t> pixels;
+    uint32_t snapshot_width = 0;
+    uint32_t snapshot_height = 0;
+    uint64_t field_index = 0;
+    uint64_t sequence = 0;
+    uint64_t vsync_from_field = 0; // RRV_GATE3_FAST_FORWARD: display sync switched on here
+    GSVSyncMode display_sync = GSVSyncMode::FIFO; // the mode display sync uses (DisplaySyncMode)
+    RrvPcsx2GsBridgeStats stats{sizeof(RrvPcsx2GsBridgeStats), 0u, 0u, 0u,
+                                 0u, 0u, 0u, 0u, 0u};
+    bool display_enabled = false;
+    bool has_successful_frame = false;
+    bool gpu_snapshot_fallback = false;
+    bool direct_present = false;
+    bool owner_thread_surface = false;
+    bool gpu_renderer = false;
+    bool capture_in_progress = false;
+    bool fp_isolated = false;
+    bool full_frame = false;
+    bool dof_log = false;                  // RRV_PCSX2_GS_FULL_DOF_LOG=1
+    uint64_t dof_seen[2]{};                // native-size blur draws counted so far (forward, return)
+    bool fpcr_path_logged[4]{};
+    bool open = false;
+#if defined(RRV_PCSX2_GS_CANONICAL_RECEIPTS)
+    rrv::pcsx2::receipt::Collector canonical_receipt;
+    // This sideband is intentionally separate from Collector and receipt
+    // schema 1. It proves where the live selector-edge arm occurred without
+    // making that diagnostic state part of a field workload digest.
+    bool receipt_arm_after_vsync_pending = false;
+    uint64_t consumer_ack_ordinal = 0u;
+    RrvPcsx2GsBridgeReceiptBoundaryOrdering receipt_boundary_ordering{
+        sizeof(RrvPcsx2GsBridgeReceiptBoundaryOrdering), 0u, 0u, 0u,
+        0u, 0u, 0u, 0u, 0u};
+#endif
+};
+
+#if defined(RRV_PCSX2_GS_CANONICAL_RECEIPTS)
+void NoteConsumerAcknowledgement(RrvPcsx2GsBridge* bridge, uint32_t event_type,
+                                 bool transfer)
+{
+    ++bridge->consumer_ack_ordinal;
+    RrvPcsx2GsBridgeReceiptBoundaryOrdering& ordering =
+        bridge->receipt_boundary_ordering;
+    if (ordering.armed_after_successful_vsync == 0u)
+    {
+        return;
+    }
+    if (ordering.first_post_arm_consumer_ack_ordinal == 0u)
+    {
+        ordering.first_post_arm_consumer_ack_ordinal = bridge->consumer_ack_ordinal;
+        ordering.first_post_arm_consumer_event_type = event_type;
+    }
+    if (transfer && ordering.first_post_arm_transfer_ack_ordinal == 0u)
+        ordering.first_post_arm_transfer_ack_ordinal = bridge->consumer_ack_ordinal;
+}
+#endif
+
+extern "C" uint32_t rrv_pcsx2_gs_bridge_version(void)
+{
+    return RRV_PCSX2_GS_BRIDGE_ABI_VERSION;
+}
+
+extern "C" void rrv_pcsx2_gs_bridge_owner_thread_init(void)
+{
+    // Match MTGS::ThreadEntryPoint at fd9d310c: the GS thread does not inherit
+    // the producer's EE/VU rounding and denormal policy.
+    FPControlRegister::SetCurrent(FPControlRegister::GetDefault());
+}
+
+extern "C" RrvPcsx2GsBridge* rrv_pcsx2_gs_bridge_create(
+    const RrvPcsx2GsBridgeConfig* config,
+    RrvPcsx2GsBridgeCapabilities* capabilities,
+    char* error, uint32_t error_capacity)
+{
+    static_assert(offsetof(RrvPcsx2GsBridgeConfig, presentation_mode) == 20u,
+                  "bridge config ABI v5 presentation offset changed");
+    static_assert(offsetof(RrvPcsx2GsBridgeConfig, renderer_kind) == 24u,
+                  "bridge config ABI v5 renderer offset changed");
+    static_assert(alignof(RrvPcsx2GsBridgeSurface) == alignof(void*),
+                  "bridge surface ABI v5 alignment changed");
+    static_assert(alignof(RrvPcsx2GsBridgeConfig) == alignof(void*),
+                  "bridge config ABI v5 alignment changed");
+    static_assert(offsetof(RrvPcsx2GsBridgeSurface, native_view) % alignof(void*) == 0u,
+                  "bridge surface native-handle alignment changed");
+    static_assert(offsetof(RrvPcsx2GsBridgeCapabilities, renderer_name) % alignof(void*) == 0u,
+                  "bridge capabilities renderer-name alignment changed");
+    if (!capabilities || capabilities->struct_size < sizeof(RrvPcsx2GsBridgeCapabilities))
+    {
+        SetError(error, error_capacity, "bridge capabilities output is too small");
+        return nullptr;
+    }
+    if (config && config->struct_size < sizeof(RrvPcsx2GsBridgeConfig))
+    {
+        SetError(error, error_capacity, "bridge config is too small (%u, expected %zu)",
+            config->struct_size, sizeof(RrvPcsx2GsBridgeConfig));
+        return nullptr;
+    }
+
+    GSRendererType renderer = GSRendererType::SW;
+    const char* renderer_name = nullptr;
+    uint32_t renderer_kind = RRV_PCSX2_GS_RENDERER_UNKNOWN;
+    const char* renderer_display_name = "PCSX2";
+    std::string startup_error;
+    const uint32_t requested_renderer = config ? config->renderer_kind :
+        RRV_PCSX2_GS_RENDERER_UNKNOWN;
+    if (!ResolveRenderer(requested_renderer, renderer, renderer_name, renderer_kind,
+                         renderer_display_name, startup_error))
+    {
+        SetError(error, error_capacity, "%s", startup_error.c_str());
+        return nullptr;
+    }
+
+    // Gate 6: full-frame mode is a hardware-renderer mode (the texture cache
+    // keeps render targets as scaled host textures). The software renderer
+    // rasterizes into native GS memory only, so it offers field mode alone.
+    capabilities->supported_render_modes = RRV_PCSX2_GS_RENDER_MODE_CAP_FIELD |
+        (renderer != GSRendererType::SW ? RRV_PCSX2_GS_RENDER_MODE_CAP_FULL_FRAME : 0u);
+    capabilities->renderer_kind = renderer_kind;
+    capabilities->capability_flags = RRV_PCSX2_GS_CAP_ON_DEMAND_CAPTURE |
+        RRV_PCSX2_GS_CAP_LEGACY_CPU_SNAPSHOT;
+    capabilities->renderer_name = renderer_display_name;
+
+    const uint32_t presentation_mode = config ? config->presentation_mode :
+        RRV_PCSX2_GS_PRESENTATION_LEGACY_CPU_SNAPSHOT;
+    if (presentation_mode > RRV_PCSX2_GS_PRESENTATION_DIRECT_GPU)
+    {
+        SetError(error, error_capacity, "invalid presentation mode value %u", presentation_mode);
+        return nullptr;
+    }
+    const bool direct_requested = presentation_mode == RRV_PCSX2_GS_PRESENTATION_DIRECT_GPU;
+#if defined(__APPLE__)
+    if (direct_requested && (!config ||
+        config->surface.struct_size < sizeof(RrvPcsx2GsBridgeSurface) ||
+        config->surface.kind != RRV_PCSX2_GS_SURFACE_MACOS_VIEW_METAL_LAYER ||
+        (config->surface.flags & (RRV_PCSX2_GS_SURFACE_FLAG_CALLER_OWNS_HANDLES |
+                                  RRV_PCSX2_GS_SURFACE_FLAG_MAIN_THREAD_PREPARED)) !=
+            (RRV_PCSX2_GS_SURFACE_FLAG_CALLER_OWNS_HANDLES |
+             RRV_PCSX2_GS_SURFACE_FLAG_MAIN_THREAD_PREPARED) ||
+        !config->surface.native_view || !config->surface.native_layer ||
+        config->surface.width_pixels == 0u || config->surface.height_pixels == 0u ||
+        config->surface.backing_scale <= 0.0f))
+    {
+        SetError(error, error_capacity,
+                 "direct presentation requires a main-thread-prepared macOS view/layer "
+                 "surface retained by the caller for the bridge lifetime");
+        return nullptr;
+    }
+#elif defined(_WIN32)
+    // Windows: an SDL Win32 surface (HWND, HINSTANCE) that the caller retains for the bridge lifetime. PCSX2's Vulkan
+    // device creates its own VkSurfaceKHR/swap chain on the HWND from whichever thread creates the device.
+    if (direct_requested && (!config ||
+        config->surface.struct_size < sizeof(RrvPcsx2GsBridgeSurface) ||
+        config->surface.kind != RRV_PCSX2_GS_SURFACE_WIN32 ||
+        (config->surface.flags & RRV_PCSX2_GS_SURFACE_FLAG_CALLER_OWNS_HANDLES) == 0u ||
+        !config->surface.native_view || !config->surface.native_layer ||
+        config->surface.width_pixels == 0u || config->surface.height_pixels == 0u ||
+        config->surface.backing_scale <= 0.0f))
+    {
+        SetError(error, error_capacity,
+                 "direct presentation requires a Win32 surface (HWND, HINSTANCE) retained by the "
+                 "caller for the bridge lifetime");
+        return nullptr;
+    }
+#elif defined(__ANDROID__)
+    // Android: an ANativeWindow (native_view; native_layer NULL) that the caller retains
+    // for the bridge lifetime; the bridge takes a reference of its own as well. PCSX2's
+    // Vulkan device creates its VkSurfaceKHR (vkCreateAndroidSurfaceKHR) and swap chain
+    // on it from the thread that creates the device; no main-thread rule.
+    if (direct_requested && (!config ||
+        config->surface.struct_size < sizeof(RrvPcsx2GsBridgeSurface) ||
+        config->surface.kind != RRV_PCSX2_GS_SURFACE_ANDROID ||
+        (config->surface.flags & RRV_PCSX2_GS_SURFACE_FLAG_CALLER_OWNS_HANDLES) == 0u ||
+        !config->surface.native_view ||
+        config->surface.width_pixels == 0u || config->surface.height_pixels == 0u ||
+        config->surface.backing_scale <= 0.0f))
+    {
+        SetError(error, error_capacity,
+                 "direct presentation requires an Android ANativeWindow surface retained by the "
+                 "caller for the bridge lifetime");
+        return nullptr;
+    }
+#else
+    // Linux (Gate 5): an SDL X11 (Display*, Window) or Wayland (wl_display*,
+    // wl_surface*) surface that the caller retains for the bridge lifetime.
+    // PCSX2's Vulkan device creates its own VkSurfaceKHR/swap chain on it and
+    // never marshals to a platform main thread, so MAIN_THREAD_PREPARED is
+    // accepted but not required here.
+    if (direct_requested && (!config ||
+        config->surface.struct_size < sizeof(RrvPcsx2GsBridgeSurface) ||
+        (config->surface.kind != RRV_PCSX2_GS_SURFACE_LINUX_X11 &&
+         config->surface.kind != RRV_PCSX2_GS_SURFACE_LINUX_WAYLAND) ||
+        (config->surface.flags & RRV_PCSX2_GS_SURFACE_FLAG_CALLER_OWNS_HANDLES) == 0u ||
+        !config->surface.native_view || !config->surface.native_layer ||
+        config->surface.width_pixels == 0u || config->surface.height_pixels == 0u ||
+        config->surface.backing_scale <= 0.0f))
+    {
+        SetError(error, error_capacity,
+                 "direct presentation requires an X11 or Wayland surface retained by the "
+                 "caller for the bridge lifetime");
+        return nullptr;
+    }
+#endif
+
+    const uint32_t requested_mode = config ? config->gs_render_mode :
+        RRV_PCSX2_GS_RENDER_MODE_FIELD;
+    if (requested_mode > RRV_PCSX2_GS_RENDER_MODE_FULL_FRAME)
+    {
+        SetError(error, error_capacity, "invalid GS render mode value %u", requested_mode);
+        return nullptr;
+    }
+    const uint32_t requested_mode_bit = 1u << requested_mode;
+    if ((capabilities->supported_render_modes & requested_mode_bit) == 0u)
+    {
+        const char* mode_name = requested_mode == RRV_PCSX2_GS_RENDER_MODE_FULL_FRAME ? "full" : "field";
+        SetError(error, error_capacity,
+                 "RRV_GS_RENDER_MODE=%s is not implemented by %s backend",
+                 mode_name, renderer_display_name);
+        return nullptr;
+    }
+
+    if (!InitializePcsx2BaseSettings(startup_error))
+    {
+        SetError(error, error_capacity, "%s", startup_error.c_str());
+        return nullptr;
+    }
+
+    if (!AcquireHostMemory(startup_error))
+    {
+        SetError(error, error_capacity, "%s", startup_error.c_str());
+        return nullptr;
+    }
+    HostMemoryReleaseGuard host_memory_guard;
+
+    auto bridge = std::make_unique<RrvPcsx2GsBridge>();
+    if (const char* value = std::getenv("RRV_PCSX2_GS_FP_ISOLATED"); value && value[0] != '\0')
+    {
+        bridge->fp_isolated = std::strcmp(value, "1") == 0;
+        if (!bridge->fp_isolated)
+            std::fprintf(stderr, "[pcsx2-gs-bridge:fpcr] ignoring invalid RRV_PCSX2_GS_FP_ISOLATED=%s (expected 1)\n", value);
+    }
+    std::fprintf(stderr, "[pcsx2-gs-bridge:fpcr] isolated=%u default=0x%llx\n",
+                 bridge->fp_isolated ? 1u : 0u,
+                 static_cast<unsigned long long>(FPControlRegister::GetDefault().bitmask));
+#if defined(RRV_PCSX2_GS_CANONICAL_RECEIPTS)
+    if (!bridge->canonical_receipt.initializeFromEnvironment(&startup_error))
+    {
+        SetError(error, error_capacity, "canonical consumer receipt initialization failed: %s",
+                 startup_error.c_str());
+        return nullptr;
+    }
+#endif
+    if (config)
+    {
+        bridge->snapshot_width = config->snapshot_width;
+        bridge->snapshot_height = config->snapshot_height;
+    }
+
+    std::fprintf(stderr, "[pcsx2-gs-bridge] renderer=%s (%s)\n", renderer_name,
+                 Pcsx2Config::GSOptions::GetRendererName(renderer));
+
+    Pcsx2Config::GSOptions options{};
+    options.Renderer = renderer;
+    options.UpscaleMultiplier = 1.0f;
+    options.VsyncEnable = false;
+    options.AutoFlushSW = true;
+    ApplyRrvMetalHardwareProfile(renderer, options);
+    const bool full_frame = requested_mode == RRV_PCSX2_GS_RENDER_MODE_FULL_FRAME;
+    if (full_frame)
+    {
+        // Gate 6 full-frame mode (docs/evidence/GATE6_FULL_FRAME_PLAN_2026-09-26.md).
+        // RR5 draws each field's complete display list into a 640x224 target.
+        // A 2x hardware scale makes PCSX2 rasterize those draws at 448 rows
+        // (1280x448 host targets): real full-height geometry, with PCSX2's
+        // texture cache keeping feedback, aliases, uploads and readbacks in
+        // native GS addresses. The field half-line (odd fields draw with
+        // XYOFFSET.OFY 0x7908, even with 0x7900) becomes exactly one host row
+        // at 2x and is removed by GSRrvSetFieldOfyCanonical below, so both
+        // parities land on one 448-row grid. No deinterlacer runs: each
+        // field's target already is the progressive frame.
+        options.UpscaleMultiplier = 2.0f;
+        options.InterlaceMode = GSInterlaceMode::Off;
+        // RRV_PCSX2_GS_FULL_SCALE=1..8: internal scale (default 2). The
+        // parity-dependent OFY is canonicalised away (below), so odd scales
+        // keep both parities on one grid too; 1 has no extra progressive rows.
+        // RRV_PCSX2_GS_FULL_HWMIPMAP=0|1: PCSX2's GS mipmap emulation (PCSX2
+        // default on). Launcher option `mipmap` (owner decision 2026-09-29);
+        // 0 departs from hardware (the guest's MIPMAP/TEX1 levels are ignored).
+        if (const char* value = std::getenv("RRV_PCSX2_GS_FULL_SCALE"); value && value[0] != '\0')
+        {
+            // 1..12 (Quest aniso, 2026-10-30: the Y scale goes above 8 when X is set separately).
+            char* end = nullptr;
+            const long scale = std::strtol(value, &end, 10);
+            if (end == value || *end != '\0' || scale < 1 || scale > 12)
+            {
+                SetError(error, error_capacity, "invalid RRV_PCSX2_GS_FULL_SCALE=%s (expected 1..12)", value);
+                return nullptr;
+            }
+            options.UpscaleMultiplier = static_cast<float>(scale);
+            std::fprintf(stderr, "[pcsx2-gs-bridge] render mode=full: UpscaleMultiplier=%s%s\n", value,
+                         scale == 1 ? " [diagnostic override]" : "");
+        }
+        // RRV_PCSX2_GS_SCALE_X=<float 1..12> (Quest aniso): the X scale on its own; the scale above is
+        // then the Y one. Unset: both axes use the scale above (unchanged behaviour). Set before the
+        // GS opens: every target is created at it.
+        GSRrvSetScaleX(0.0f);
+        if (const char* value = std::getenv("RRV_PCSX2_GS_SCALE_X"); value && value[0] != '\0')
+        {
+            char* end = nullptr;
+            const float sx = std::strtof(value, &end);
+            if (end == value || *end != '\0' || !(sx >= 1.0f && sx <= 12.0f))
+            {
+                SetError(error, error_capacity, "invalid RRV_PCSX2_GS_SCALE_X=%s (expected 1..12)", value);
+                return nullptr;
+            }
+            GSRrvSetScaleX(sx);
+            std::fprintf(stderr, "[pcsx2-gs-bridge] render mode=full: anisotropic scale x %g y %g\n",
+                         static_cast<double>(sx), static_cast<double>(options.UpscaleMultiplier));
+        }
+        if (const char* value = std::getenv("RRV_PCSX2_GS_FULL_HWMIPMAP"); value && value[0] != '\0')
+        {
+            if ((value[0] != '0' && value[0] != '1') || value[1] != '\0')
+            {
+                SetError(error, error_capacity, "invalid RRV_PCSX2_GS_FULL_HWMIPMAP=%s (expected 0 or 1)", value);
+                return nullptr;
+            }
+            options.HWMipmap = value[0] == '1';
+            std::fprintf(stderr, "[pcsx2-gs-bridge] render mode=full: HWMipmap=%s [override]\n", value);
+        }
+        // PCSX2's AA1 emulation (edge coverage for primitives the game draws
+        // with PRIM.AA1) is on in full mode (owner decision 2026-09-26). RR5
+        // sets AA1 only on untextured blended lines/strips (census 2026-09-26);
+        // visibly the race rev-counter needle. RRV_PCSX2_GS_FULL_HWAA1=0 turns
+        // it off.
+        // RRV_PCSX2_GS_BLEND=0..5: PCSX2's blending accuracy (Minimum..Maximum, default Basic).
+        // Quest: framebuffer-fetch blending is expensive on a tiled GPU at high scales.
+        if (const char* value = std::getenv("RRV_PCSX2_GS_BLEND"); value && value[0] >= '0' && value[0] <= '5' && value[1] == '\0')
+        {
+            options.AccurateBlendingUnit = static_cast<AccBlendLevel>(value[0] - '0');
+            std::fprintf(stderr, "[pcsx2-gs-bridge] render mode=full: AccurateBlendingUnit=%s\n", value);
+        }
+        // RRV_PCSX2_GS_TEXBARRIER=0|1: PCSX2's OverrideTextureBarriers. The ARMSX2 driver table
+        // makes every Qualcomm driver copy the render target for each draw that reads it back
+        // (and set up destination alpha in a pass of its own); 1 uses the in-pass read instead.
+#if defined(__ANDROID__)
+        // Quest 3 (Adreno 740, Meta's Qualcomm driver): the in-pass read renders RR5 identically
+        // (A/B screenshots start pack and tunnel, 2026-10-29) and lifts the start pack at scale 6
+        // from 24-27 to 34-35 fps; the copy path's ~250 render-pass breaks a field go away.
+        options.OverrideTextureBarriers = 1;
+#endif
+        if (const char* value = std::getenv("RRV_PCSX2_GS_TEXBARRIER"); value && (value[0] == '0' || value[0] == '1') && value[1] == '\0')
+        {
+            options.OverrideTextureBarriers = static_cast<s8>(value[0] - '0');
+            std::fprintf(stderr, "[pcsx2-gs-bridge] render mode=full: OverrideTextureBarriers=%s\n", value);
+        }
+        options.HWAA1 = true;
+        if (const char* value = std::getenv("RRV_PCSX2_GS_FULL_HWAA1"); value && value[0] != '\0')
+        {
+            if ((value[0] != '0' && value[0] != '1') || value[1] != '\0')
+            {
+                SetError(error, error_capacity, "invalid RRV_PCSX2_GS_FULL_HWAA1=%s (expected 0 or 1)", value);
+                return nullptr;
+            }
+            options.HWAA1 = value[0] == '1';
+            std::fprintf(stderr, "[pcsx2-gs-bridge] render mode=full: HWAA1=%s [override]\n", value);
+        }
+        if (const char* interlace = std::getenv("RRV_PCSX2_GS_INTERLACE");
+            interlace && interlace[0] != '\0')
+        {
+            SetError(error, error_capacity,
+                     "RRV_PCSX2_GS_INTERLACE is a field-mode option; full-frame mode never deinterlaces");
+            return nullptr;
+        }
+        // RR5-specific rule (Gate 6, G6-1 census): 0x7908 is the only
+        // parity-dependent OFY; every other half-pixel OFY (the FBP 210
+        // downsample pass at OFY 8) is constant across fields and is kept.
+        // RRV_GS_FULL_OFY_CANONICAL=0 turns the rule off for the Gate-6
+        // G6-2 A/B only (it re-introduces the one-row parity bob).
+        bool ofy_canonical = true;
+        if (const char* value = std::getenv("RRV_GS_FULL_OFY_CANONICAL"); value && value[0] != '\0')
+        {
+            if ((value[0] != '0' && value[0] != '1') || value[1] != '\0')
+            {
+                SetError(error, error_capacity, "invalid RRV_GS_FULL_OFY_CANONICAL=%s (expected 0 or 1)", value);
+                return nullptr;
+            }
+            ofy_canonical = value[0] == '1';
+        }
+        GSRrvSetFieldOfyCanonical(ofy_canonical ? 0x7908u : 0u, ofy_canonical ? 0x7900u : 0u);
+        if (!ofy_canonical)
+            std::fprintf(stderr, "[pcsx2-gs-bridge] render mode=full: field OFY canonicalization OFF [A/B override]\n");
+        // PCSX2's own GameDB entry for SLUS-20002 carries two upscaling fixes
+        // that only act above 1x ("halfPixelOffset: 2 # Fixes title screen and
+        // some intro post-processing alignment", "roundSprite: 1 # Fixes ui
+        // and hud alignment"). The bridge does not run PCSX2's GameDB loader,
+        // so full mode applies them the way RR5's Metal profile applies the
+        // other GameDB entries. RRV_PCSX2_GS_FULL_HPO=<0..5> and
+        // RRV_PCSX2_GS_FULL_ROUND_SPRITE=<0..2> override them for the Gate-6
+        // stock-setting matrix only.
+        options.UserHacks_HalfPixelOffset = GSHalfPixelOffset::Special;
+        options.UserHacks_RoundSprite = 1;
+        bool fixes_overridden = false;
+        // Gate-6 owner review (2026-09-26): with RoundSprite rounding both
+        // axes, HUD/menu glyphs lose alternate rows. RR5 fonts are full-height
+        // textures drawn into half-height field sprites, each field sampling
+        // alternate texel rows; rounding V to the native field texel grid keeps
+        // only one field's rows in every progressive frame. So vertically
+        // minified sprites (the fonts) round V on the progressive grid (twice
+        // the field rows; skipping it bled one texel row at 4x); U is always rounded (a
+        // stray column follows glyph strings without it) and 1:1 sprites keep
+        // V rounding (without it the post-process page strips show seam rows).
+        // RRV_GS_FULL_ROUND_SPRITE_U_ONLY=0 restores stock both-axis rounding (A/B).
+        bool round_sprite_u_only = true;
+        if (const char* value = std::getenv("RRV_GS_FULL_ROUND_SPRITE_U_ONLY"); value && value[0] != '\0')
+        {
+            if ((value[0] != '0' && value[0] != '1') || value[1] != '\0')
+            {
+                SetError(error, error_capacity, "invalid RRV_GS_FULL_ROUND_SPRITE_U_ONLY=%s (expected 0 or 1)", value);
+                return nullptr;
+            }
+            round_sprite_u_only = value[0] == '1';
+            fixes_overridden = true;
+        }
+        GSRrvSetRoundSpriteUOnly(round_sprite_u_only);
+        // Sprite coverage (owner request 2026-10-12; PCSX2 patch
+        // 0013-sprite-coverage.patch, docs/TESTING.md T-SPRITE-COVERAGE). RR5
+        // draws its 2D (HUD, menus, text, logos) as FST sprites and two-triangle
+        // rectangles with TEX1 NEAREST, so a host pixel takes one texel and a
+        // texel is only as wide as the others when it covers a whole number of
+        // host pixels. Fonts are full-height textures drawn into half-height
+        // field sprites: 2 / N host rows per texel at scale N (measured
+        // 2026-10-12 on race field 4000, "LAP RECORD": every other glyph row
+        // missing at 1, strokes of 1 and 2 rows at 3), and the 4:3 HUD on a wide
+        // picture gives 0.75 N columns per texel, with sprite edges at fractions
+        // of a pixel (stray columns of the next glyph, see HudScaleApply). With
+        // `even` (the default) such a draw, when it reads guest memory, has its
+        // edges put on host pixels and each host pixel takes the texels under
+        // its own area by share: the stock picture where a texel boundary is a
+        // host pixel boundary (menus at 4:3 and scale 2 or 4: byte-identical),
+        // the exact mix elsewhere, at every scale. Draws that read a render
+        // target (the composite passes), linear draws and 3D keep the stock
+        // path. Presentation only: the guest's GS memory and timing are
+        // unchanged. RRV_PCSX2_GS_SPRITE_FILTER=ps2 restores the stock sampling
+        // (setting `sprite_filter`; use it to compare 2D pixels with a runtime
+        // older than this).
+        bool sprite_coverage = true;
+        if (const char* value = std::getenv("RRV_PCSX2_GS_SPRITE_FILTER"); value && value[0] != '\0')
+        {
+            if (std::strcmp(value, "even") != 0 && std::strcmp(value, "ps2") != 0)
+            {
+                SetError(error, error_capacity, "invalid RRV_PCSX2_GS_SPRITE_FILTER=%s (expected even or ps2)", value);
+                return nullptr;
+            }
+            sprite_coverage = std::strcmp(value, "even") == 0;
+        }
+        GSRrvSetSpriteCoverage(sprite_coverage);
+        SpriteCoverageV1& coverage = SpriteCoverage();
+        coverage.on = sprite_coverage;
+        std::fprintf(stderr, "[pcsx2-gs-bridge] render mode=full: sprite filter %s\n",
+                     sprite_coverage ? "even (texel coverage on point-sampled sprites)" : "ps2 [RRV_PCSX2_GS_SPRITE_FILTER]");
+        // RR5 depth-of-field blur at an internal scale above 1 (fukami#2,
+        // 2026-10-11; PCSX2 patch 0012-native-size-depth-of-field-blur.patch,
+        // docs/TESTING.md T-DOF-SCALE). The guest's DoF (FUN_00240cb0 ->
+        // FUN_00240a48, called from func_233240 via FUN_00240ca0; also
+        // FUN_002429d0 and FUN_002aaa60) blurs by framebuffer feedback through
+        // FBP 210 (block 0x1a40): 1 to 5 round trips per field (5 on the
+        // memory-card save screen via FUN_002aaa60, script-driven counts via
+        // FUN_002429d0), each 280 sprites of 32x16
+        // (FST, TEX1 linear, CLAMP, CT32, FBW 10). Forward: FRAME = 0x1a40 (FBMSK
+        // 0xff000000), TEX0 = the frame, DECAL, no blend, UV = XY + 1.0 texel (U0 =
+        // 16 in 1/16 units): a half-texel 2x2 average. Return: FRAME = the frame,
+        // TEX0 = 0x1a40, UV = XY + 0, ABE with A=Cs B=Cd C=Ad D=Cd (weights from a
+        // depth-built destination-alpha mask). Net per round trip a [1 2 1] / 4
+        // kernel in native pixels. At scale N both targets are N times larger and
+        // each resample is a 2-tap bilinear of host texels, so the blur is 1/N as
+        // wide on screen (measured on attract field 1140: background detail 1.44x
+        // and 1.67x of the 1x frame at 2x and 4x). No stock setting fixes it
+        // (NativeScaling 1/2/4 and BilinearHack are byte-identical; HPO 0/1 smear
+        // and halo, HPO 4 is sharper). The patch draws BOTH passes from a
+        // box-downsampled native-size copy of their source (PCSX2's
+        // m_downscale_source path; the forward from the frame, the return from the
+        // scratch target) and aligns each to half a native pixel: scratch =
+        // bilinear(S, c + 0.5) forward, frame = bilinear(T, c - 0.5) back, c a
+        // host pixel centre in native pixels. (a0408bf copied only the forward;
+        // the return then sampled the N-times scratch at a host texel centre and
+        // a round trip was not the native kernel, measured 2026-10-11.) It fires
+        // in the attract, on the "SELECT SAVE FILE / Now saving" screen and in the
+        // pre-race fly-by (the log's field number is one less than the capture
+        // field number).
+        // Presentation only: the guest's GS memory and timing are unchanged.
+        // Off at scale 1 (byte-identical there). RRV_PCSX2_GS_FULL_DOF_NATIVE=0
+        // turns it off (A/B); RRV_PCSX2_GS_FULL_DOF_LOG=1 logs, once per field in
+        // which a draw matched, the field number and the forward and return draw
+        // counts (to list the scenes it touches). Developer variables: neither is
+        // a user setting.
+        bool dof_native = true;
+        if (const char* value = std::getenv("RRV_PCSX2_GS_FULL_DOF_NATIVE"); value && value[0] != '\0')
+        {
+            if ((value[0] != '0' && value[0] != '1') || value[1] != '\0')
+            {
+                SetError(error, error_capacity, "invalid RRV_PCSX2_GS_FULL_DOF_NATIVE=%s (expected 0 or 1)", value);
+                return nullptr;
+            }
+            dof_native = value[0] == '1';
+        }
+        if (const char* value = std::getenv("RRV_PCSX2_GS_FULL_DOF_LOG"); value && value[0] != '\0')
+        {
+            if ((value[0] != '0' && value[0] != '1') || value[1] != '\0')
+            {
+                SetError(error, error_capacity, "invalid RRV_PCSX2_GS_FULL_DOF_LOG=%s (expected 0 or 1)", value);
+                return nullptr;
+            }
+            bridge->dof_log = value[0] == '1';
+        }
+        const bool dof_active = dof_native && options.UpscaleMultiplier > 1.0f;
+        GSRrvSetNativeBlurCopy(dof_active ? 0x1a40u : 0u);
+        std::fprintf(stderr, "[pcsx2-gs-bridge] render mode=full: DoF native-size blur %s%s\n",
+                     dof_active ? "ON (scratch block 0x1a40)" : "off",
+                     dof_native ? (dof_active ? "" : " (scale 1)") : " [RRV_PCSX2_GS_FULL_DOF_NATIVE=0]");
+        // Gate-6 owner review round 2: far rival cars turned red-brown at 2x.
+        // Measured (race field 4559 draw dumps, 1x vs 2x): 197 of 201 red
+        // pixels come from car env-map triangles with degenerate Q whose ST
+        // the large-ST rewrite replaced; those triangles add nothing (black
+        // texel) at 1x but sample red at 2x. Full mode therefore drops the
+        // triangles it had to rewrite (mode 2). Race captures move closer to
+        // field mode in every changed field. RRV_PCSX2_GS_FULL_LARGE_ST=0 (no
+        // rewrite) / 1 (rewrite only) / 2 (default) for A/B.
+        unsigned large_st = options.UserHacks_RewriteLargeST ? 2u : 0u;
+        if (const char* value = std::getenv("RRV_PCSX2_GS_FULL_LARGE_ST"); value && value[0] != '\0')
+        {
+            if ((value[0] < '0' || value[0] > '2') || value[1] != '\0')
+            {
+                SetError(error, error_capacity, "invalid RRV_PCSX2_GS_FULL_LARGE_ST=%s (expected 0..2)", value);
+                return nullptr;
+            }
+            large_st = static_cast<unsigned>(value[0] - '0');
+            fixes_overridden = true;
+        }
+        options.UserHacks_RewriteLargeST = large_st != 0u;
+        GSRrvSetDropLargeSTTriangles(large_st == 2u);
+        std::fprintf(stderr, "[pcsx2-gs-bridge] render mode=full: large-ST mode=%u\n", large_st);
+        if (const char* value = std::getenv("RRV_PCSX2_GS_FULL_HPO"); value && value[0] != '\0')
+        {
+            char* end = nullptr;
+            const unsigned long parsed = std::strtoul(value, &end, 10);
+            if (end == value || *end != '\0' ||
+                parsed >= static_cast<unsigned long>(GSHalfPixelOffset::MaxCount))
+            {
+                SetError(error, error_capacity, "invalid RRV_PCSX2_GS_FULL_HPO=%s (expected 0..%u)", value,
+                         static_cast<unsigned>(GSHalfPixelOffset::MaxCount) - 1u);
+                return nullptr;
+            }
+            options.UserHacks_HalfPixelOffset = static_cast<GSHalfPixelOffset>(parsed);
+            fixes_overridden = true;
+        }
+        if (const char* value = std::getenv("RRV_PCSX2_GS_FULL_ROUND_SPRITE"); value && value[0] != '\0')
+        {
+            if ((value[0] < '0' || value[0] > '2') || value[1] != '\0')
+            {
+                SetError(error, error_capacity, "invalid RRV_PCSX2_GS_FULL_ROUND_SPRITE=%s (expected 0..2)", value);
+                return nullptr;
+            }
+            options.UserHacks_RoundSprite = static_cast<s8>(value[0] - '0');
+            fixes_overridden = true;
+        }
+        // Further stock PCSX2 upscaling fixes, default off (PCSX2 defaults),
+        // selectable for the Gate-6 matrix only.
+        auto small_override = [&](const char* name, unsigned max_value, unsigned& out) -> bool {
+            const char* value = std::getenv(name);
+            if (!value || value[0] == '\0')
+                return true;
+            char* end = nullptr;
+            const unsigned long parsed = std::strtoul(value, &end, 10);
+            if (end == value || *end != '\0' || parsed > max_value)
+            {
+                SetError(error, error_capacity, "invalid %s=%s (expected 0..%u)", name, value, max_value);
+                return false;
+            }
+            out = static_cast<unsigned>(parsed);
+            fixes_overridden = true;
+            return true;
+        };
+        unsigned native_scaling = static_cast<unsigned>(options.UserHacks_NativeScaling);
+        unsigned align_sprite = options.UserHacks_AlignSpriteX ? 1u : 0u;
+        unsigned merge_sprite = options.UserHacks_MergePPSprite ? 1u : 0u;
+        unsigned bilinear = static_cast<unsigned>(options.UserHacks_BilinearHack);
+        if (!small_override("RRV_PCSX2_GS_FULL_NATIVE_SCALING",
+                            static_cast<unsigned>(GSNativeScaling::MaxCount) - 1u, native_scaling) ||
+            !small_override("RRV_PCSX2_GS_FULL_ALIGN_SPRITE", 1u, align_sprite) ||
+            !small_override("RRV_PCSX2_GS_FULL_MERGE_SPRITE", 1u, merge_sprite) ||
+            !small_override("RRV_PCSX2_GS_FULL_BILINEAR",
+                            static_cast<unsigned>(GSBilinearDirtyMode::MaxCount) - 1u, bilinear))
+            return nullptr;
+        options.UserHacks_NativeScaling = static_cast<GSNativeScaling>(native_scaling);
+        options.UserHacks_AlignSpriteX = align_sprite != 0u;
+        options.UserHacks_MergePPSprite = merge_sprite != 0u;
+        options.UserHacks_BilinearHack = static_cast<GSBilinearDirtyMode>(bilinear);
+        std::fprintf(stderr,
+                     "[pcsx2-gs-bridge] render mode=full: NativeScaling=%u AlignSprite=%u MergeSprite=%u "
+                     "BilinearHack=%u\n", native_scaling, align_sprite, merge_sprite, bilinear);
+        std::fprintf(stderr,
+                     "[pcsx2-gs-bridge] render mode=full: UpscaleMultiplier=%g InterlaceMode=Off "
+                     "field OFY 0x7908->0x7900 HalfPixelOffset=%u RoundSprite=%d%s%s\n",
+                     static_cast<double>(options.UpscaleMultiplier),
+                     static_cast<unsigned>(options.UserHacks_HalfPixelOffset),
+                     static_cast<int>(options.UserHacks_RoundSprite),
+                     round_sprite_u_only ? " (minified sprites: V on progressive grid)" : " (U and V)",
+                     fixes_overridden ? " [matrix override]" : "");
+    }
+    else
+    {
+        GSRrvSetFieldOfyCanonical(0u, 0u);
+        GSRrvSetRoundSpriteUOnly(false);
+        GSRrvSetDropLargeSTTriangles(false);
+        GSRrvSetNativeBlurCopy(0u);
+        GSRrvSetSpriteCoverage(false);
+        SpriteCoverage() = {};
+        // RRV_PCSX2_GS_GAME=gt4: Gran Turismo 4 (GT4 VR, ps2-web-recomp on the Quest) in field mode.
+        // The bridge does not run PCSX2's GameDB loader, so this applies GT4's entry
+        // (SCUS-97328 / SCUS-97436, gran-turismo-4-gs-fixes): halfPixelOffset 4 (Native),
+        // autoFlush 1 (SpritesOnly), getSkipCount GSC_PolyphonyDigitalGames (the HLE of GT4's
+        // channel-shuffle post-processing); recommendedBlendingLevel 3 is only a recommendation
+        // (RRV_PCSX2_GS_BLEND). It also takes back the RR5 hardware profile set above (CPU sprite
+        // rendering, texture-in-RT, large-ST rewrite are RR5 GameDB fixes), and lets field mode
+        // upscale: RRV_PCSX2_GS_SCALE=1..8 (default 2).
+        if (const char* game = std::getenv("RRV_PCSX2_GS_GAME"); game && std::strcmp(game, "gt4") == 0)
+        {
+            options.UserHacks_CPUSpriteRenderBW = 0;
+            options.UserHacks_CPUSpriteRenderLevel = 0;
+            options.UserHacks_TextureInsideRt = GSTextureInRtMode::Disabled;
+            options.UserHacks_RewriteLargeST = false;
+            options.UserHacks_HalfPixelOffset = GSHalfPixelOffset::Native;
+            options.UserHacks_AutoFlush = GSHWAutoFlushLevel::SpritesOnly;
+            options.GetSkipCountFunctionId = GSLookupGetSkipCountFunctionId("GSC_PolyphonyDigitalGames");
+            options.UpscaleMultiplier = 2.0f;
+            // InterlaceMode stays Automatic: GT4's race SMODE2 (INT 0 / FFMD 1, shown as the top half
+            // doubled) is sent as INT 1 / FFMD 0 by the host (gs.cpp), which PCSX2 deinterlaces into
+            // the full, steady picture. Off flickered strongly (owner 2026-10-30).
+            // Fractional scales too (3.5 = 2240x1568): the VR view's vertical detail is 448 x scale.
+            if (const char* value = std::getenv("RRV_PCSX2_GS_SCALE"))
+            {
+                char* end = nullptr;
+                const float scale = std::strtof(value, &end);
+                if (end != value && *end == '\0' && scale >= 1.0f && scale <= 8.0f)
+                    options.UpscaleMultiplier = scale;
+            }
+            // Hardware download (owner 2026-10-30): "Accurate" read every GS->EE transfer back from
+            // the GPU; GT4's sun / light reflections read one back per field (lens flare check),
+            // which flashed the picture and dropped the frame rate. Disabled = no GPU readback, the
+            // transfer gets GS local memory (ARMSX2 Quest uses Unsynchronized for the same reason).
+            // RRV_PCSX2_GS_HWDOWNLOAD=0..5 (GSHardwareDownloadMode: 0 Accurate, 2 NoReadbacks,
+            // 3 Unsynchronized, 4 Disabled) overrides.
+            options.HWDownloadMode = GSHardwareDownloadMode::Disabled;
+            if (const char* value = std::getenv("RRV_PCSX2_GS_HWDOWNLOAD"); value && value[0] >= '0' && value[0] <= '5' && value[1] == '\0')
+                options.HWDownloadMode = static_cast<GSHardwareDownloadMode>(value[0] - '0');
+            std::fprintf(stderr, "[pcsx2-gs-bridge] GT4 profile: HWDownloadMode=%u\n", static_cast<unsigned>(options.HWDownloadMode));
+            // RRV_PCSX2_GS_SCALE_X: the X scale on its own, RRV_PCSX2_GS_SCALE is then the Y one (VR
+            // lacks vertical detail most: 448 lines for the whole view; owner 2026-10-30).
+            GSRrvSetScaleX(0.0f);
+            if (const char* value = std::getenv("RRV_PCSX2_GS_SCALE_X"))
+            {
+                char* end = nullptr;
+                const float sx = std::strtof(value, &end);
+                if (end != value && *end == '\0' && sx >= 1.0f && sx <= 8.0f)
+                {
+                    GSRrvSetScaleX(sx);
+                    std::fprintf(stderr, "[pcsx2-gs-bridge] GT4 profile: anisotropic scale x %g y %g\n",
+                                 static_cast<double>(sx), static_cast<double>(options.UpscaleMultiplier));
+                }
+            }
+            if (const char* value = std::getenv("RRV_PCSX2_GS_BLEND"); value && value[0] >= '0' && value[0] <= '5' && value[1] == '\0')
+                options.AccurateBlendingUnit = static_cast<AccBlendLevel>(value[0] - '0');
+            // Stereo depth mask (owner 2026-11-02): GT4's real Z stays below ~1/8192 (hence the depth
+            // scale 8192), but the rear-view mirror area is written at the maximum Z, so it packed as
+            // the nearest depth and slid sideways in each eye, seam and all. Raw depth above 1/1024
+            // packs as 0 (flat). RRV_PCSX2_GS_STEREO_DEPTH_MASK=<raw> overrides, 0 = off.
+            {
+                float mask = 1.0f / 1024.0f;
+                if (const char* value = std::getenv("RRV_PCSX2_GS_STEREO_DEPTH_MASK"))
+                    mask = std::strtof(value, nullptr);
+                GSRrvSetStereoDepthMask(mask);
+                std::fprintf(stderr, "[pcsx2-gs-bridge] GT4 profile: stereo depth mask %g\n", static_cast<double>(mask));
+            }
+            // HD texture packs (PCSX2 replacement packs, owner 2026-11-02): RRV_PCSX2_GS_TEXTURE_DIR is the
+            // "textures" folder, RRV_PCSX2_GS_TEXTURE_SERIAL the game ID below it (SCUS-97436 = Spec II),
+            // loaded from <dir>/<serial>/replacements. Asynchronous loading, no precache (Quest memory).
+            if (const char* dir = std::getenv("RRV_PCSX2_GS_TEXTURE_DIR"); dir && *dir && std::getenv("RRV_PCSX2_GS_TEXTURE_SERIAL"))
+            {
+                EmuFolders::Textures = dir;
+                options.LoadTextureReplacements = true;
+                options.LoadTextureReplacementsAsync = true;
+                options.PrecacheTextureReplacements = false;
+                options.DumpReplaceableTextures = false;
+                std::fprintf(stderr, "[pcsx2-gs-bridge] GT4 profile: texture replacements from %s/%s/replacements\n", dir,
+                             std::getenv("RRV_PCSX2_GS_TEXTURE_SERIAL"));
+                // RRV_PCSX2_GS_TEXTURE_DUMP=1: write every texture that was NOT replaced to <dir>/<serial>/dumps
+                // (PCSX2 skips replaced ones) - finds the pieces a pack misses (owner 2026-11-07: Midfield's
+                // sky only half HD).
+                if (const char* dump = std::getenv("RRV_PCSX2_GS_TEXTURE_DUMP"); dump && std::strcmp(dump, "1") == 0)
+                {
+                    options.DumpReplaceableTextures = true;
+                    options.DumpReplaceableMipmaps = false;
+                    options.DumpDirectTextures = true;
+                    options.DumpPaletteTextures = true;
+                    options.DumpTexturesWithFMVActive = false;
+                    std::fprintf(stderr, "[pcsx2-gs-bridge] GT4 profile: dumping textures without a replacement to %s/%s/dumps\n",
+                                 dir, std::getenv("RRV_PCSX2_GS_TEXTURE_SERIAL"));
+                }
+            }
+#if defined(__ANDROID__)
+            options.OverrideTextureBarriers = 1; // in-pass RT reads on the Quest (see full mode)
+#endif
+            if (const char* value = std::getenv("RRV_PCSX2_GS_TEXBARRIER"); value && (value[0] == '0' || value[0] == '1') && value[1] == '\0')
+                options.OverrideTextureBarriers = static_cast<s8>(value[0] - '0');
+            std::fprintf(stderr,
+                         "[pcsx2-gs-bridge] GT4 profile (field mode): UpscaleMultiplier=%g HalfPixelOffset=%u AutoFlush=%u "
+                         "GetSkipCount=%d AccurateBlendingUnit=%u OverrideTextureBarriers=%d\n",
+                         static_cast<double>(options.UpscaleMultiplier), static_cast<unsigned>(options.UserHacks_HalfPixelOffset),
+                         static_cast<unsigned>(options.UserHacks_AutoFlush), static_cast<int>(options.GetSkipCountFunctionId),
+                         static_cast<unsigned>(options.AccurateBlendingUnit), static_cast<int>(options.OverrideTextureBarriers));
+        }
+    }
+    // RRV_PCSX2_GS_INTERLACE=<n> selects Pcsx2Config::GSOptions::InterlaceMode
+    // (0=Automatic .. 9=AdaptiveBFF, see PCSX2 Config.h GSInterlaceMode).
+    // Default is unchanged (PCSX2's own Automatic) so this is observation-only
+    // until a value is proven. RR5 renders a complete display list per field
+    // into a HALF-HEIGHT 640x224 buffer with SMODE2 INT=1 FFMD=1, and the live
+    // output is currently two different 224-line images stacked into the 448-line
+    // scan-out, so the deinterlace/field-composition policy is a prime suspect.
+    if (const char* interlace = std::getenv("RRV_PCSX2_GS_INTERLACE");
+        interlace && interlace[0] != '\0')
+    {
+        char* end = nullptr;
+        const unsigned long parsed = std::strtoul(interlace, &end, 10);
+        if (end != interlace && *end == '\0' &&
+            parsed < static_cast<unsigned long>(GSInterlaceMode::Count))
+        {
+            options.InterlaceMode = static_cast<GSInterlaceMode>(parsed);
+            std::fprintf(stderr, "[pcsx2-gs-bridge] InterlaceMode=%lu\n", parsed);
+        }
+        else
+        {
+            std::fprintf(stderr,
+                         "[pcsx2-gs-bridge] ignoring invalid RRV_PCSX2_GS_INTERLACE=%s\n",
+                         interlace);
+        }
+    }
+    // RRV_PCSX2_GS_DRAWDUMP=<dir> mirrors `pcsx2-gsrunner -dump i`: PCSX2's own
+    // per-draw context dump, written from inside GSState::DumpDrawInfo and keyed
+    // on the global draw counter s_n. The point is not the dump itself -- it is
+    // that the direct-call consumer and the MTGS consumer then carry the SAME
+    // instrumentation at the SAME code point, so a draw-level diff between them
+    // is a measurement rather than an inference. Default off; observation only.
+    // RRV_PCSX2_GS_DRAWDUMP_FRAMES=<start>[,<count>] narrows the frame range
+    // (PCSX2 defaults to every frame, which is far too much data here).
+    if (const char* dump_dir = std::getenv("RRV_PCSX2_GS_DRAWDUMP");
+        dump_dir && dump_dir[0] != '\0')
+    {
+        options.DumpGSData = true;
+        options.SaveInfo = true;
+        options.SWDumpDirectory = dump_dir;
+        options.HWDumpDirectory = dump_dir;
+        options.SaveFrameStart = 0;
+        options.SaveFrameCount = -1;
+        options.SaveFrameBy = 1;
+        // PCSX2 also caps dumps at the first 5000 draws of the run (s_n is
+        // global); the frame range is the only limit here.
+        options.SaveDrawCount = -1;
+        // RRV_PCSX2_GS_DRAWDUMP_TEX=1 also writes each draw's source texture
+        // and render target images (large; use a narrow frame range).
+        if (const char* tex = std::getenv("RRV_PCSX2_GS_DRAWDUMP_TEX"); tex && std::strcmp(tex, "1") == 0)
+        {
+            options.SaveTexture = true;
+            options.SaveRT = true;
+        }
+        // RRV_PCSX2_GS_DRAWDUMP_DEPTH=1 also writes the depth buffer before and
+        // after each draw; RRV_PCSX2_GS_DRAWDUMP_DRAWS=<first>,<count> narrows the
+        // dump to a range of the global draw counter (the images are large).
+        if (const char* depth = std::getenv("RRV_PCSX2_GS_DRAWDUMP_DEPTH"); depth && std::strcmp(depth, "1") == 0)
+            options.SaveDepth = true;
+        if (const char* draws = std::getenv("RRV_PCSX2_GS_DRAWDUMP_DRAWS"); draws && draws[0] != '\0')
+        {
+            char* end = nullptr;
+            options.SaveDrawStart = static_cast<int>(std::strtol(draws, &end, 10));
+            if (end && *end == ',')
+                options.SaveDrawCount = static_cast<int>(std::strtol(end + 1, nullptr, 10));
+        }
+        if (const char* range = std::getenv("RRV_PCSX2_GS_DRAWDUMP_FRAMES");
+            range && range[0] != '\0')
+        {
+            char* end = nullptr;
+            const long start = std::strtol(range, &end, 10);
+            options.SaveFrameStart = static_cast<int>(start);
+            if (end && *end == ',')
+                options.SaveFrameCount = static_cast<int>(std::strtol(end + 1, nullptr, 10));
+        }
+        std::fprintf(stderr,
+                     "[pcsx2-gs-bridge] draw dump -> %s (frames %d count %d)\n",
+                     dump_dir, options.SaveFrameStart, options.SaveFrameCount);
+    }
+    if (config)
+    {
+        if (config->sw_threads > UINT16_MAX)
+        {
+            SetError(error, error_capacity, "sw_threads %u exceeds PCSX2's uint16 range", config->sw_threads);
+            return nullptr;
+        }
+        // The caller owns this policy: the software rasterizer's worker count is
+        // the single biggest lever on how much of a frame the SUBMITTING thread
+        // pays for (measured: ~9 ms -> ~3.7 ms per guest frame on the 3D attract
+        // phases). 0 means "rasterize on the submitting thread", which is the
+        // single-threaded rollback, NOT "use PCSX2's default".
+        options.SWExtraThreads = static_cast<uint16_t>(config->sw_threads);
+        std::fprintf(stderr, "[pcsx2-gs-bridge] SWExtraThreads=%u\n",
+                     static_cast<unsigned>(options.SWExtraThreads));
+    }
+
+    if (direct_requested)
+    {
+#if defined(__APPLE__)
+        const bool owner_surface =
+            (config->surface.flags & RRV_PCSX2_GS_SURFACE_FLAG_OWNER_THREAD) != 0u;
+        if (!owner_surface && !rrv_pcsx2_gs_bridge_is_macos_main_thread())
+        {
+            SetError(error, error_capacity,
+                     "direct presentation bridge creation must run on AppKit's main thread");
+            return nullptr;
+        }
+        if (owner_surface && !rrv_pcsx2_gs_bridge_consume_owner_surface(
+                &config->surface, error, error_capacity))
+            return nullptr;
+        if ((!owner_surface && !rrv_pcsx2_gs_bridge_validate_macos_surface(config->surface.native_view,
+                                                          config->surface.native_layer,
+                                                          error, error_capacity)) ||
+            !rrv_pcsx2_gs_bridge_configure_native_surface(
+                config->surface.kind, config->surface.flags, config->surface.native_view,
+                config->surface.native_layer, config->surface.width_pixels,
+                config->surface.height_pixels, config->surface.backing_scale,
+                error, error_capacity))
+        {
+            return nullptr;
+        }
+        bridge->owner_thread_surface = owner_surface;
+        GSRrvResetDirectPresentCount();
+#else
+        // Linux: no AppKit-style main-thread rule. The owner sideband is still
+        // honoured so a dedicated-owner caller uses the same protocol on both
+        // platforms (prepare on the SDL thread, consume here on the owner).
+        const bool owner_surface =
+            (config->surface.flags & RRV_PCSX2_GS_SURFACE_FLAG_OWNER_THREAD) != 0u;
+        if (owner_surface && !rrv_pcsx2_gs_bridge_consume_owner_surface(
+                &config->surface, error, error_capacity))
+            return nullptr;
+#if defined(_WIN32)
+        if (!rrv_pcsx2_gs_bridge_validate_win32_surface(&config->surface, error, error_capacity) ||
+#elif defined(__ANDROID__)
+        if (!rrv_pcsx2_gs_bridge_validate_android_surface(&config->surface, error, error_capacity) ||
+#else
+        if (!rrv_pcsx2_gs_bridge_validate_linux_surface(&config->surface, error, error_capacity) ||
+#endif
+            !rrv_pcsx2_gs_bridge_configure_native_surface(
+                config->surface.kind, config->surface.flags, config->surface.native_view,
+                config->surface.native_layer, config->surface.width_pixels,
+                config->surface.height_pixels, config->surface.backing_scale,
+                error, error_capacity))
+        {
+            return nullptr;
+        }
+        bridge->owner_thread_surface = owner_surface;
+        GSRrvResetDirectPresentCount();
+#endif
+    }
+
+    // RRV_PCSX2_GS_VSYNC=1 (the windowed, real-time product launcher sets it):
+    // present on the display's vertical sync (Metal displaySyncEnabled +
+    // presentDrawable; Vulkan VK_PRESENT_MODE_FIFO_KHR), so a frame never
+    // replaces another mid-scan (no tearing). Host presentation only; guest
+    // time is unaffected. Off by default and never with a detached (headless)
+    // surface. The Metal-only atTime present pacer (pcsx2-gs-bridge-target
+    // .patch, RrvPresentPacer) has no Vulkan equivalent: core Vulkan has no
+    // present-at-time, so on Linux FIFO alone paces presentation. There
+    // RRV_PCSX2_GS_PRESENT_PACING only decides where the acquire of the next
+    // swap-chain image runs (pcsx2-gs-bridge-linux.patch, VKSwapChain): on a
+    // helper thread by default, so it does not block the GS thread; 0 keeps
+    // PCSX2's acquire on the GS thread.
+    const bool vsync = direct_requested && EnvFlag("RRV_PCSX2_GS_VSYNC", false);
+    // RRV_GATE3_FAST_FORWARD=N (replay debugging): the runtime runs the first N
+    // starts unpaced, so vsync would throttle them to the display rate; present
+    // without it and switch to FIFO at field N.
+    uint64_t vsync_from_field = 0;
+    if (vsync)
+        if (const char* ff = std::getenv("RRV_GATE3_FAST_FORWARD"); ff && *ff)
+            vsync_from_field = std::strtoull(ff, nullptr, 10);
+    options.VsyncEnable = vsync && !vsync_from_field;
+#if defined(_WIN32)
+    if (direct_requested)
+        options.Adapter = RrvAdapterName();
+#endif
+    unsigned display_hz = 0;
+    const GSVSyncMode display_sync = DisplaySyncMode(config ? &config->surface : nullptr, &display_hz);
+    if (vsync && vsync_from_field)
+        std::fprintf(stderr, "[pcsx2-gs-bridge] presentation vsync=%s from field %llu (fast-forward)\n",
+                     SyncModeName(display_sync), static_cast<unsigned long long>(vsync_from_field));
+    else if (vsync)
+        std::fprintf(stderr, "[pcsx2-gs-bridge] presentation vsync=%s (display sync, display %u Hz)\n",
+                     SyncModeName(display_sync), display_hz);
+    // Gate 7 aspect/UI: how the displayed image is fitted into the window.
+    // RRV_PCSX2_GS_ASPECT=auto|4:3|16:9|16:10|21:9|stretch (default auto =
+    // PCSX2's Auto 4:3/3:2, i.e. 4:3 for RR5's interlaced NTSC output). 16:10
+    // and 21:9 use Auto with PCSX2's custom ratio (the slot patches use).
+    // Wider ratios widen the same picture unless the game renders wider too
+    // (RR5 enhancement RRV_RR5_WIDESCREEN).
+    // PCSX2's CalculateDrawDstRect reads EmuConfig.CurrentAspectRatio, not
+    // GSConfig, so both are set. RRV_PCSX2_GS_INTEGER_SCALING=1 snaps the
+    // image to whole multiples of the output size. Presentation only: the
+    // headless snapshot path takes the internal-resolution texture (window
+    // 0x0) and never runs this fit.
+    float custom_aspect = 0.0f;
+    if (const char* aspect = std::getenv("RRV_PCSX2_GS_ASPECT"); aspect && aspect[0] != '\0')
+    {
+        const std::string_view value(aspect);
+        if (value == "auto")
+            options.AspectRatio = AspectRatioType::RAuto4_3_3_2;
+        else if (value == "4:3")
+            options.AspectRatio = AspectRatioType::R4_3;
+        else if (value == "16:9")
+            options.AspectRatio = AspectRatioType::R16_9;
+        else if (value == "16:10" || value == "21:9")
+        {
+            options.AspectRatio = AspectRatioType::RAuto4_3_3_2;
+            custom_aspect = value == "16:10" ? 16.0f / 10.0f : 21.0f / 9.0f;
+        }
+        else if (value == "stretch")
+            options.AspectRatio = AspectRatioType::Stretch;
+        else
+        {
+            SetError(error, error_capacity, "RRV_PCSX2_GS_ASPECT must be auto, 4:3, 16:9, 16:10, 21:9 or stretch, got %s",
+                     aspect);
+            return nullptr;
+        }
+    }
+    options.IntegerScaling = EnvFlag("RRV_PCSX2_GS_INTEGER_SCALING", false);
+    // Optional presentation post-processing, both off by default (owner
+    // decision 2026-09-29). RRV_PCSX2_GS_FXAA=1 runs PCSX2's FXAA pass on the
+    // merged frame (GSRenderer::Merge -> GSDevice::FXAA). RRV_PCSX2_GS_CAS=
+    // 1..100 runs AMD FidelityFX CAS at that sharpness (GSRenderer::VSync ->
+    // GSDevice::CAS); PCSX2 sharpens only when the internal resolution exceeds
+    // the window and sharpens+resizes when it is smaller. 0 = off.
+    // Direct presentation only: FXAA runs inside Merge(), so enabling it on
+    // the headless path would change the merged snapshot/readback image that
+    // captures and oracle comparisons read.
+    options.FXAA = false;
+    options.CASMode = GSCASMode::Disabled;
+    // RRV_PCSX2_GS_ANISO=0|2|4|8|16: PCSX2's shader anisotropic filtering
+    // (ps.sw_aniso, triangles with automatic LOD only). Off by default (owner
+    // decision 2026-09-29). A host enhancement: it changes rendered pixels,
+    // including headless captures, so it is never set for oracle work.
+    options.MaxAnisotropy = 0;
+    if (const char* aniso = std::getenv("RRV_PCSX2_GS_ANISO"); aniso && aniso[0] != '\0')
+    {
+        const std::string_view value(aniso);
+        if (value != "0" && value != "2" && value != "4" && value != "8" && value != "16")
+        {
+            SetError(error, error_capacity, "RRV_PCSX2_GS_ANISO must be 0, 2, 4, 8 or 16, got %s", aniso);
+            return nullptr;
+        }
+        options.MaxAnisotropy = static_cast<u8>(std::atoi(aniso));
+        std::fprintf(stderr, "[pcsx2-gs-bridge] anisotropic filtering=%ux\n",
+                     static_cast<unsigned>(options.MaxAnisotropy));
+    }
+    // RRV_PCSX2_GS_TEXTURE_FILTER=ps2|bilinear: ps2 (default) filters each draw as
+    // its TEX1 asks. bilinear is PCSX2's "Bilinear (Forced excluding sprite)"
+    // (GSVertexTrace: every non-sprite draw samples linearly, sprites keep
+    // TEX1). RR5 draws its cars with MMAG=NEAREST and MXL=0, so stock cars
+    // show their texels as blocks, and the course already asks for LINEAR
+    // (measured with RRV_PCSX2_GS_DRAWDUMP on attract field 2200 and field
+    // 47500 of the owner's race replay: the PSMT8 512x512 car page at TBP0
+    // 0x1a80 is the only texture a non-sprite draw samples NEAREST; docs/
+    // TESTING.md T-TEXTURE-FILTER). So in RR5 this setting changes the cars.
+    // There is no trilinear choice: PCSX2's "Trilinear (Forced)" was tried
+    // (f0de78a) and is not trilinear here. With this profile (GPU palette
+    // conversion on, HWMipmap on) it leaves a race pixel-identical to bilinear,
+    // and with both off its generated mip levels come out magenta on Metal
+    // (T-TEXTURE-FILTER).
+    // A host enhancement like RRV_PCSX2_GS_ANISO: it changes
+    // rendered pixels, including headless captures, so it is never set for
+    // oracle work. The guest and the GS command stream are unchanged.
+    options.TextureFiltering = BiFiltering::PS2;
+    if (const char* filter = std::getenv("RRV_PCSX2_GS_TEXTURE_FILTER"); filter && filter[0] != '\0')
+    {
+        const std::string_view value(filter);
+        if (value != "ps2" && value != "bilinear")
+        {
+            SetError(error, error_capacity, "RRV_PCSX2_GS_TEXTURE_FILTER must be ps2 or bilinear, got %s", filter);
+            return nullptr;
+        }
+        if (value == "bilinear")
+            options.TextureFiltering = BiFiltering::Forced_But_Sprite;
+        std::fprintf(stderr, "[pcsx2-gs-bridge] texture filter=%s\n", filter);
+    }
+    if (direct_requested)
+    {
+        options.FXAA = EnvFlag("RRV_PCSX2_GS_FXAA", false);
+        if (const char* cas = std::getenv("RRV_PCSX2_GS_CAS"); cas && cas[0] != '\0')
+        {
+            char* end = nullptr;
+            const long sharpness = std::strtol(cas, &end, 10);
+            if (end == cas || *end != '\0' || sharpness < 0 || sharpness > 100)
+            {
+                SetError(error, error_capacity, "RRV_PCSX2_GS_CAS must be 0 to 100, got %s", cas);
+                return nullptr;
+            }
+            if (sharpness > 0)
+            {
+                options.CASMode = GSCASMode::SharpenAndResize;
+                options.CAS_Sharpness = static_cast<u8>(sharpness);
+            }
+        }
+        std::fprintf(stderr, "[pcsx2-gs-bridge] presentation fxaa=%u cas=%u\n", options.FXAA ? 1u : 0u,
+                     options.CASMode == GSCASMode::Disabled ? 0u : static_cast<unsigned>(options.CAS_Sharpness));
+    }
+    // Dithering (PCSX2 Dithering: 0 off, 1 scaled, 2 unscaled = PCSX2 default, 3 force 32-bit). GT4 at
+    // 480p shows a 16-bit (PSMCT16) frame buffer instead of 24-bit (owner 2026-11-08: "too sharp, crispy,
+    // washed out"); its dither pattern at native size turns into coarse noise when upscaled.
+    if (const char* dither = std::getenv("RRV_PCSX2_GS_DITHER"); dither && dither[0] >= '0' && dither[0] <= '3' && dither[1] == '\0')
+        options.Dithering = static_cast<u8>(dither[0] - '0');
+    std::fprintf(stderr, "[pcsx2-gs-bridge] dithering=%u (0 off, 1 scaled, 2 unscaled, 3 force 32-bit)\n",
+                 static_cast<unsigned>(options.Dithering));
+    EmuConfig.GS.AspectRatio = options.AspectRatio;
+    EmuConfig.CurrentAspectRatio = options.AspectRatio;
+    EmuConfig.CurrentCustomAspectRatio = custom_aspect;
+    if (direct_requested)
+        std::fprintf(stderr, "[pcsx2-gs-bridge] presentation aspect=%s custom=%.4f integer-scaling=%u\n",
+                     Pcsx2Config::GSOptions::AspectRatioNames[static_cast<size_t>(options.AspectRatio)],
+                     static_cast<double>(custom_aspect), options.IntegerScaling ? 1u : 0u);
+    const ScopedBridgeGsFpcr fpcr_guard(bridge->fp_isolated);
+    if (!GSopen(options, renderer, bridge->pcsx2_regs.data(),
+                options.VsyncEnable ? display_sync : GSVSyncMode::Disabled, false))
+    {
+        if (direct_requested)
+            rrv_pcsx2_gs_bridge_clear_native_surface();
+        SetError(error, error_capacity, "PCSX2 GSopen(%s) failed; see PCSX2 console output", renderer_name);
+        return nullptr;
+    }
+
+    // GSopen may resolve Auto or select a fallback. Report the instantiated
+    // renderer from PCSX2's live GS state, after open, and overwrite the
+    // pre-open request metadata returned through the ABI. This is the M0R
+    // proof point: callers must never infer Metal execution from an option or
+    // a library name.
+    const GSRendererType actual_renderer = GSGetCurrentRenderer();
+    const bool actual_hardware = GSIsHardwareRenderer();
+    switch (actual_renderer)
+    {
+        case GSRendererType::Metal:
+            capabilities->renderer_kind = RRV_PCSX2_GS_RENDERER_METAL;
+            capabilities->renderer_name = "PCSX2 Metal";
+            break;
+        case GSRendererType::VK:
+            capabilities->renderer_kind = RRV_PCSX2_GS_RENDERER_VULKAN;
+            capabilities->renderer_name = "PCSX2 Vulkan";
+            break;
+        case GSRendererType::DX11:
+            capabilities->renderer_kind = RRV_PCSX2_GS_RENDERER_D3D11;
+            capabilities->renderer_name = "PCSX2 Direct3D 11";
+            break;
+        case GSRendererType::SW:
+            capabilities->renderer_kind = RRV_PCSX2_GS_RENDERER_SOFTWARE;
+            capabilities->renderer_name = "PCSX2 Software";
+            break;
+        default:
+            capabilities->renderer_kind = RRV_PCSX2_GS_RENDERER_UNKNOWN;
+            capabilities->renderer_name = "PCSX2 Other";
+            break;
+    }
+    std::fprintf(stderr,
+                 "[pcsx2-gs-bridge] instantiated renderer=%s hardware=%s backend=%s\n",
+                 Pcsx2Config::GSOptions::GetRendererName(actual_renderer),
+                 actual_hardware ? "yes" : "no",
+                 GpuBackendName(actual_renderer));
+
+    if (full_frame && !actual_hardware)
+    {
+        GSclose();
+        if (direct_requested)
+            rrv_pcsx2_gs_bridge_clear_native_surface();
+        SetError(error, error_capacity,
+                 "RRV_GS_RENDER_MODE=full requires a hardware renderer, but PCSX2 instantiated %s",
+                 Pcsx2Config::GSOptions::GetRendererName(actual_renderer));
+        return nullptr;
+    }
+    if (actual_hardware)
+        capabilities->capability_flags |= RRV_PCSX2_GS_CAP_HARDWARE_GS;
+    if (actual_renderer == GSRendererType::Metal)
+        capabilities->capability_flags |= RRV_PCSX2_GS_CAP_METAL_BACKEND;
+    if (actual_renderer == GSRendererType::VK)
+        capabilities->capability_flags |= RRV_PCSX2_GS_CAP_VULKAN_BACKEND;
+    if (actual_renderer == GSRendererType::DX11)
+        capabilities->capability_flags |= RRV_PCSX2_GS_CAP_D3D11_BACKEND;
+    // Fail closed when PCSX2 fell back: direct presentation needs the GPU
+    // renderer that was asked for (Auto: the platform's own).
+    const GSRendererType wanted_renderer = renderer == GSRendererType::Auto ? kPlatformGpuRenderer : renderer;
+    if (direct_requested && (!IsPlatformGpuRenderer(actual_renderer) || actual_renderer != wanted_renderer))
+    {
+        GSclose();
+        rrv_pcsx2_gs_bridge_clear_native_surface();
+        SetError(error, error_capacity,
+                 "direct presentation requested but PCSX2 did not instantiate %s",
+                 GpuBackendName(wanted_renderer));
+        return nullptr;
+    }
+    if (direct_requested)
+        capabilities->capability_flags |= RRV_PCSX2_GS_CAP_DIRECT_PRESENT;
+
+    bridge->full_frame = full_frame;
+    // The platform GPU renderer (Metal or Vulkan) can expose PMODE before it
+    // has a snapshotable target, and every CPU snapshot waits on the GPU.
+    bridge->gpu_snapshot_fallback = IsPlatformGpuRenderer(actual_renderer);
+    bridge->gpu_renderer = IsPlatformGpuRenderer(actual_renderer);
+    bridge->direct_present = direct_requested;
+    bridge->vsync_from_field = vsync_from_field;
+    bridge->display_sync = display_sync;
+    if (options.VsyncEnable)
+        ApplyDisplaySync(display_sync, false);
+    bridge->open = true;
+    Gate4GsObserver().Configure();
+    host_memory_guard.disarm();
+    return bridge.release();
+}
+
+extern "C" void rrv_pcsx2_gs_bridge_destroy(RrvPcsx2GsBridge* bridge)
+{
+    if (!bridge)
+        return;
+    Gate4GsObserver().Write();
+    if (bridge->full_frame)
+        std::fprintf(stderr, "[pcsx2-gs-bridge] full-frame: field OFY canonicalized in %llu XYOFFSET writes\n",
+                     static_cast<unsigned long long>(GSRrvGetFieldOfyCanonicalCount()));
+    if (bridge->full_frame)
+        std::fprintf(stderr, "[pcsx2-gs-bridge] full-frame: large-ST triangles dropped %llu\n",
+                     static_cast<unsigned long long>(GSRrvGetDroppedLargeSTTriangles()));
+    if (bridge->full_frame && GSRrvNativeBlurCopyBlock() != 0u)
+        std::fprintf(stderr, "[pcsx2-gs-bridge] full-frame: DoF native-size blur draws forward=%llu return=%llu\n",
+                     static_cast<unsigned long long>(GSRrvGetNativeBlurCopyCount(1u)),
+                     static_cast<unsigned long long>(GSRrvGetNativeBlurCopyCount(2u)));
+    if (bridge->full_frame && SpriteCoverage().on)
+        std::fprintf(stderr, "[pcsx2-gs-bridge] full-frame: sprite coverage draws=%llu, HUD un-stretch sprites aligned=%llu "
+                             "filter not seen=%llu\n",
+                     static_cast<unsigned long long>(GSRrvGetSpriteCoverageDraws()),
+                     static_cast<unsigned long long>(SpriteCoverage().hud_sprites),
+                     static_cast<unsigned long long>(SpriteCoverage().hud_unknown));
+    const ScopedBridgeGsFpcr fpcr_guard(bridge->fp_isolated);
+    if (bridge->open)
+        GSclose();
+#if defined(RRV_PCSX2_GS_CANONICAL_RECEIPTS)
+    std::string receipt_error;
+    if (!bridge->canonical_receipt.dumpDeferred(&receipt_error))
+        std::fprintf(stderr, "[pcsx2-gs-bridge] %s\n", receipt_error.c_str());
+#endif
+    if (bridge->direct_present)
+        rrv_pcsx2_gs_bridge_clear_native_surface();
+    delete bridge;
+    // After GSclose(): the SW JIT's generated code lives in the code reserve.
+    ReleaseHostMemory();
+}
+
+// Gate 7 HUD survey/transform: a GIF-stream walker that keeps per-path tag
+// state across submits (a tag can span transfers) and visits every vertex X
+// (XYZ2/XYZ3/XYZF2/XYZF3 in PACKED, A+D and REGLIST form) with the current
+// PRIM. RRV_PCSX2_GS_HUDSTATS=<file> writes, per field and path, vertex counts
+// and X ranges per primitive type. Observation only; off by default.
+namespace gifwalk
+{
+struct PathState
+{
+    uint32_t nloop = 0, nreg = 0, reg = 0, flg = 0;
+    uint64_t regs = 0;
+    uint32_t prim = 0; // last PRIM register value (low 11 bits)
+    bool in_tag = false;
+    uint64_t tag_index = 0;
+    uint8_t* uv = nullptr; // last UV register in the current buffer (U = low 14 bits, 10.4)
+    uint8_t* st = nullptr; // last ST register in the current buffer (S, T floats; PACKED: Q follows)
+    bool st_packed = false;
+};
+
+// Visitor: (path, prim, ptr, kind, tag_index) where ptr points at the vertex
+// data: kind 0 = PACKED XYZ2/XYZ3 qword, 1 = PACKED XYZF2/XYZF3 qword,
+// 2 = 64-bit register (A+D data or REGLIST) XYZ2/XYZ3, 3 = 64-bit XYZF2/XYZF3.
+// X is always the low 16 bits (12.4 fixed point, GS window coordinates).
+struct NoRegVisit
+{
+    void operator()(uint32_t, uint32_t, uint8_t*) const {}
+};
+
+// RegVisit: (path, register address, ptr to the 64-bit data) for A+D writes
+// and REGLIST registers 0x6..0xD are not reported (only A+D), which is where
+// RR5 sets SCISSOR/XYOFFSET.
+template <typename Visit, typename RegVisit = NoRegVisit>
+void Walk(PathState& st, uint32_t path, uint8_t* data, uint32_t qwc, Visit&& visit, RegVisit&& reg_visit = RegVisit{})
+{
+    uint32_t q = 0;
+    st.uv = nullptr;
+    st.st = nullptr;
+    while (q < qwc)
+    {
+        uint8_t* qw = data + q * 16u;
+        if (!st.in_tag)
+        {
+            uint64_t lo, hi;
+            std::memcpy(&lo, qw, 8);
+            std::memcpy(&hi, qw + 8, 8);
+            st.nloop = static_cast<uint32_t>(lo & 0x7fffu);
+            const bool pre = ((lo >> 46) & 1u) != 0;
+            if (pre)
+                st.prim = static_cast<uint32_t>((lo >> 47) & 0x7ffu);
+            st.flg = static_cast<uint32_t>((lo >> 58) & 3u);
+            st.nreg = static_cast<uint32_t>((lo >> 60) & 0xfu);
+            if (st.nreg == 0)
+                st.nreg = 16;
+            st.regs = hi;
+            st.reg = 0;
+            st.in_tag = st.nloop != 0;
+            ++st.tag_index;
+            ++q;
+            continue;
+        }
+        if (st.flg >= 2) // IMAGE: nloop qwords of data
+        {
+            const uint32_t take = std::min(st.nloop, qwc - q);
+            q += take;
+            st.nloop -= take;
+            st.in_tag = st.nloop != 0;
+            continue;
+        }
+        if (st.flg == 0) // PACKED: one qword per register
+        {
+            const uint32_t r = static_cast<uint32_t>((st.regs >> (4u * st.reg)) & 0xfu);
+            uint64_t lo;
+            std::memcpy(&lo, qw, 8);
+            if (r == 0x0)
+                st.prim = static_cast<uint32_t>(lo & 0x7ffu);
+            else if (r == 0x3)
+                st.uv = qw;
+            else if (r == 0x2)
+            {
+                st.st = qw;
+                st.st_packed = true;
+            }
+            else if (r == 0x4 || r == 0x5 || r == 0xc || r == 0xd)
+                visit(path, st.prim, qw, (r == 0x4 || r == 0xc) ? 1u : 0u, st.tag_index, st.uv);
+            else if (r == 0x6 || r == 0x7)
+                reg_visit(path, r, qw); // TEX0_1/2 written directly (64-bit value in the low half)
+            else if (r == 0xe)
+            {
+                uint64_t addr;
+                std::memcpy(&addr, qw + 8, 8);
+                addr &= 0xffu;
+                if (addr == 0x00)
+                    st.prim = static_cast<uint32_t>(lo & 0x7ffu);
+                else if (addr == 0x03)
+                    st.uv = qw;
+                else if (addr == 0x04 || addr == 0x05 || addr == 0x0c || addr == 0x0d)
+                    visit(path, st.prim, qw, (addr == 0x04 || addr == 0x0c) ? 3u : 2u, st.tag_index, st.uv);
+                else
+                    reg_visit(path, static_cast<uint32_t>(addr), qw);
+            }
+            if (++st.reg == st.nreg)
+            {
+                st.reg = 0;
+                if (--st.nloop == 0)
+                    st.in_tag = false;
+            }
+            ++q;
+            continue;
+        }
+        // REGLIST: two 64-bit registers per qword.
+        for (uint32_t half = 0; half < 2u && st.in_tag; ++half)
+        {
+            const uint32_t r = static_cast<uint32_t>((st.regs >> (4u * st.reg)) & 0xfu);
+            uint8_t* d = qw + half * 8u;
+            uint64_t v;
+            std::memcpy(&v, d, 8);
+            if (r == 0x0)
+                st.prim = static_cast<uint32_t>(v & 0x7ffu);
+            else if (r == 0x2)
+            {
+                st.st = d;
+                st.st_packed = false;
+            }
+            else if (r == 0x3)
+                st.uv = d;
+            else if (r == 0x4 || r == 0x5 || r == 0xc || r == 0xd)
+                visit(path, st.prim, d, (r == 0x4 || r == 0xc) ? 3u : 2u, st.tag_index, st.uv);
+            else if (r == 0x6 || r == 0x7)
+                reg_visit(path, r, d);
+            if (++st.reg == st.nreg)
+            {
+                st.reg = 0;
+                if (--st.nloop == 0)
+                    st.in_tag = false;
+            }
+        }
+        ++q;
+    }
+}
+} // namespace gifwalk
+
+struct HudStatsV1
+{
+    bool enabled = false;
+    std::FILE* out = nullptr;
+    gifwalk::PathState state[4];
+    // [path][prim type 0..7]: count, min X, max X (pixels relative to 2048), textured count
+    uint32_t count[4][8] = {};
+    int32_t minx[4][8], maxx[4][8];
+    uint32_t tme[4][8] = {};
+    uint64_t field = 0;
+    int64_t dump_field = -1; // RRV_PCSX2_GS_HUDSTATS_FIELD: per-tag records for this field
+    struct Tag { uint32_t path, prim, n; int32_t x0, x1, y0, y1; uint32_t z0, z1; uint64_t id; uint32_t reg; uint64_t val; };
+    std::vector<Tag> tags;
+    HudStatsV1() { Reset(); }
+    void Reset()
+    {
+        for (auto& p : count) for (auto& c : p) c = 0;
+        for (auto& p : tme) for (auto& c : p) c = 0;
+        for (auto& p : minx) for (auto& c : p) c = INT32_MAX;
+        for (auto& p : maxx) for (auto& c : p) c = INT32_MIN;
+    }
+};
+
+HudStatsV1& HudStats()
+{
+    static HudStatsV1 s = [] {
+        HudStatsV1 h;
+        if (const char* path = std::getenv("RRV_PCSX2_GS_HUDSTATS"); path && path[0])
+        {
+            h.out = std::fopen(path, "w");
+            h.enabled = h.out != nullptr;
+            if (h.out)
+                std::fprintf(h.out, "# field path prim count textured minx maxx (pixels from GS x=2048)\n");
+            if (const char* f = std::getenv("RRV_PCSX2_GS_HUDSTATS_FIELD"); f && f[0])
+                h.dump_field = std::strtoll(f, nullptr, 10);
+        }
+        return h;
+    }();
+    return s;
+}
+
+void HudStatsObserve(uint32_t path, const uint8_t* bytes, uint32_t size_bytes)
+{
+    HudStatsV1& h = HudStats();
+    if (!h.enabled || size_bytes == 0u)
+        return;
+    gifwalk::Walk(h.state[path], path, const_cast<uint8_t*>(bytes), size_bytes / 16u,
+                  [&](uint32_t p, uint32_t prim, const uint8_t* x, uint32_t kind, uint64_t tag, uint8_t* uv) {
+                      uint16_t raw;
+                      std::memcpy(&raw, x, 2);
+                      if (static_cast<int64_t>(h.field) == h.dump_field)
+                      {
+                          // Textured sprite vertices in arrival order, raw 12.4 XY and 10.4 UV (S lines; the
+                          // V of a PACKED UV is the second value, of a 64-bit UV register the first).
+                          // Textured STQ vertices of PATH2/3 (Q lines): S, T and, from a PACKED ST, Q.
+                          if (p != 1u && ((prim >> 4) & 1u) != 0 && ((prim >> 8) & 1u) == 0 && h.state[p].st)
+                          {
+                              uint16_t sy;
+                              float s, t, qq = 0.0f;
+                              std::memcpy(&sy, x + (kind <= 1u ? 4 : 2), 2);
+                              std::memcpy(&s, h.state[p].st, 4);
+                              std::memcpy(&t, h.state[p].st + 4, 4);
+                              if (h.state[p].st_packed)
+                                  std::memcpy(&qq, h.state[p].st + 8, 4);
+                              std::fprintf(h.out, "Q path=%u prim=0x%03x x=%u y=%u s=%.9g t=%.9g q=%.9g\n", p, prim,
+                                           static_cast<unsigned>(raw), static_cast<unsigned>(sy), static_cast<double>(s),
+                                           static_cast<double>(t), static_cast<double>(qq));
+                          }
+                          if (((prim >> 4) & 1u) != 0 && ((prim >> 8) & 1u) != 0 && uv)
+                          {
+                              uint16_t sy, u, va, vb;
+                              std::memcpy(&sy, x + (kind <= 1u ? 4 : 2), 2);
+                              std::memcpy(&u, uv, 2);
+                              std::memcpy(&va, uv + 2, 2);
+                              std::memcpy(&vb, uv + 4, 2);
+                              std::fprintf(h.out, "S path=%u prim=0x%03x kind=%u x=%u y=%u u=%u v=%u|%u\n", p, prim, kind,
+                                           static_cast<unsigned>(raw), static_cast<unsigned>(sy), u & 0x3fffu, va & 0x3fffu,
+                                           vb & 0x3fffu);
+                          }
+                          uint16_t ry;
+                          uint32_t z;
+                          if (kind <= 1u)
+                          {
+                              std::memcpy(&ry, x + 4, 2);
+                              uint32_t zz;
+                              std::memcpy(&zz, x + 8, 4);
+                              z = kind == 0u ? zz : ((zz >> 4) & 0xffffffu);
+                          }
+                          else
+                          {
+                              std::memcpy(&ry, x + 2, 2);
+                              uint32_t zz;
+                              std::memcpy(&zz, x + 4, 4);
+                              z = kind == 2u ? zz : (zz & 0xffffffu);
+                          }
+                          const int32_t px = static_cast<int32_t>(raw >> 4) - 2048;
+                          const int32_t py = static_cast<int32_t>(ry >> 4) - 2048;
+                          if (h.tags.empty() || h.tags.back().id != tag || h.tags.back().path != p ||
+                              h.tags.back().prim != prim)
+                              h.tags.push_back({p, prim, 0, px, px, py, py, z, z, tag, 0, 0});
+                          auto& t = h.tags.back();
+                          ++t.n;
+                          t.x0 = std::min(t.x0, px); t.x1 = std::max(t.x1, px);
+                          t.y0 = std::min(t.y0, py); t.y1 = std::max(t.y1, py);
+                          t.z0 = std::min(t.z0, z); t.z1 = std::max(t.z1, z);
+                      }
+                      const uint32_t type = prim & 7u;
+                      const int32_t px = static_cast<int32_t>(raw >> 4) - 2048;
+                      ++h.count[p][type];
+                      h.tme[p][type] += (prim >> 4) & 1u;
+                      h.minx[p][type] = std::min(h.minx[p][type], px);
+                      h.maxx[p][type] = std::max(h.maxx[p][type], px);
+                  },
+                  [&](uint32_t p, uint32_t reg, uint8_t* d) {
+                      if (static_cast<int64_t>(h.field) != h.dump_field)
+                          return;
+                      // TEX0, CLAMP, TEX1 and XYOFFSET in arrival order with the S lines.
+                      if (reg == 0x06 || reg == 0x07 || reg == 0x08 || reg == 0x09 || reg == 0x14 || reg == 0x15 ||
+                          reg == 0x18 || reg == 0x19)
+                      {
+                          uint64_t v;
+                          std::memcpy(&v, d, 8);
+                          std::fprintf(h.out, "r path=%u reg=0x%02x val=0x%016llx\n", p, reg, static_cast<unsigned long long>(v));
+                      }
+                      if (reg == 0x40 || reg == 0x41 || reg == 0x18 || reg == 0x19 || reg == 0x4c || reg == 0x4d)
+                      {
+                          uint64_t v;
+                          std::memcpy(&v, d, 8);
+                          h.tags.push_back({p, 0, 0, 0, 0, 0, 0, 0, 0, ~0ull, reg, v});
+                      }
+                  });
+}
+
+void HudStatsFieldEnd()
+{
+    HudStatsV1& h = HudStats();
+    if (!h.enabled)
+        return;
+    for (uint32_t p = 1; p < 4u; ++p)
+        for (uint32_t t = 0; t < 8u; ++t)
+            if (h.count[p][t])
+                std::fprintf(h.out, "%llu %u %u %u %u %d %d\n", static_cast<unsigned long long>(h.field), p, t,
+                             h.count[p][t], h.tme[p][t], h.minx[p][t], h.maxx[p][t]);
+    for (const auto& t : h.tags)
+        if (t.id == ~0ull)
+            std::fprintf(h.out, "R path=%u reg=0x%02x val=0x%016llx lo=%llu hi=%llu\n", t.path, t.reg,
+                         static_cast<unsigned long long>(t.val),
+                         static_cast<unsigned long long>(t.val & 0x7ff),
+                         static_cast<unsigned long long>((t.val >> 16) & 0x7ff));
+        else
+        std::fprintf(h.out, "T %llu path=%u prim=0x%03x type=%u tme=%u fst=%u abe=%u n=%u x=%d..%d y=%d..%d z=%u..%u\n",
+                     static_cast<unsigned long long>(t.id), t.path, t.prim, t.prim & 7u, (t.prim >> 4) & 1u,
+                     (t.prim >> 8) & 1u, (t.prim >> 6) & 1u, t.n, t.x0, t.x1, t.y0, t.y1, t.z0, t.z1);
+    h.tags.clear();
+    std::fflush(h.out);
+    h.Reset();
+    ++h.field;
+}
+
+// Gate 7 HUD un-stretch (RR5 widescreen companion). RRV_PCSX2_GS_HUD_SCALE=<f>
+// (0 < f < 1; the launcher passes (4/3)/ratio with --ratio) gives every 2D
+// element back its 4:3 proportions and pins it to its screen edge. RR5 draws
+// all of its 2D (HUD sprites 0x356, panels, minimap fans/lines, rev needle
+// strips, menu text) at the far depth plane, Z 0xFFFFF5..0xFFFFFF, through
+// PATH3 (measured 2026-09-27 on race field 4700 and car select 2600); 3D
+// arrives with smaller Z, and the few far-plane 3D strips come through PATH1,
+// which is left alone. A vertex is 2D when Z >= 0xFFFE28 (RRV_PCSX2_GS_HUD_ZMIN
+// overrides) and |X - 2048| <= 400 px. The 2D vertices of each GIF tag form
+// a piece. Pieces that touch (x gap <= 24 px, y gap <= 8 px) form an element,
+// so a word, a card or the rev dial moves as one; RR5 sends many letters as
+// separate transfers, so elements are clustered over a whole field at VSync
+// and applied to the next field (a piece takes the anchor of the previous
+// field's element it overlaps most; a piece with no match is grouped within
+// its own transfer). Each element keeps its size ratio and is anchored by
+// its centre cx (px from the screen centre): |cx| < 107 stays centred
+// (x' = x f), otherwise it keeps its distance to the nearer edge
+// (x' = +-320 + (x -+ 320) f). An element that spans the whole width
+// (full-screen covers, fades, backgrounds) is left alone. RRV_PCSX2_GS_HUD_MODE=race
+// applies all of this only while a race HUD is on screen: a recent field drew
+// the rev-counter needle, the far-plane AA1 strip 0x2cc in the bottom-right
+// quarter (measured at (222,66) in races; menus draw AA1 0x284 anywhere and
+// 0x2cc near the centre); menus then stay stretched.
+// Edge guard (2026-10-11): clustering is transitive single linkage, so in a
+// race anything drawn in the centre (the "GO" strokes -140..137, the pause
+// circle, the countdown digit, the Race Analysis gauge) chained the left panel
+// (ends x=-150), the centre and the right group (starts x=121) into one
+// element spanning the screen (anchor 0, pin): the bars stayed at the edges
+// while everything else scaled about the centre (measured on 1.0.1-windows at
+// 16:9: one element x=-320..321 with 170 pieces at field 3950). While a race
+// HUD is on, links are now merged closest first (signed distance, deeper
+// overlap first) and a merge whose box would reach an edge (x0 <= -312 or
+// x1 >= 312) and also the middle band beyond +-107 is refused; the fallback
+// grouping of unmatched pieces obeys the same rule, and a piece that overlaps
+// two previous elements equally takes the smaller one (race only: outside a race the first best match is kept, as before; the first version applied it everywhere and changed hud=fixed menus, fixed 2026-10-11). Result at 3950: left
+// -320..-150, centre -140..137, right 121..334, dial 121..321. Outside a race
+// (menus) the partition is the plain transitive closure, as before. HUDSTATS
+// E lines carry pieces=, pin= and layer=.
+// Draw-order layers (2026-10-11, the race rule also covers screens drawn over a
+// still-present race HUD): the race HUD stays "on" for 60 fields after the
+// needle is last drawn and the pause menu and the RETIRE result screen are
+// drawn over it (race_active stays true through the result screen; field 5220
+// of the RETIRE test: three full-width quads, the dial element
+// x=117..321 y=12..112 grew from 27 to 49 pieces, captured the result text
+// "You have 3 chances left. Try again?" at x>=117 (deep overlap merges first)
+// and anchored the last four glyphs right while the rest of the line could not
+// join them because of the edge guard). A full-width far-plane piece (x only:
+// x0 <= -312 and x1 >= 312 px; the menu dim quad, a fade, a cover, but also
+// the black bars y=30..112 and y=-112..-30 of the result screen) separates
+// what is under it from what is drawn after it, so every 2D piece gets a layer
+// number = how many full-width pieces were drawn before it in this field (counted in HudScaleApply in arrival order
+// across transfers, reset at VSync) and, while race_active: pieces of
+// different layers never union (HudScaleFieldEnd), a piece matches only
+// previous-field elements of its own layer, and the unmatched-piece fallback
+// does not group across a layer change. Each layer is then clustered by the
+// rules above: the result text is its own centred element, the HUD under it
+// keeps its anchors (offline on the dumps: 5220 text one centre element
+// x=-200..200 with 120 pieces, dial back to 27 pieces; 5000, 3800, 3950, 4500
+// and a menu field unchanged). Outside a race the layer is ignored: the
+// matching and clustering are the pre-existing code path. Validated in the game
+// on 2026-10-11 (observed, see the Gate 7 note section 6).
+// Centred over a cover (2026-10-11, found by that validation): a small piece
+// drawn over a full-width quad that moves or grows (the title underline of the
+// RETIRE result screen growing from 4:3 x=-200, the pause blob opening from
+// x=-120) can no longer match the element of the previous field, becomes an
+// element of its own and took a left/right anchor from its own centre while
+// |cx| >= 107 px, so it jumped 80 capture px when it grew past that. While the
+// race HUD is on, an element (HudScaleFieldEnd) or a group of unmatched pieces
+// (HudScaleApply) on layer > 0 whose box touches neither screen edge
+// (x0 > -312 and x1 < 312 px) is therefore centre-anchored. Layer-0 HUD
+// elements and anything that reaches an edge keep their anchors (the RETRY /
+// QUIT GP menu x=120..320 stays right-anchored from its second visible field;
+// on its first one it is drawn 80 capture px left, see below). Offline on the
+// dumps: the underline at field 5075 changes from anchor left to centre.
+// Validated in the game on 2026-10-11 (observed, Gate 7 note section 6): the
+// underline stays at x=170 on every field and the pause blob opening is within
+// 0.5 px of the hud=stretch reference.
+// Known one-field issue (accepted by the owner 2026-10-11, no further
+// heuristic): before the RETRY / QUIT GP menu appears the game parks it
+// invisibly at x=80..155 y=85..103 (layer 3). That element touches no edge, so
+// it is centred, and the first visible pieces (x=120..320) inherit that anchor
+// for one field (the menu is 80 capture px left); right-anchored from the next.
+// RRV_PCSX2_GS_HUD_ANCHOR=center puts everything in a centred 4:3 box
+// instead. Host-side and presentation-only: guest data is unchanged. Off
+// unless set.
+// Quest VR HUD (quest/bridge/android_stereo.cpp, rrv_pcsx2_gs_bridge_android_set_hud_vr): in the
+// immersive race view the frame covers the whole field of view, so the race HUD is brought into
+// the middle: every element keeps its anchor (left/centre/right) but at vr_scale of the screen
+// half-width, its size and its Y position (about the screen centre) are scaled by vr_scale and its
+// width additionally by vr_x (its 4:3 proportions at the frame's aspect). 0 = off. Applies only
+// while the race HUD is on (race_active), like the race rules above. Desktop builds never set it.
+namespace rrv_quest_hud
+{
+std::atomic<float> vr_scale{0.0f};
+std::atomic<float> vr_x{1.0f};
+// Presentation aspect the XR host wants (0 = 16:9 letterboxed, for the fixed screen; 1 = stretch,
+// the immersive view fills each eye), -1 = leave the configured one. Applied at the next present.
+std::atomic<int> present_aspect{-1};
+// Field skipping (RRV_PCSX2_GS_FRAMESKIP): did the last vsync present a picture?
+std::atomic<int> vsync_presented{1};
+} // namespace rrv_quest_hud
+
+struct HudScaleV1
+{
+    float factor = 0.0f;
+    uint32_t zmin = 0xFFFE28u;
+    bool edges = true;
+    bool race_only = false;   // RRV_PCSX2_GS_HUD_MODE=race
+    bool race_seen = false;   // this field drew the AA1 rev needle at the far plane
+    bool race_active = false; // a recent field did (held for 60 fields)
+    uint32_t race_quiet = 0;  // fields since the needle was last drawn
+    uint64_t fields = 0;
+    uint32_t wide_pieces = 0; // full-width pieces seen so far in this field (reset at VSync)
+    uint64_t vr_ctx2_skipped = 0; // Quest VR: context-2 far-plane vertices left alone
+    uint32_t race_prim = 0;
+    int32_t race_x = 0, race_y = 0;
+    gifwalk::PathState state[4];
+    std::vector<uint8_t> scratch;
+    struct Piece { uint64_t tag; uint32_t prim; int32_t x0, x1, y0, y1; uint32_t first, count; uint32_t layer = 0; };
+    std::vector<Piece> pieces;
+    // TEX1 MMAG per context as last written on PATH2/3 by A+D (0 nearest, 1 linear, 2 not seen yet).
+    uint8_t mmag[2] = {2, 2};
+    // layer: how many full-width pieces were drawn before this one in its field (see "Draw-order layers").
+    struct Box { int32_t x0, x1, y0, y1; uint32_t layer = 0; };
+    struct Element { Box box; int32_t anchor; bool full_width; uint32_t pieces; bool pin; uint32_t layer; };
+    std::vector<Box> field_pieces;      // this field's pieces (original coordinates)
+    std::vector<Element> prev_elements; // clustered at the previous VSync
+    std::vector<uint8_t*> verts;
+    std::vector<uint8_t*> ys; // per vertex: its Y (u16, 12.4 fixed point)
+    std::vector<uint8_t> kinds; // per vertex: gifwalk kind (0/1 PACKED: V at uv+4, else at uv+2)
+    std::vector<uint8_t*> uvs;
+    std::vector<uint8_t> filters; // per vertex: mmag[] of its context when it arrived (see "Sprite coverage")
+    std::vector<uint8_t> aligned; // per vertex of the piece being moved: first vertex of a sprite whose U was aligned
+};
+
+HudScaleV1& HudScale()
+{
+    static HudScaleV1 h = [] {
+        HudScaleV1 v;
+        if (const char* f = std::getenv("RRV_PCSX2_GS_HUD_SCALE"); f && f[0])
+        {
+            const float parsed = std::strtof(f, nullptr);
+            if (parsed > 0.0f && parsed < 1.0f)
+                v.factor = parsed;
+        }
+        if (const char* z = std::getenv("RRV_PCSX2_GS_HUD_ZMIN"); z && z[0])
+            v.zmin = static_cast<uint32_t>(std::strtoul(z, nullptr, 0));
+        if (const char* m = std::getenv("RRV_PCSX2_GS_HUD_ANCHOR"); m && std::strcmp(m, "center") == 0)
+            v.edges = false;
+        if (const char* m = std::getenv("RRV_PCSX2_GS_HUD_MODE"); m && std::strcmp(m, "race") == 0)
+            v.race_only = true;
+        if (v.factor > 0.0f)
+            std::fprintf(stderr, "[pcsx2-gs-bridge] HUD un-stretch: far-plane PATH2/3 2D x%.4f, anchored to %s, %s "
+                                 "(Z >= 0x%X)\n", static_cast<double>(v.factor), v.edges ? "edges" : "centre",
+                         v.race_only ? "races only" : "always", v.zmin);
+        return v;
+    }();
+    return h;
+}
+
+// VSync: cluster this field's 2D pieces into elements for the next field.
+void HudScaleFieldEnd()
+{
+    HudScaleV1& h = HudScale();
+    if (h.vr_ctx2_skipped != 0u && (h.fields % 600u) == 0u)
+        std::fprintf(stderr, "[quest-hud] context-2 far-plane vertices left alone: %llu\n",
+                     static_cast<unsigned long long>(h.vr_ctx2_skipped));
+    if (h.factor <= 0.0f)
+        return;
+    // Race HUD turns on with the first needle and off after 60 fields without
+    // it, so short gaps (fades, the start sequence) do not make the HUD jump.
+    h.race_quiet = h.race_seen ? 0u : h.race_quiet + 1u;
+    const bool active = h.race_seen || (h.race_active && h.race_quiet < 60u);
+    if (h.race_only && active != h.race_active)
+        std::fprintf(stderr, "[pcsx2-gs-bridge] HUD un-stretch: race HUD %s at field %llu (AA1 prim 0x%03x at %d,%d)\n",
+                     active ? "on" : "off", static_cast<unsigned long long>(h.fields), h.race_prim, h.race_x, h.race_y);
+    ++h.fields;
+    h.race_active = active;
+    h.race_seen = false;
+    constexpr int32_t kGapX = 24 << 4, kGapY = 8 << 4, kEdge = 312 << 4, kHalf = 320 << 4, kMiddle = 107 << 4;
+    const size_t n = h.field_pieces.size();
+    std::vector<uint32_t> parent(n);
+    for (size_t k = 0; k < n; ++k)
+        parent[k] = static_cast<uint32_t>(k);
+    const auto find = [&](uint32_t k) {
+        while (parent[k] != k)
+            k = parent[k] = parent[parent[k]];
+        return k;
+    };
+    // A full-width piece (menu bar, background line) is its own element and
+    // never links others: measured on the team-colour menu, such bars chained
+    // the whole screen into one full-width element that was then left alone.
+    const auto wide = [&](const HudScaleV1::Box& b) { return b.x0 <= -kEdge && b.x1 >= kEdge; };
+    // Links between touching pieces, with a signed distance (the larger of the x
+    // gap and three times the y gap; negative when the boxes overlap, deeper
+    // overlap first). With the edge guard off the partition is the plain
+    // transitive closure of the links, which does not depend on their order, so
+    // they are merged as found (the partition is exactly what it always was).
+    // While a race is on (h.race_active, the value just set above: the elements
+    // built here are applied to the NEXT field, which runs under this value) a
+    // merge is refused when the merged box would reach a screen edge (x0 <=
+    // -kEdge or x1 >= kEdge) and also the middle band beyond kMiddle: otherwise
+    // whatever is drawn in the centre (the "GO" strokes, the pause circle, the
+    // countdown digit, the Race Analysis gauge) chains the left panel, the
+    // centre and the right group into one element spanning the screen (anchor
+    // 0 and pin), and the bars then stay at the edges while everything else
+    // scales about the centre. Merging closest first keeps a stroke of "O"
+    // with its own letter before any looser link (a distance clamped at 0 let
+    // a stroke tie with the dial's box and be absorbed by it).
+    struct Link { int32_t d; uint32_t a, b; };
+    std::vector<Link> links;
+    for (size_t a = 0; a < n; ++a)
+        for (size_t b = a + 1; b < n; ++b)
+        {
+            const auto& p = h.field_pieces[a];
+            const auto& q = h.field_pieces[b];
+            if (wide(p) || wide(q))
+                continue;
+            // Race: pieces of different draw-order layers never union (a result
+            // text drawn over a still-present HUD is not captured by a HUD element).
+            if (h.race_active && p.layer != q.layer)
+                continue;
+            const int32_t gx = std::max(q.x0 - p.x1, p.x0 - q.x1);
+            const int32_t gy = std::max(q.y0 - p.y1, p.y0 - q.y1);
+            if (gx <= kGapX && gy <= kGapY)
+                links.push_back({std::max(gx, 3 * gy), static_cast<uint32_t>(a), static_cast<uint32_t>(b)});
+        }
+    const bool guard = h.race_active;
+    if (guard)
+        std::stable_sort(links.begin(), links.end(), [](const Link& l, const Link& r) { return l.d < r.d; });
+    std::vector<HudScaleV1::Box> root_box(h.field_pieces); // per-root box
+    for (const Link& l : links)
+    {
+        const uint32_t ra = find(l.a), rb = find(l.b);
+        if (ra == rb)
+            continue;
+        const HudScaleV1::Box m{std::min(root_box[ra].x0, root_box[rb].x0), std::max(root_box[ra].x1, root_box[rb].x1),
+                                std::min(root_box[ra].y0, root_box[rb].y0), std::max(root_box[ra].y1, root_box[rb].y1)};
+        if (guard && ((m.x0 <= -kEdge && m.x1 > -kMiddle) || (m.x1 >= kEdge && m.x0 < kMiddle)))
+            continue;
+        parent[ra] = rb;
+        root_box[rb] = m;
+    }
+    std::vector<int32_t> index(n, -1);
+    h.prev_elements.clear();
+    for (size_t k = 0; k < n; ++k)
+    {
+        const uint32_t r = find(static_cast<uint32_t>(k));
+        const auto& p = h.field_pieces[k];
+        if (index[r] < 0)
+        {
+            index[r] = static_cast<int32_t>(h.prev_elements.size());
+            h.prev_elements.push_back({{p.x0, p.x1, p.y0, p.y1}, 0, false, 0, false, p.layer});
+        }
+        ++h.prev_elements[static_cast<size_t>(index[r])].pieces;
+        auto& b = h.prev_elements[static_cast<size_t>(index[r])].box;
+        b.x0 = std::min(b.x0, p.x0); b.x1 = std::max(b.x1, p.x1);
+        b.y0 = std::min(b.y0, p.y0); b.y1 = std::max(b.y1, p.y1);
+    }
+    for (auto& el : h.prev_elements)
+    {
+        // One full-width shape (cover, fade, background bar) stays as drawn; a
+        // chain of pieces wider than the screen (the team-colour card
+        // carousel) is one composition and keeps its proportions about the
+        // centre.
+        const bool spans = el.box.x0 <= -kEdge && el.box.x1 >= kEdge;
+        el.full_width = spans && el.pieces == 1u;
+        el.pin = spans;
+        const int32_t cx = (el.box.x0 + el.box.x1) / 2;
+        // Race: a piece drawn over a full-width cover (layer > 0) that touches neither
+        // screen edge is centred (see "Draw-order layers", centre-anchored over covers).
+        const bool over_cover = h.race_active && el.layer > 0 && el.box.x0 > -kEdge && el.box.x1 < kEdge;
+        el.anchor = (spans || !h.edges || over_cover || (cx > -kMiddle && cx < kMiddle)) ? 0 : (cx < 0 ? -kHalf : kHalf);
+    }
+    HudStatsV1& st = HudStats();
+    if (st.enabled && static_cast<int64_t>(st.field) == st.dump_field)
+        for (const auto& el : h.prev_elements)
+            std::fprintf(st.out, "E x=%d..%d y=%d..%d anchor=%s pieces=%u pin=%d layer=%u\n", el.box.x0 >> 4, el.box.x1 >> 4,
+                         el.box.y0 >> 4, el.box.y1 >> 4,
+                         el.full_width ? "none" : el.anchor == 0 ? "centre" : el.anchor < 0 ? "left" : "right",
+                         el.pieces, el.pin ? 1 : 0, el.layer);
+    h.field_pieces.clear();
+    h.wide_pieces = 0;
+}
+
+// Returns the bytes to submit: the original, or a transformed copy.
+const uint8_t* HudScaleApply(uint32_t path, const uint8_t* bytes, uint32_t size_bytes)
+{
+    HudScaleV1& h = HudScale();
+    if (h.factor <= 0.0f || size_bytes == 0u || path == 1u)
+        return bytes;
+    // The copy is made only when the walk finds HUD vertices to move (below); 3D packets, most of a
+    // race, pass through untouched (the copy of every packet was 1-2% of the GS thread, Quest 3).
+    h.pieces.clear();
+    h.verts.clear();
+    h.ys.clear();
+    h.kinds.clear();
+    h.filters.clear();
+    h.uvs.clear();
+    constexpr int32_t kCentre = 2048 << 4;
+    const float vr_scale = rrv_quest_hud::vr_scale.load(std::memory_order_relaxed);
+    const float vr_x = rrv_quest_hud::vr_x.load(std::memory_order_relaxed);
+    const bool vr_on = vr_scale > 0.0f && h.race_active;
+    // The shrunk HUD sprites keep their V in PCSX2 (GSRrvSetHudVr, see GS.h).
+    static bool s_vr_on_set = false;
+    if (vr_on != s_vr_on_set)
+    {
+        s_vr_on_set = vr_on;
+        GSRrvSetHudVr(vr_on);
+    }
+    gifwalk::Walk(h.state[path], path, const_cast<uint8_t*>(bytes), size_bytes / 16u, // read only
+                  [&](uint32_t, uint32_t prim, uint8_t* v, uint32_t kind, uint64_t tag, uint8_t* uv) {
+                      uint32_t zz, z;
+                      uint16_t x, y;
+                      std::memcpy(&x, v, 2);
+                      if (kind <= 1u)
+                      {
+                          std::memcpy(&y, v + 4, 2);
+                          std::memcpy(&zz, v + 8, 4);
+                          z = kind == 0u ? zz : ((zz >> 4) & 0xffffffu);
+                      }
+                      else
+                      {
+                          std::memcpy(&y, v + 2, 2);
+                          std::memcpy(&zz, v + 4, 4);
+                          z = kind == 2u ? zz : (zz & 0xffffffu);
+                      }
+                      const int32_t rx = static_cast<int32_t>(x) - kCentre;
+                      if (z < h.zmin || rx < -(400 << 4) || rx > (400 << 4))
+                          return;
+                      const int32_t ry = static_cast<int32_t>(y) - kCentre;
+                      if (h.pieces.empty() || h.pieces.back().tag != tag || h.pieces.back().prim != prim)
+                          h.pieces.push_back({tag, prim, rx, rx, ry, ry, static_cast<uint32_t>(h.verts.size()), 0});
+                      auto& pc = h.pieces.back();
+                      pc.x0 = std::min(pc.x0, rx); pc.x1 = std::max(pc.x1, rx);
+                      pc.y0 = std::min(pc.y0, ry); pc.y1 = std::max(pc.y1, ry);
+                      ++pc.count;
+                      h.verts.push_back(v);
+                      h.ys.push_back(kind <= 1u ? v + 4 : v + 2);
+                      h.kinds.push_back(static_cast<uint8_t>(kind));
+                      h.uvs.push_back(uv);
+                      h.filters.push_back(h.mmag[(prim >> 9) & 1u]);
+                      // The rev needle: AA1 alpha-blended untextured strip 0x2cc in
+                      // the dial's quarter (measured at (222,66)); menus draw
+                      // AA1 0x284 anywhere and 0x2cc near the centre.
+                      if (prim == 0x2ccu && (rx >> 4) >= 100 && (ry >> 4) >= 0)
+                      {
+                          h.race_seen = true;
+                          h.race_prim = prim;
+                          h.race_x = rx >> 4;
+                          h.race_y = ry >> 4;
+                      }
+                  },
+                  [&](uint32_t, uint32_t addr, uint8_t* data) {
+                      // TEX1_1 / TEX1_2: MMAG is bit 5.
+                      if (addr == 0x14u || addr == 0x15u)
+                          h.mmag[addr - 0x14u] = static_cast<uint8_t>((data[0] >> 5) & 1u);
+                      // Quest VR diagnostic: every SCISSOR_1/2 value seen while the VR HUD is on.
+                      if ((addr == 0x40u || addr == 0x41u) && rrv_quest_hud::vr_scale.load(std::memory_order_relaxed) > 0.0f)
+                      {
+                          static std::vector<uint64_t> seen;
+                          uint64_t value;
+                          std::memcpy(&value, data, 8);
+                          if (seen.size() < 64 && std::find(seen.begin(), seen.end(), value) == seen.end())
+                          {
+                              seen.push_back(value);
+                              std::fprintf(stderr, "[quest-hud] path %u SCISSOR_%u x %u..%u y %u..%u (race %d)\n", path,
+                                           addr - 0x3fu, static_cast<unsigned>(value & 0x7ff),
+                                           static_cast<unsigned>((value >> 16) & 0x7ff), static_cast<unsigned>((value >> 32) & 0x7ff),
+                                           static_cast<unsigned>((value >> 48) & 0x7ff), h.race_active ? 1 : 0);
+                          }
+                      }
+                  });
+    // Everything below writes only through verts / ys / uvs: copy now and point those into the copy.
+    const bool copied = !h.pieces.empty();
+    if (copied)
+    {
+        h.scratch.assign(bytes, bytes + size_bytes);
+        uint8_t* const base = h.scratch.data();
+        const auto rebase = [&](std::vector<uint8_t*>& ptrs) {
+            for (uint8_t*& q : ptrs)
+                if (q)
+                    q = base + (q - bytes);
+        };
+        rebase(h.verts);
+        rebase(h.ys);
+        rebase(h.uvs);
+    }
+    constexpr int32_t kGapX = 24 << 4, kGapY = 8 << 4, kEdge = 312 << 4, kHalf = 320 << 4, kMiddle = 107 << 4;
+    // Draw-order layers (arrival order across transfers): a full-width piece
+    // is numbered with the count of full-width pieces before it, so it closes
+    // the layer below it and everything drawn after it is one layer higher.
+    for (auto& pc : h.pieces)
+    {
+        pc.layer = h.wide_pieces;
+        if (pc.x0 <= -kEdge && pc.x1 >= kEdge)
+            ++h.wide_pieces;
+    }
+    const auto anchor_of = [&](int32_t x0, int32_t x1, uint32_t layer) {
+        const int32_t cx = (x0 + x1) / 2;
+        // Race: over a full-width cover (layer > 0), a group touching neither screen edge is centred.
+        const bool over_cover = h.race_active && layer > 0 && x0 > -kEdge && x1 < kEdge;
+        return (!h.edges || over_cover || (cx > -kMiddle && cx < kMiddle)) ? 0 : (cx < 0 ? -kHalf : kHalf);
+    };
+    // pin: inside a composition wider than the screen, an untextured panel's
+    // vertex on or past the screen edge stays there (menu backgrounds, info
+    // boxes and bars keep running edge to edge; measured on the entry,
+    // team-colour and class-select menus); textured pictures keep their shape.
+    const auto transform_piece = [&](const HudScaleV1::Piece& pc, int32_t anchor, bool pin) {
+        // A textured sprite counts as a panel when it stretches its texture
+        // (more than 1.5 px per texel across): the grey menu info box is one;
+        // pictures such as the team-colour cards map about 1:1 and keep shape.
+        bool pin_this = pin && ((pc.prim >> 4) & 1u) == 0;
+        if (pin && !pin_this && (pc.prim & 7u) == 6u && ((pc.prim >> 8) & 1u) != 0 && pc.count >= 2)
+        {
+            uint8_t* ua = h.uvs[pc.first];
+            uint8_t* ub = h.uvs[pc.first + 1];
+            if (ua && ub && ua != ub)
+            {
+                uint32_t wa, wb;
+                std::memcpy(&wa, ua, 4);
+                std::memcpy(&wb, ub, 4);
+                const int32_t du = std::abs(static_cast<int32_t>(wb & 0x3fffu) - static_cast<int32_t>(wa & 0x3fffu));
+                pin_this = (pc.x1 - pc.x0) * 2 > du * 3;
+            }
+        }
+        // Sprite coverage (RRV_PCSX2_GS_SPRITE_FILTER=even). PCSX2 draws a
+        // point-sampled textured piece with every host pixel taking the texels
+        // under its own area and puts the piece's edges on host pixels itself,
+        // so a moved piece comes out as the unmoved picture resampled when its
+        // texture coordinates are the ones of the unmoved piece. (Before this,
+        // measured 2026-10-12 on race field 4000 at 16:9, hud = fixed, scale 4:
+        // a bar after "POSITION", the colon of "1:" drawn twice, the next glyph
+        // inside the "0" of the lap record, a dotted line under the apostrophe
+        // of the total time; none of them at 4:3.)
+        // Triangles keep their ST / UV. A sprite needs more: PCSX2 finds the
+        // texels a point-sampled sprite spans from its first and last NATIVE
+        // pixel (RoundSpriteOffset), which a moved sprite no longer has (0.75
+        // pixel per texel: it took the wrong first or last texel). So that step
+        // is done here on the game's own X, the result is written to U, and the
+        // sprite is marked for PCSX2 to leave its U alone
+        // (GSRrvMarkAlignedSprite; V still comes from Y there). The arithmetic
+        // is RoundSpriteOffset's, with X taken as it is sent: RR5's
+        // XYOFFSET.OFX is a whole number of pixels (0x6c00, 0).
+        // The filter is the TEX1 MMAG last written on PATH2/3 for the sprite's
+        // context when it arrived. A linear sprite, one whose filter was not
+        // seen, and every sprite with the filter set to ps2 keep the half-texel
+        // pull-in below. Pieces, elements and anchors do not depend on any of
+        // this.
+        SpriteCoverageV1& cov = SpriteCoverage();
+        const bool fst_sprite = !pin_this && (pc.prim & 7u) == 6u && ((pc.prim >> 4) & 1u) != 0 && ((pc.prim >> 8) & 1u) != 0;
+        const auto moved = [&](int32_t rx) {
+            if (vr_on)
+                return kCentre + static_cast<int32_t>(std::lround(anchor * vr_scale)) +
+                       static_cast<int32_t>(std::lround((rx - anchor) * vr_scale * vr_x));
+            return kCentre + anchor + static_cast<int32_t>(std::lround((rx - anchor) * h.factor));
+        };
+        std::vector<uint8_t>& aligned = h.aligned;
+        aligned.assign(pc.count, 0);
+        if (cov.on && fst_sprite)
+        {
+            const auto texel = [](float alpha, int32_t t0, int32_t t1) {
+                const float t = (1.0f - alpha) * static_cast<float>(t0) + alpha * static_cast<float>(t1);
+                return static_cast<int32_t>(static_cast<uint16_t>(t)) & ~0xF;
+            };
+            for (uint32_t n = 0; n + 1 < pc.count; n += 2)
+            {
+                uint8_t* ua = h.uvs[pc.first + n];
+                uint8_t* ub = h.uvs[pc.first + n + 1];
+                uint16_t xa, xb;
+                std::memcpy(&xa, h.verts[pc.first + n], 2);
+                std::memcpy(&xb, h.verts[pc.first + n + 1], 2);
+                if (!ua || !ub || ua == ub)
+                    continue;
+                if (h.filters[pc.first + n + 1] != 0u)
+                {
+                    cov.hud_unknown += h.filters[pc.first + n + 1] == 2u ? 1u : 0u;
+                    continue;
+                }
+                if (xb <= xa)
+                    continue;
+                uint32_t wa, wb;
+                std::memcpy(&wa, ua, 4);
+                std::memcpy(&wb, ub, 4);
+                const int32_t x0 = xa, x1 = xb, length = x1 - x0;
+                const int32_t u0 = static_cast<int32_t>(wa & 0x3fffu), u1 = static_cast<int32_t>(wb & 0x3fffu);
+                const float a0 = static_cast<float>(((x0 + 15) & ~0xF) - x0) / static_cast<float>(length);
+                const float a1 = static_cast<float>(((x1 - 1) & ~0xF) - x0) / static_cast<float>(length);
+                const int32_t t0 = texel(a0, u0, u1), t1 = texel(a1, u0, u1);
+                const int32_t nu0 = t0 <= t1 ? t0 : t0 + 16, nu1 = t0 <= t1 ? t1 + 16 : t1;
+                if (nu0 > 0x3fff || nu1 > 0x3fff)
+                    continue;
+                wa = (wa & ~0x3fffu) | static_cast<uint32_t>(nu0);
+                wb = (wb & ~0x3fffu) | static_cast<uint32_t>(nu1);
+                std::memcpy(ua, &wa, 4);
+                std::memcpy(ub, &wb, 4);
+                GSRrvMarkAlignedSprite(GSRrvSpriteKey(static_cast<uint16_t>(moved(x0 - kCentre)),
+                                                      static_cast<uint16_t>(moved(x1 - kCentre)),
+                                                      static_cast<uint16_t>(nu0), static_cast<uint16_t>(nu1)));
+                aligned[n] = 1;
+                ++cov.hud_sprites;
+            }
+        }
+        for (uint32_t n = 0; n < pc.count; ++n)
+        {
+            uint8_t* v = h.verts[pc.first + n];
+            uint16_t x;
+            std::memcpy(&x, v, 2);
+            const int32_t rx = static_cast<int32_t>(x) - kCentre;
+            if (vr_on)
+            {
+                // VR: the piece moves into the middle box, Y included (a pinned panel edge goes
+                // to the box edge).
+                const int32_t ox = pin_this && (rx <= -kEdge || rx >= kEdge)
+                                       ? kCentre + static_cast<int32_t>(std::lround(rx * vr_scale))
+                                       : moved(rx);
+                const uint16_t out = static_cast<uint16_t>(ox);
+                std::memcpy(v, &out, 2);
+                uint16_t y;
+                std::memcpy(&y, h.ys[pc.first + n], 2);
+                const int32_t ry = static_cast<int32_t>(y) - kCentre;
+                const uint16_t oy = static_cast<uint16_t>(kCentre + static_cast<int32_t>(std::lround(ry * vr_scale)));
+                std::memcpy(h.ys[pc.first + n], &oy, 2);
+                continue;
+            }
+            if (pin_this && (rx <= -kEdge || rx >= kEdge))
+                continue; // panels keep running off the edge; pictures keep their shape
+            const uint16_t out = static_cast<uint16_t>(moved(rx));
+            std::memcpy(v, &out, 2);
+        }
+        // A squeezed textured sprite samples between texels; pull its U range
+        // in by half a texel at each end so the filter never reaches the
+        // neighbouring texels of the texture sheet (measured: 1-pixel slivers
+        // at the right edge of digits, dial and minimap).
+        if (pin_this || (pc.prim & 7u) != 6u || ((pc.prim >> 4) & 1u) == 0 || ((pc.prim >> 8) & 1u) == 0)
+            return;
+        // Quest VR: the sprite is squeezed vertically too, and PCSX2 keeps its V (GSRrvSetHudVr):
+        // the same half-texel pull-in for V (measured: the next texture row as a faint line under
+        // the race labels).
+        if (vr_on)
+            for (uint32_t n = 0; n + 1 < pc.count; n += 2)
+            {
+                uint8_t* ua = h.uvs[pc.first + n];
+                uint8_t* ub = h.uvs[pc.first + n + 1];
+                if (!ua || !ub || ua == ub)
+                    continue;
+                uint8_t* va = ua + (h.kinds[pc.first + n] <= 1u ? 4 : 2);
+                uint8_t* vb = ub + (h.kinds[pc.first + n + 1] <= 1u ? 4 : 2);
+                uint16_t wa, wb;
+                std::memcpy(&wa, va, 2);
+                std::memcpy(&wb, vb, 2);
+                int32_t ta = wa & 0x3fff, tb = wb & 0x3fff;
+                if (std::abs(tb - ta) <= 16)
+                    continue;
+                const int32_t d = ta < tb ? 8 : -8;
+                ta += d;
+                tb -= d;
+                wa = static_cast<uint16_t>((wa & ~0x3fffu) | static_cast<uint32_t>(ta & 0x3fff));
+                wb = static_cast<uint16_t>((wb & ~0x3fffu) | static_cast<uint32_t>(tb & 0x3fff));
+                std::memcpy(va, &wa, 2);
+                std::memcpy(vb, &wb, 2);
+            }
+        for (uint32_t n = 0; n + 1 < pc.count; n += 2)
+        {
+            uint8_t* ua = h.uvs[pc.first + n];
+            uint8_t* ub = h.uvs[pc.first + n + 1];
+            if (!ua || !ub || ua == ub || aligned[n])
+                continue;
+            uint32_t wa, wb;
+            std::memcpy(&wa, ua, 4);
+            std::memcpy(&wb, ub, 4);
+            int32_t ta = static_cast<int32_t>(wa & 0x3fffu), tb = static_cast<int32_t>(wb & 0x3fffu);
+            if (std::abs(tb - ta) <= 16)
+                continue;
+            const int32_t d = ta < tb ? 8 : -8;
+            ta += d;
+            tb -= d;
+            wa = (wa & ~0x3fffu) | static_cast<uint32_t>(ta & 0x3fff);
+            wb = (wb & ~0x3fffu) | static_cast<uint32_t>(tb & 0x3fff);
+            std::memcpy(ua, &wa, 4);
+            std::memcpy(ub, &wb, 4);
+        }
+    };
+    if (h.race_only && !h.race_active)
+    {
+        for (const auto& pc : h.pieces)
+            h.field_pieces.push_back({pc.x0, pc.x1, pc.y0, pc.y1, pc.layer});
+        return bytes; // menus stay stretched in race-only mode
+    }
+    // Pieces matched to the previous field's elements.
+    std::vector<int32_t> match(h.pieces.size(), -1);
+    for (size_t k = 0; k < h.pieces.size(); ++k)
+    {
+        const auto& pc = h.pieces[k];
+        h.field_pieces.push_back({pc.x0, pc.x1, pc.y0, pc.y1, pc.layer});
+        int64_t best = 0;
+        int64_t best_area = 0;
+        for (size_t e = 0; e < h.prev_elements.size(); ++e)
+        {
+            // Race: only elements of the piece's own draw-order layer.
+            if (h.race_active && h.prev_elements[e].layer != pc.layer)
+                continue;
+            const auto& b = h.prev_elements[e].box;
+            const int64_t ox = std::min(pc.x1, b.x1) - std::max(pc.x0, b.x0) + (2 << 4);
+            const int64_t oy = std::min(pc.y1, b.y1) - std::max(pc.y0, b.y0) + (2 << 4);
+            // During a race, on equal overlap the element with the smaller box
+            // wins (a piece that fits a letter's element and a wider one
+            // belongs to the tighter one; at pause it moves the pause pieces
+            // off the full-width dim quad). Outside a race the match is
+            // exactly the first-best rule: the first version of this tie-break
+            // was not gated and changed hud=fixed menus (team-card pieces
+            // moved from the centre element to the full-width background;
+            // measured 2026-10-11).
+            const int64_t area = static_cast<int64_t>(b.x1 - b.x0) * (b.y1 - b.y0);
+            if (ox > 0 && oy > 0 && (ox * oy > best || (h.race_active && ox * oy == best && area < best_area)))
+            {
+                best = ox * oy;
+                best_area = area;
+                match[k] = static_cast<int32_t>(e);
+            }
+        }
+    }
+    size_t i = 0;
+    while (i < h.pieces.size())
+    {
+        if (match[i] >= 0)
+        {
+            const auto& el = h.prev_elements[static_cast<size_t>(match[i])];
+            if (!el.full_width)
+                transform_piece(h.pieces[i], el.anchor, el.pin);
+            ++i;
+            continue;
+        }
+        // No previous element: group the unmatched pieces of this transfer.
+        int32_t x0 = h.pieces[i].x0, x1 = h.pieces[i].x1, y0 = h.pieces[i].y0, y1 = h.pieces[i].y1;
+        size_t j = i + 1;
+        const bool first_wide = x0 <= -kEdge && x1 >= kEdge;
+        for (; !first_wide && j < h.pieces.size() && match[j] < 0; ++j)
+        {
+            const auto& pc = h.pieces[j];
+            if (pc.x0 <= -kEdge && pc.x1 >= kEdge)
+                break;
+            if (h.race_active && pc.layer != h.pieces[i].layer)
+                break; // race: the group does not cross a layer change
+            if (pc.x0 - x1 > kGapX || x0 - pc.x1 > kGapX || pc.y0 - y1 > kGapY || y0 - pc.y1 > kGapY)
+                break;
+            // Race: do not grow the group across an edge and the middle band
+            // (the same rule as the clustering in HudScaleFieldEnd).
+            const int32_t nx0 = std::min(x0, pc.x0), nx1 = std::max(x1, pc.x1);
+            if (h.race_active && ((nx0 <= -kEdge && nx1 > -kMiddle) || (nx1 >= kEdge && nx0 < kMiddle)))
+                break;
+            x0 = nx0; x1 = nx1;
+            y0 = std::min(y0, pc.y0); y1 = std::max(y1, pc.y1);
+        }
+        const bool spans = x0 <= -kEdge && x1 >= kEdge;
+        if (!spans || j - i > 1)
+            for (size_t k = i; k < j; ++k)
+                transform_piece(h.pieces[k], spans ? 0 : anchor_of(x0, x1, h.pieces[i].layer), spans);
+        i = j;
+    }
+    return copied ? h.scratch.data() : bytes;
+}
+
+// RRV_GS_BUSY: time the GS owner thread spends inside the bridge (submit, readbacks, vsync) per
+// field. The field-skip decision uses it instead of wall time: the GS runs a field behind the game,
+// so wall-clock lag carries a constant offset that would read as "behind" in light scenes too.
+static std::atomic<uint64_t> g_rrv_busy_ns{0};
+// Only differences of it are used (busy time per field). On arm64 it reads the generic timer
+// directly: the GS thread calls this twice per submit, and steady_clock::now() through the vDSO was
+// 4.8% of the GS owner thread in the City 1 race start on the Quest 3 (simpleperf, 2026-10-29).
+static uint64_t RrvNowNs()
+{
+#if defined(__aarch64__)
+    static const uint64_t mult = [] { // ns per tick, 32.32 fixed point
+        uint64_t f;
+        asm volatile("mrs %0, cntfrq_el0" : "=r"(f));
+        return static_cast<uint64_t>((static_cast<unsigned __int128>(1000000000u) << 32) / (f ? f : 19200000u));
+    }();
+    uint64_t t;
+    asm volatile("mrs %0, cntvct_el0" : "=r"(t));
+    return static_cast<uint64_t>((static_cast<unsigned __int128>(t) * mult) >> 32);
+#else
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+#endif
+}
+struct RrvBusyScope
+{
+    uint64_t t0 = RrvNowNs();
+    ~RrvBusyScope() { g_rrv_busy_ns.fetch_add(RrvNowNs() - t0, std::memory_order_relaxed); }
+};
+
+// GT4 VR overlay panel (RRV_PCSX2_GS_GAME=gt4, Quest immersive race view; Wipeout Pure VR's HUD
+// rectangle): the frame covers the headset's whole field of view, so GT4's 2D layer (race HUD,
+// pause menu) is shrunk into a head-locked panel in the middle, x by vr_scale * vr_x and y by
+// vr_scale about the screen centre (quest/bridge/android_stereo.cpp set_hud_vr). GT4 draws its 3D
+// into its own target (ZTST GEQUAL/GREATER), copies it into the display buffer with textured
+// sprites (the composite), then draws the 2D layer there with ZTST ALWAYS. So per field: targets
+// drawn with a depth test are 3D; a textured draw sourced from a 3D target into another buffer is
+// the composite; after it, ZTST ALWAYS draws into that buffer are the 2D layer and are moved.
+// Untested-Z draws there (the pause menu's full-screen dimming) stay as they are. Measured on the
+// Nurburgring race state (PS2_CAPTURE, 2026-10-30): 3D FBP 0xD2, composite TBP 0x1A40 -> FBP 0
+// (20 sprites), HUD/pause 2D in FBP 0 with TEST 0x3820C/0x3840C/0x3840D.
+namespace gt4_overlay
+{
+struct Ctx
+{
+    uint64_t frame = 0, test = 0, tex0 = 0, xyoffset = 0, scissor = 0;
+};
+struct State
+{
+    bool on = false; // GT4 profile
+    Ctx ctx[2];
+    uint32_t targets3d[8] = {};
+    uint32_t target_count = 0;
+    int32_t overlay_fbp = -1; // the composite's destination this field, -1 = not seen yet
+    int32_t composite_tbp = -1; // the composite's source (the main 3D target), this field
+    int32_t displayed[4] = {-1, -1, -1, -1}; // frame buffers the CRTC showed recently
+    uint32_t displayed_next = 0;
+    int32_t candidate_fbp = -1, cand_x0 = 0, cand_x1 = 0, cand_y0 = 0, cand_y1 = 0;
+    gifwalk::PathState walk[4];
+    std::vector<uint8_t> scratch;
+    uint64_t moved = 0, fields = 0;
+    bool dirty[2] = {true, true};
+    // HUD rectangles of this field (GS window coordinates 12.4 after the move): the stereo gives
+    // them one depth (GSRrvSetStereoHudRects). A rectangle grows while vertices of the same GIF
+    // tag stay within kJoin of it.
+    struct Rect { int32_t x0, y0, x1, y1; uint64_t tag; };
+    std::vector<Rect> rects;
+    std::vector<float> published;
+    int32_t tune_cx = 0, tune_cy = 0;
+    uint32_t logged_centre = 0;
+};
+
+State& Get()
+{
+    static State st = [] {
+        State v;
+        const char* game = std::getenv("RRV_PCSX2_GS_GAME");
+        v.on = game && std::strcmp(game, "gt4") == 0;
+        return v;
+    }();
+    return st;
+}
+
+bool IsDisplayed(const State& st, uint32_t fbp)
+{
+    for (uint32_t i = 0; i < 4; ++i)
+        if (st.displayed[i] == static_cast<int32_t>(fbp))
+            return true;
+    return false;
+}
+
+// At vsync: remember the frame buffers the CRTC reads (DISPFB1/2 with PMODE EN1/EN2).
+void NoteDisplay(const uint64_t* regs)
+{
+    State& st = Get();
+    if (!st.on || !regs)
+        return;
+    const uint64_t pmode = regs[0];
+    for (int circuit = 0; circuit < 2; ++circuit)
+    {
+        if (!((pmode >> circuit) & 1u))
+            continue;
+        const int32_t fbp = static_cast<int32_t>(regs[circuit == 0 ? 7 : 9] & 0x1ffu);
+        if (!IsDisplayed(st, static_cast<uint32_t>(fbp)))
+        {
+            st.displayed[st.displayed_next & 3u] = fbp;
+            ++st.displayed_next;
+        }
+    }
+}
+
+bool Is3d(const State& st, uint32_t fbp)
+{
+    for (uint32_t i = 0; i < st.target_count; ++i)
+        if (st.targets3d[i] == fbp)
+            return true;
+    return false;
+}
+
+void Note3d(State& st, const Ctx& c)
+{
+    const uint32_t zte = static_cast<uint32_t>(c.test >> 16) & 1u, ztst = static_cast<uint32_t>(c.test >> 17) & 3u;
+    if (!zte || ztst < 2u)
+        return;
+    const uint32_t fbp = static_cast<uint32_t>(c.frame) & 0x1ffu;
+    if (!Is3d(st, fbp) && st.target_count < 8u)
+        st.targets3d[st.target_count++] = fbp;
+}
+
+// Right before GSvsync: hand this field's HUD rectangles (UV of the composite = the presented
+// frame, padded by 2 GS pixels) to the stereo, or none when the panel is off.
+void PublishHudRects()
+{
+    State& st = Get();
+    if (!st.on)
+        return;
+    st.published.clear();
+    const float w = static_cast<float>(st.cand_x1 - st.cand_x0), h = static_cast<float>(st.cand_y1 - st.cand_y0);
+    const bool layer_on = rrv_quest_hud::vr_scale.load(std::memory_order_relaxed) > 0.0f;
+    if (layer_on && st.overlay_fbp >= 0 && w > 0.0f && h > 0.0f)
+    {
+        constexpr int32_t kPad = 2 << 4;
+        for (const State::Rect& r : st.rects)
+        {
+            st.published.push_back(std::clamp(static_cast<float>(r.x0 - kPad - st.cand_x0) / w, 0.0f, 1.0f));
+            st.published.push_back(std::clamp(static_cast<float>(r.y0 - kPad - st.cand_y0) / h, 0.0f, 1.0f));
+            st.published.push_back(std::clamp(static_cast<float>(r.x1 + kPad - st.cand_x0) / w, 0.0f, 1.0f));
+            st.published.push_back(std::clamp(static_cast<float>(r.y1 + kPad - st.cand_y0) / h, 0.0f, 1.0f));
+        }
+    }
+    GSRrvSetStereoHudRects(st.published.data(), static_cast<u32>(st.published.size() / 4u));
+    if (st.fields % 600u == 1u && !st.published.empty())
+        std::fprintf(stderr, "[gt4-overlay] %zu HUD rectangles get the stereo's nearest depth\n", st.published.size() / 4u);
+    st.rects.clear();
+}
+
+void FieldEnd()
+{
+    State& st = Get();
+    if (!st.on)
+        return;
+    ++st.fields;
+#if defined(__ANDROID__)
+    // Live tuning of the panel's centre (GS pixels): adb shell setprop debug.gt4vr.hudcx/hudcy N
+    if (st.fields % 30u == 0u)
+    {
+        char value[PROP_VALUE_MAX] = {};
+        st.tune_cx = __system_property_get("debug.gt4vr.hudcx", value) > 0 ? std::atoi(value) : 0;
+        value[0] = 0;
+        // Default 0: the composite's middle (-112 only compensated the half-picture bug that
+        // ps2-web-recomp's SMODE2 FFMD fix removed).
+        st.tune_cy = __system_property_get("debug.gt4vr.hudcy", value) > 0 ? std::atoi(value) : 0;
+    }
+#endif
+    if (st.fields % 600u == 0u && rrv_quest_hud::vr_scale.load(std::memory_order_relaxed) > 0.0f)
+        std::fprintf(stderr, "[gt4-overlay] panel: %llu 2D vertices moved in 600 fields, overlay buffer %d, 3D targets %u\n",
+                     static_cast<unsigned long long>(st.moved), st.overlay_fbp, st.target_count);
+    if (st.fields % 600u == 0u)
+        st.moved = 0;
+    st.target_count = 0;
+    st.overlay_fbp = -1;
+    st.composite_tbp = -1;
+    st.candidate_fbp = -1;
+}
+
+const uint8_t* Apply(uint32_t path, const uint8_t* bytes, uint32_t size_bytes)
+{
+    State& st = Get();
+    if (!st.on || size_bytes == 0u)
+        return bytes;
+    const float scale = rrv_quest_hud::vr_scale.load(std::memory_order_relaxed);
+    const float sx = scale * rrv_quest_hud::vr_x.load(std::memory_order_relaxed), sy = scale;
+    // scale > 0: immersive VR (the HUD rectangles get one stereo depth); below 1 the 2D layer is
+    // also shrunk into the middle panel. scale 1 = the game's own HUD layout (owner 2026-10-30).
+    const bool layer_on = scale > 0.0f;
+    const bool panel = layer_on && scale < 1.0f;
+    // Copy on write: the walk reads the caller's bytes; the first moved vertex copies the packet
+    // and every write goes to the same offset in the copy (most packets, the 3D, stay uncopied).
+    uint8_t* const src = const_cast<uint8_t*>(bytes);
+    bool copied = false;
+    const auto writable = [&](uint8_t* p) {
+        if (!copied)
+        {
+            st.scratch.assign(bytes, bytes + size_bytes);
+            copied = true;
+        }
+        return st.scratch.data() + (p - src);
+    };
+    gifwalk::Walk(
+        st.walk[path], path, src, size_bytes / 16u,
+        [&](uint32_t, uint32_t prim, uint8_t* v, uint32_t kind, uint64_t tag, uint8_t*) {
+            const uint32_t ci = (prim >> 9) & 1u;
+            const Ctx& c = st.ctx[ci];
+            if (st.dirty[ci])
+            {
+                // depth-tested draws mark their target as 3D (checked at the first vertex after a
+                // FRAME/TEST change: the two are written one after the other)
+                st.dirty[ci] = false;
+                Note3d(st, c);
+            }
+            const uint32_t fbp = static_cast<uint32_t>(c.frame) & 0x1ffu;
+            if (Is3d(st, fbp))
+                return;
+            if (st.overlay_fbp != static_cast<int32_t>(fbp))
+            {
+                // The composite: textured, sourced from a 3D target, into a buffer of its own, at
+                // least 600 pixels wide (post-effect tiles copy 64x32 pieces of the 3D target).
+                // Into a buffer the CRTC shows (DISPFB of recent fields: GT4 double-buffers), or, until
+                // the display is known, sourced from a 3D target. The source may be a post-effect
+                // copy of the 3D picture (near walls: owner 2026-10-30, the HUD jumped back to full
+                // size because the composite then came from a buffer without depth draws).
+                const uint32_t tbp = static_cast<uint32_t>(c.tex0) & 0x3fffu;
+                if (!(prim & 0x10u))
+                    return;
+                if (!IsDisplayed(st, fbp) && ((tbp & 31u) != 0u || !Is3d(st, tbp >> 5)))
+                    return;
+                uint16_t x, y;
+                std::memcpy(&x, v, 2);
+                std::memcpy(&y, kind <= 1u ? v + 4 : v + 2, 2);
+                if (st.candidate_fbp != static_cast<int32_t>(fbp))
+                {
+                    st.candidate_fbp = static_cast<int32_t>(fbp);
+                    st.cand_x0 = st.cand_x1 = x;
+                    st.cand_y0 = st.cand_y1 = y;
+                }
+                st.cand_x0 = std::min<int32_t>(st.cand_x0, x);
+                st.cand_x1 = std::max<int32_t>(st.cand_x1, x);
+                st.cand_y0 = std::min<int32_t>(st.cand_y0, y);
+                st.cand_y1 = std::max<int32_t>(st.cand_y1, y);
+                if (st.cand_x1 - st.cand_x0 >= (600 << 4))
+                {
+                    st.overlay_fbp = static_cast<int32_t>(fbp);
+                    st.composite_tbp = static_cast<int32_t>(tbp);
+                }
+                return;
+            }
+            const uint32_t zte = static_cast<uint32_t>(c.test >> 16) & 1u, ztst = static_cast<uint32_t>(c.test >> 17) & 3u;
+            if (!layer_on || !zte || ztst != 1u)
+                return;
+            // Never the 3D picture itself: the composite (20 strips, ZTST ALWAYS too) stays full size
+            // (owner 2026-10-30: the race scene showed again inside the panel and flickered). Only the
+            // composite's own source: GT4 reuses other 3D targets' memory (city course env maps) for
+            // HUD and menu textures, which must still move (else: big dark bars behind the pause menu,
+            // empty position box).
+            if ((prim & 0x10u) && st.composite_tbp >= 0 &&
+                static_cast<int32_t>(static_cast<uint32_t>(c.tex0) & 0x3fffu) == st.composite_tbp)
+                return;
+            // Move the vertex towards the screen centre (GS window coordinates, 12.4) = the middle
+            // of the composite (it covers the whole picture; XYOFFSET + 320 x 224 put the panel at
+            // the bottom on the Quest).
+            const int32_t cx = (st.cand_x0 + st.cand_x1) / 2 + st.tune_cx * 16;
+            const int32_t cy = (st.cand_y0 + st.cand_y1) / 2 + st.tune_cy * 16;
+            uint8_t* px = v;
+            uint8_t* py = kind <= 1u ? v + 4 : v + 2;
+            uint16_t x, y;
+            std::memcpy(&x, px, 2);
+            std::memcpy(&y, py, 2);
+            const int32_t x0 = x, y0 = y;
+            // Game layout (no panel): nothing moves, only the HUD rectangle is recorded below.
+            const int32_t nx = panel ? cx + static_cast<int32_t>(std::lround((static_cast<int32_t>(x) - cx) * sx)) : x0;
+            const int32_t ny = panel ? cy + static_cast<int32_t>(std::lround((static_cast<int32_t>(y) - cy) * sy)) : y0;
+            if (panel)
+            {
+                x = static_cast<uint16_t>(std::clamp(nx, 0, 0xffff));
+                y = static_cast<uint16_t>(std::clamp(ny, 0, 0xffff));
+                std::memcpy(writable(px), &x, 2);
+                std::memcpy(writable(py), &y, 2);
+                ++st.moved;
+            }
+            {
+                constexpr int32_t kJoin = 24 << 4; // GS pixels: glyphs of one string join
+                const int32_t vx = x, vy = y;
+                if (!st.rects.empty())
+                {
+                    State::Rect& r = st.rects.back();
+                    if (r.tag == tag && vx >= r.x0 - kJoin && vx <= r.x1 + kJoin && vy >= r.y0 - kJoin && vy <= r.y1 + kJoin)
+                    {
+                        r.x0 = std::min(r.x0, vx);
+                        r.x1 = std::max(r.x1, vx);
+                        r.y0 = std::min(r.y0, vy);
+                        r.y1 = std::max(r.y1, vy);
+                        return;
+                    }
+                }
+                if (st.rects.size() < 256u)
+                    st.rects.push_back({vx, vy, vx, vy, tag});
+            }
+            if (st.logged_centre < 3u && st.fields > 600u * st.logged_centre)
+            {
+                ++st.logged_centre;
+                std::fprintf(stderr, "[gt4-overlay] first moved vertex: centre %d,%d (%s), %d,%d -> %d,%d\n", cx >> 4,
+                             cy >> 4, "composite middle", x0 >> 4, y0 >> 4, nx >> 4, ny >> 4);
+            }
+        },
+        [&](uint32_t, uint32_t addr, uint8_t* d) {
+            uint64_t value;
+            std::memcpy(&value, d, 8);
+            switch (addr)
+            {
+            case 0x06: case 0x07: st.ctx[addr - 0x06].tex0 = value; break;
+            case 0x18: case 0x19: st.ctx[addr - 0x18].xyoffset = value; break;
+            case 0x47: case 0x48: st.ctx[addr - 0x47].test = value; st.dirty[addr - 0x47] = true; break;
+            case 0x4c: case 0x4d: st.ctx[addr - 0x4c].frame = value; st.dirty[addr - 0x4c] = true; break;
+            default: break;
+            }
+        });
+    return copied ? st.scratch.data() : bytes;
+}
+} // namespace gt4_overlay
+
+extern "C" int rrv_pcsx2_gs_bridge_submit(
+    RrvPcsx2GsBridge* bridge, uint32_t path_id, const uint8_t* gif_bytes,
+    uint32_t size_bytes, char* error, uint32_t error_capacity)
+{
+    const RrvBusyScope rrv_busy; // RRV_GS_BUSY
+    if (!bridge || !bridge->open)
+    {
+        SetError(error, error_capacity, "PCSX2 GS bridge is not initialized");
+        return 0;
+    }
+    if (path_id < 1 || path_id > 3)
+    {
+        SetError(error, error_capacity, "invalid post-arbitration GIF path %u", path_id);
+        return 0;
+    }
+    if ((size_bytes != 0 && !gif_bytes) || (size_bytes & 0x0f) != 0)
+    {
+        SetError(error, error_capacity, "GIF packet must be non-null and 16-byte aligned in size (got %u)", size_bytes);
+        return 0;
+    }
+
+    // GSDumpReplayer at the pinned revision dispatches staged GSPackets through
+    // Transfer<3>; GSgifTransfer is that exported API. Its size is QWC, so the
+    // ABI's byte length is divided only after the validated 16-byte alignment.
+    // Re-selecting Transfer 1/2/3 here would incorrectly treat post-arbitrated
+    // bytes as DMA input.
+    if (size_bytes != 0 && (path_id == 1u || path_id == 3u) &&
+        !bridge->fpcr_path_logged[path_id])
+    {
+        bridge->fpcr_path_logged[path_id] = true;
+        const FPControlRegister ambient = FPControlRegister::GetCurrent();
+        std::fprintf(stderr,
+                     "[pcsx2-gs-bridge:fpcr] first-submit path=%u ambient=0x%llx "
+                     "round=%u ftz=%u isolated=%u\n",
+                     path_id, static_cast<unsigned long long>(ambient.bitmask),
+                     static_cast<unsigned>(ambient.GetRoundMode()),
+                     ambient.GetFlushToZero() ? 1u : 0u, bridge->fp_isolated ? 1u : 0u);
+    }
+    HudStatsObserve(path_id, gif_bytes, size_bytes);
+    // Canonical receipts below still acknowledge the caller's original bytes.
+    const uint8_t* const original_gif_bytes = gif_bytes;
+    gif_bytes = HudScaleApply(path_id, gif_bytes, size_bytes);
+    gif_bytes = gt4_overlay::Apply(path_id, gif_bytes, size_bytes);
+    (void)original_gif_bytes;
+    const ScopedBridgeGsFpcr fpcr_guard(bridge->fp_isolated);
+    if (Gate4GsObserverV1& obs = Gate4GsObserver(); obs.enabled)
+    {
+        uint64_t before[2], after[2];
+        std::memcpy(&before[0], bridge->pcsx2_regs.data() + kPcsx2Offsets[15], sizeof(uint64_t));
+        std::memcpy(&before[1], bridge->pcsx2_regs.data() + kPcsx2Offsets[18], sizeof(uint64_t));
+        const uint64_t t0 = Gate4GsObserverV1::Now();
+        if (size_bytes != 0)
+            GSgifTransfer(gif_bytes, size_bytes / 16u);
+        obs.open_field.gif_ns += Gate4GsObserverV1::Now() - t0;
+        ++obs.open_field.packets;
+        obs.open_field.bytes += size_bytes;
+        std::memcpy(&after[0], bridge->pcsx2_regs.data() + kPcsx2Offsets[15], sizeof(uint64_t));
+        std::memcpy(&after[1], bridge->pcsx2_regs.data() + kPcsx2Offsets[18], sizeof(uint64_t));
+        obs.open_field.result_changes += (before[0] != after[0] || before[1] != after[1]) ? 1u : 0u;
+    }
+    else if (size_bytes != 0)
+        GSgifTransfer(gif_bytes, size_bytes / 16u);
+#if defined(RRV_PCSX2_GS_CANONICAL_RECEIPTS)
+    // GSgifTransfer directly executes GSState::Transfer<3> in this bridge; no
+    // MTGS queue exists on this call path. Record only after that synchronous
+    // consumer returned, never merely after bridge ingress.
+    if (size_bytes != 0u &&
+        !bridge->canonical_receipt.acknowledgeTransfer(path_id, original_gif_bytes, size_bytes))
+    {
+        SetError(error, error_capacity,
+                 "canonical consumer receipt overflowed or rejected a consumed transfer");
+        return 0;
+    }
+    if (size_bytes != 0u && bridge->receipt_boundary_ordering.arm_scheduled != 0u)
+        NoteConsumerAcknowledgement(bridge,
+                                    static_cast<uint32_t>(rrv::pcsx2::receipt::EventType::Transfer),
+                                    true);
+#endif
+    return 1;
+}
+
+extern "C" int rrv_pcsx2_gs_bridge_reset_gs(
+    RrvPcsx2GsBridge* bridge, char* error, uint32_t error_capacity)
+{
+    if (!bridge || !bridge->open)
+    {
+        SetError(error, error_capacity, "PCSX2 GS bridge is not open for reset");
+        return 0;
+    }
+    // fd9d310c: GS.cpp::csrWrite calls MTGS::ResetGS(false); the consumer
+    // calls GSreset(false). This resets GSState's parser and draw environment
+    // but does not reset producer GIF progression or clear GS local memory.
+    const ScopedBridgeGsFpcr fpcr_guard(bridge->fp_isolated);
+    GSreset(false);
+    return 1;
+}
+
+extern "C" int rrv_pcsx2_gs_bridge_readback(
+    RrvPcsx2GsBridge* bridge, uint64_t* csr, uint64_t* siglblid,
+    char* error, uint32_t error_capacity)
+{
+    const RrvBusyScope rrv_busy; // RRV_GS_BUSY
+    if (!bridge || !bridge->open || !csr || !siglblid)
+    {
+        SetError(error, error_capacity, "PCSX2 GS bridge or readback outputs are null");
+        return 0;
+    }
+    std::memcpy(csr, bridge->pcsx2_regs.data() + kPcsx2Offsets[15], sizeof(*csr));
+    std::memcpy(siglblid, bridge->pcsx2_regs.data() + kPcsx2Offsets[18], sizeof(*siglblid));
+    if (Gate4GsObserverV1& obs = Gate4GsObserver(); obs.enabled)
+        ++obs.open_field.readbacks;
+    return 1;
+}
+
+extern "C" int rrv_pcsx2_gs_bridge_read_local_memory(
+    RrvPcsx2GsBridge* bridge, uint8_t* dst, uint32_t byte_count,
+    uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg,
+    char* error, uint32_t error_capacity)
+{
+    const RrvBusyScope rrv_busy; // RRV_GS_BUSY
+    if (!bridge || !bridge->open)
+    {
+        SetError(error, error_capacity, "PCSX2 GS bridge is not open");
+        return 0;
+    }
+    if (byte_count == 0u)
+    {
+        // A zero-byte result request has no guest transaction meaning.  In
+        // particular, it must not report success before checking the native
+        // local-to-host cursor or be mistaken for an acknowledged no-op.
+        SetError(error, error_capacity, "local-memory read requires a non-zero byte count");
+        return 0;
+    }
+    if (!dst)
+    {
+        SetError(error, error_capacity, "PCSX2 GS local-memory destination is null");
+        return 0;
+    }
+
+    // Keep the bridge allocation within the same fixed local-memory maximum
+    // enforced by GSState::RrvReadLocalMemoryChecked.  This check must happen
+    // before vector construction: the bridge is built without exceptions, so
+    // an attacker-controlled UINT32_MAX request must not reach allocation and
+    // terminate the process before the native adapter can reject it.
+    constexpr uint64_t kNativeLocalMemoryBytes = RRV_PCSX2_GS_BRIDGE_LOCAL_MEMORY_BYTES;
+    if (static_cast<uint64_t>(byte_count) > kNativeLocalMemoryBytes)
+    {
+        SetError(error, error_capacity, "local-memory read size %u exceeds native GS local memory", byte_count);
+        return 0;
+    }
+    const uint64_t qwc64 = (static_cast<uint64_t>(byte_count) + 15u) / 16u;
+    if (qwc64 == 0u || qwc64 > UINT32_MAX || qwc64 > static_cast<uint64_t>(SIZE_MAX) / 16u)
+    {
+        SetError(error, error_capacity, "local-memory read size %u is not representable", byte_count);
+        return 0;
+    }
+    const size_t fifo_bytes = static_cast<size_t>(qwc64 * 16u);
+
+    // PCSX2 owns the cursor created by the preceding guest TRXDIR=1. The
+    // maintained GS adapter compares these ABI provenance descriptors against
+    // both that cursor and the live GS environment, rejects no-active/upload/
+    // rewritten/inconsistent transfers before consuming anything, then uses
+    // PCSX2's native InitReadFIFO/ReadFIFO continuation path. It also retires
+    // rasterizer work before the local-memory operation. The bridge keeps no
+    // duplicate transaction state and never falls back to the stale-state
+    // ReadLocalMemoryUnsync helper.
+    Gate4GsObserverV1& obs = Gate4GsObserver();
+    const uint64_t local_read_t0 = obs.enabled ? Gate4GsObserverV1::Now() : 0u;
+    std::vector<uint8_t> fifo(fifo_bytes);
+    const ScopedBridgeGsFpcr fpcr_guard(bridge->fp_isolated);
+    const bool local_read_ok = GSReadLocalMemoryChecked(fifo.data(), byte_count, bitbltbuf, trxpos, trxreg);
+    if (obs.enabled)
+    {
+        ++obs.open_field.local_reads;
+        obs.open_field.local_read_bytes += byte_count;
+        obs.open_field.local_read_ns += Gate4GsObserverV1::Now() - local_read_t0;
+    }
+    if (!local_read_ok)
+    {
+        SetError(error, error_capacity,
+                 "PCSX2 rejected local-to-host transfer state or descriptor before FIFO consumption");
+        return 0;
+    }
+    std::memcpy(dst, fifo.data(), byte_count);
+    return 1;
+}
+
+extern "C" int rrv_pcsx2_gs_bridge_snapshot_local_memory(
+    RrvPcsx2GsBridge* bridge, uint8_t* dst, uint32_t byte_count,
+    char* error, uint32_t error_capacity)
+{
+    if (!bridge || !bridge->open || !dst ||
+        byte_count != RRV_PCSX2_GS_BRIDGE_LOCAL_MEMORY_BYTES)
+    {
+        SetError(error, error_capacity, "PCSX2 GS bridge local-memory snapshot requires a %u-byte destination",
+                 RRV_PCSX2_GS_BRIDGE_LOCAL_MEMORY_BYTES);
+        return 0;
+    }
+    const ScopedBridgeGsFpcr fpcr_guard(bridge->fp_isolated);
+    if (!GSSnapshotLocalMemory(dst, byte_count))
+    {
+        SetError(error, error_capacity, "PCSX2 GS local-memory snapshot failed");
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" int rrv_pcsx2_gs_bridge_restore_local_memory(
+    RrvPcsx2GsBridge* bridge, const uint8_t* src, uint32_t byte_count,
+    char* error, uint32_t error_capacity)
+{
+    if (!bridge || !bridge->open || !src ||
+        byte_count != RRV_PCSX2_GS_BRIDGE_LOCAL_MEMORY_BYTES)
+    {
+        SetError(error, error_capacity, "PCSX2 GS bridge local-memory restore requires a %u-byte source",
+                 RRV_PCSX2_GS_BRIDGE_LOCAL_MEMORY_BYTES);
+        return 0;
+    }
+    const ScopedBridgeGsFpcr fpcr_guard(bridge->fp_isolated);
+    if (!GSRestoreLocalMemory(src, byte_count))
+    {
+        SetError(error, error_capacity, "PCSX2 GS local-memory restore failed");
+        return 0;
+    }
+#if defined(RRV_PCSX2_GS_CANONICAL_RECEIPTS)
+    // Restore mutates GS local memory and texture-cache state, so it is an
+    // image-affecting consumer event even though it is not a GIF transfer.
+    if (!bridge->canonical_receipt.acknowledgeLocalMemoryRestore(src, byte_count))
+    {
+        SetError(error, error_capacity,
+                 "canonical consumer receipt overflowed after local-memory restore");
+        return 0;
+    }
+    if (bridge->receipt_boundary_ordering.arm_scheduled != 0u)
+    {
+        NoteConsumerAcknowledgement(
+            bridge, static_cast<uint32_t>(rrv::pcsx2::receipt::EventType::LocalMemoryRestore),
+            false);
+    }
+#endif
+    return 1;
+}
+
+// ---- Host overlay (the Fukami in-game menu) --------------------------------
+//
+// PCSX2's present path already runs a Dear ImGui frame for its OSD:
+// GSRenderer::VSync -> EndPresentFrame() renders it (GSDeviceMTL::EndPresent ->
+// RenderImGui) and immediately opens the next one (ImGuiManager::NewFrame), so
+// between two GSvsync calls the ImGui frame is always open on this owner. The
+// host callback runs right before GSvsync and only adds windows/input to that
+// frame. ImGui is compiled into this library with hidden visibility, so the
+// host reaches it through the RrvPcsx2GsBridgeUi table rather than linking it.
+// Adapted usage: the ImGuiKey mapping, the ClearInput calls and the IO event
+// calls follow pcsx2/ImGui/ImGuiManager.cpp (ProcessHostKeyEvent,
+// ProcessPointerButtonEvent, ProcessGenericInputEvent) at PCSX2 2.8.2
+// (fd9d310ccbb6, GPL-3.0+), called directly because this bridge has no MTGS
+// thread to marshal onto.
+namespace {
+
+std::mutex s_overlay_mutex; // held across a frame callback
+RrvPcsx2GsBridgeOverlayFrame s_overlay_frame = nullptr;
+void* s_overlay_context = nullptr;
+std::atomic<bool> s_overlay_registered{false};
+bool s_overlay_font_pushed = false;
+
+float OverlayScale()
+{
+    return std::max(ImGuiManager::GetGlobalScale(), 0.5f);
+}
+
+ImGuiKey OverlayImGuiKey(uint32_t key)
+{
+    switch (key)
+    {
+        case RRV_PCSX2_GS_UI_KEY_TAB: return ImGuiKey_Tab;
+        case RRV_PCSX2_GS_UI_KEY_LEFT: return ImGuiKey_LeftArrow;
+        case RRV_PCSX2_GS_UI_KEY_RIGHT: return ImGuiKey_RightArrow;
+        case RRV_PCSX2_GS_UI_KEY_UP: return ImGuiKey_UpArrow;
+        case RRV_PCSX2_GS_UI_KEY_DOWN: return ImGuiKey_DownArrow;
+        case RRV_PCSX2_GS_UI_KEY_PAGE_UP: return ImGuiKey_PageUp;
+        case RRV_PCSX2_GS_UI_KEY_PAGE_DOWN: return ImGuiKey_PageDown;
+        case RRV_PCSX2_GS_UI_KEY_HOME: return ImGuiKey_Home;
+        case RRV_PCSX2_GS_UI_KEY_END: return ImGuiKey_End;
+        case RRV_PCSX2_GS_UI_KEY_SPACE: return ImGuiKey_Space;
+        case RRV_PCSX2_GS_UI_KEY_ENTER: return ImGuiKey_Enter;
+        case RRV_PCSX2_GS_UI_KEY_ESCAPE: return ImGuiKey_Escape;
+        case RRV_PCSX2_GS_UI_KEY_SHIFT: return ImGuiKey_LeftShift;
+        case RRV_PCSX2_GS_UI_KEY_GAMEPAD_DPAD_UP: return ImGuiKey_GamepadDpadUp;
+        case RRV_PCSX2_GS_UI_KEY_GAMEPAD_DPAD_DOWN: return ImGuiKey_GamepadDpadDown;
+        case RRV_PCSX2_GS_UI_KEY_GAMEPAD_DPAD_LEFT: return ImGuiKey_GamepadDpadLeft;
+        case RRV_PCSX2_GS_UI_KEY_GAMEPAD_DPAD_RIGHT: return ImGuiKey_GamepadDpadRight;
+        case RRV_PCSX2_GS_UI_KEY_GAMEPAD_FACE_DOWN: return ImGuiKey_GamepadFaceDown;
+        case RRV_PCSX2_GS_UI_KEY_GAMEPAD_FACE_RIGHT: return ImGuiKey_GamepadFaceRight;
+        case RRV_PCSX2_GS_UI_KEY_GAMEPAD_FACE_LEFT: return ImGuiKey_GamepadFaceLeft;
+        case RRV_PCSX2_GS_UI_KEY_GAMEPAD_FACE_UP: return ImGuiKey_GamepadFaceUp;
+        case RRV_PCSX2_GS_UI_KEY_GAMEPAD_L1: return ImGuiKey_GamepadL1;
+        case RRV_PCSX2_GS_UI_KEY_GAMEPAD_R1: return ImGuiKey_GamepadR1;
+        default: return ImGuiKey_None;
+    }
+}
+
+void OverlayAddKey(uint32_t key, int down)
+{
+    const ImGuiKey imkey = OverlayImGuiKey(key);
+    if (imkey == ImGuiKey_None)
+        return;
+    ImGuiIO& io = ImGui::GetIO();
+    io.AddKeyEvent(imkey, down != 0);
+    if (key == RRV_PCSX2_GS_UI_KEY_SHIFT)
+        io.AddKeyEvent(ImGuiMod_Shift, down != 0);
+}
+
+void OverlayAddMousePosition(float x, float y)
+{
+    ImGui::GetIO().AddMousePosEvent(x, y);
+}
+
+void OverlayAddMouseButton(uint32_t button, int down)
+{
+    if (button < 3u)
+        ImGui::GetIO().AddMouseButtonEvent(static_cast<int>(button), down != 0);
+}
+
+void OverlayAddMouseWheel(float x, float y)
+{
+    ImGui::GetIO().AddMouseWheelEvent(x, y);
+}
+
+void OverlayClearInput()
+{
+    ImGuiIO& io = ImGui::GetIO();
+    io.ClearInputKeys();
+    io.ClearInputMouse();
+    io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+}
+
+int OverlayConsumesCancel()
+{
+    return ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel) ||
+                   ImGui::IsAnyItemActive()
+               ? 1
+               : 0;
+}
+
+int OverlayBeginMenu(const char* title, int appearing)
+{
+    const ImGuiIO& io = ImGui::GetIO();
+    const float scale = OverlayScale();
+    const ImVec2 display = io.DisplaySize;
+    // Dim the game picture behind the menu (drawn under every ImGui window).
+    ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0.0f, 0.0f), display, IM_COL32(0, 0, 0, 150));
+    const float width = std::min(display.x * 0.94f, 600.0f * scale);
+    const float height = std::min(display.y * 0.92f, 760.0f * scale);
+    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(width, height), ImGuiCond_Always);
+    if (appearing)
+        ImGui::SetNextWindowFocus();
+    ImGui::PushFont(ImGuiManager::GetStandardFont(), std::ceil(15.0f * scale));
+    s_overlay_font_pushed = true;
+    return ImGui::Begin(title ? title : "Menu", nullptr,
+               ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+                   ImGuiWindowFlags_NoSavedSettings) ? 1 : 0;
+}
+
+void OverlayEndMenu()
+{
+    ImGui::End();
+    if (s_overlay_font_pushed)
+    {
+        ImGui::PopFont();
+        s_overlay_font_pushed = false;
+    }
+}
+
+void OverlaySection(const char* label)
+{
+    ImGui::Spacing();
+    ImGui::SeparatorText(label ? label : "");
+}
+
+void OverlayText(const char* text) { ImGui::TextUnformatted(text ? text : ""); }
+void OverlayTextDisabled(const char* text) { ImGui::TextDisabled("%s", text ? text : ""); }
+void OverlayTextWrapped(const char* text) { ImGui::TextWrapped("%s", text ? text : ""); }
+void OverlayTextWarning(const char* text)
+{
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.78f, 0.28f, 1.0f));
+    ImGui::TextWrapped("%s", text ? text : "");
+    ImGui::PopStyleColor();
+}
+void OverlaySeparator() { ImGui::Separator(); }
+void OverlaySameLine() { ImGui::SameLine(); }
+void OverlaySpacing() { ImGui::Spacing(); }
+void OverlayPushId(int id) { ImGui::PushID(id); }
+void OverlayPopId() { ImGui::PopID(); }
+void OverlayBeginDisabled(int disabled) { ImGui::BeginDisabled(disabled != 0); }
+void OverlayEndDisabled() { ImGui::EndDisabled(); }
+void OverlayTooltip(const char* text)
+{
+    if (text && text[0] != '\0')
+        ImGui::SetItemTooltip("%s", text);
+}
+void OverlayDefaultFocus() { ImGui::SetItemDefaultFocus(); }
+
+// Label in the left column, control filling the right one. The control's
+// ImGui ID is "##value" inside the caller's push_id() scope, never the label:
+// the host may change a label (a restart marker) while the control is active.
+void OverlayRowLabel(const char* label)
+{
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label ? label : "");
+    ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.45f);
+    ImGui::SetNextItemWidth(-FLT_MIN);
+}
+
+int OverlayCheckbox(const char* label, int* value)
+{
+    if (!value)
+        return 0;
+    OverlayRowLabel(label);
+    bool checked = *value != 0;
+    const bool changed = ImGui::Checkbox("##value", &checked);
+    if (changed)
+        *value = checked ? 1 : 0;
+    return changed ? 1 : 0;
+}
+
+int OverlayCombo(const char* label, int* index, const char* const* items, int count)
+{
+    if (!index || !items || count <= 0)
+        return 0;
+    OverlayRowLabel(label);
+    const bool changed = ImGui::Combo("##value", index, items, count);
+    return changed ? 1 : 0;
+}
+
+int OverlaySliderInt(const char* label, int* value, int min, int max)
+{
+    if (!value)
+        return 0;
+    OverlayRowLabel(label);
+    // No Ctrl+click text entry: the menu forwards no text input.
+    const bool changed = ImGui::SliderInt("##value", value, min, max, "%d",
+                                          ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_NoInput);
+    return changed ? 1 : 0;
+}
+
+int OverlaySliderFloat(const char* label, float* value, float min, float max, const char* format)
+{
+    if (!value)
+        return 0;
+    OverlayRowLabel(label);
+    const bool changed = ImGui::SliderFloat("##value", value, min, max, format ? format : "%.2f",
+                                            ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_NoInput);
+    return changed ? 1 : 0;
+}
+
+int OverlayButton(const char* label)
+{
+    const float scale = OverlayScale();
+    return ImGui::Button(label ? label : "", ImVec2(std::max(120.0f * scale, 0.0f), 0.0f)) ? 1 : 0;
+}
+
+// Presentation options: the same GSConfig/EmuConfig fields rrv_pcsx2_gs_bridge_create
+// sets from RRV_PCSX2_GS_ASPECT, RRV_PCSX2_GS_INTEGER_SCALING, RRV_PCSX2_GS_FXAA
+// and RRV_PCSX2_GS_CAS. PCSX2 reads them on this owner at the next present:
+// CalculateDrawDstRect (aspect, integer scaling), GSRenderer::Merge -> FXAA,
+// GSRenderer::VSync -> CAS. GSDeviceMTL creates the FXAA and both CAS
+// pipelines unconditionally at device creation, so enabling them later needs
+// no device work. None of them feeds back into GS emulation.
+int OverlaySetAspect(const char* value)
+{
+    if (!value)
+        return 0;
+    const std::string_view v(value);
+    AspectRatioType type;
+    float custom = 0.0f;
+    if (v == "auto")
+        type = AspectRatioType::RAuto4_3_3_2;
+    else if (v == "4:3")
+        type = AspectRatioType::R4_3;
+    else if (v == "16:9")
+        type = AspectRatioType::R16_9;
+    else if (v == "16:10" || v == "21:9")
+    {
+        type = AspectRatioType::RAuto4_3_3_2;
+        custom = v == "16:10" ? 16.0f / 10.0f : 21.0f / 9.0f;
+    }
+    else if (v == "stretch")
+        type = AspectRatioType::Stretch;
+    else
+        return 0;
+    GSConfig.AspectRatio = type;
+    EmuConfig.GS.AspectRatio = type;
+    EmuConfig.CurrentAspectRatio = type;
+    EmuConfig.CurrentCustomAspectRatio = custom;
+    std::fprintf(stderr, "[pcsx2-gs-bridge] menu: presentation aspect=%s\n", value);
+    return 1;
+}
+
+void OverlaySetIntegerScaling(int enabled)
+{
+    GSConfig.IntegerScaling = enabled != 0;
+    EmuConfig.GS.IntegerScaling = enabled != 0;
+    std::fprintf(stderr, "[pcsx2-gs-bridge] menu: integer-scaling=%d\n", enabled != 0 ? 1 : 0);
+}
+
+void OverlaySetFxaa(int enabled)
+{
+    GSConfig.FXAA = enabled != 0;
+    EmuConfig.GS.FXAA = enabled != 0;
+    std::fprintf(stderr, "[pcsx2-gs-bridge] menu: fxaa=%d\n", enabled != 0 ? 1 : 0);
+}
+
+int OverlaySetCas(int sharpness)
+{
+    if (sharpness < 0 || sharpness > 100)
+        return 0;
+    const GSCASMode mode = sharpness > 0 ? GSCASMode::SharpenAndResize : GSCASMode::Disabled;
+    GSConfig.CASMode = mode;
+    EmuConfig.GS.CASMode = mode;
+    if (sharpness > 0)
+    {
+        GSConfig.CAS_Sharpness = static_cast<u8>(sharpness);
+        EmuConfig.GS.CAS_Sharpness = static_cast<u8>(sharpness);
+    }
+    std::fprintf(stderr, "[pcsx2-gs-bridge] menu: cas=%d\n", sharpness);
+    return 1;
+}
+
+// Runs the host overlay, if one is registered, inside the open ImGui frame.
+// Direct presentation only: the snapshot path presents nothing.
+void RunHostOverlay()
+{
+    {
+        static int applied = -1;
+        const int wanted = rrv_quest_hud::present_aspect.load(std::memory_order_relaxed);
+        if (wanted >= 0 && wanted != applied)
+        {
+            applied = wanted;
+            OverlaySetAspect(wanted == 1 ? "stretch" : "16:9");
+        }
+    }
+    if (!s_overlay_registered.load(std::memory_order_acquire))
+        return;
+    std::lock_guard<std::mutex> lock(s_overlay_mutex);
+    if (!s_overlay_frame || !ImGui::GetCurrentContext())
+        return;
+    const ImGuiIO& io = ImGui::GetIO();
+    RrvPcsx2GsBridgeUi ui{};
+    ui.struct_size = sizeof(ui);
+    ui.display_width = io.DisplaySize.x;
+    ui.display_height = io.DisplaySize.y;
+    ui.scale = OverlayScale();
+    ui.add_key = OverlayAddKey;
+    ui.add_mouse_position = OverlayAddMousePosition;
+    ui.add_mouse_button = OverlayAddMouseButton;
+    ui.add_mouse_wheel = OverlayAddMouseWheel;
+    ui.clear_input = OverlayClearInput;
+    ui.consumes_cancel = OverlayConsumesCancel;
+    ui.begin_menu = OverlayBeginMenu;
+    ui.end_menu = OverlayEndMenu;
+    ui.section = OverlaySection;
+    ui.text = OverlayText;
+    ui.text_disabled = OverlayTextDisabled;
+    ui.text_wrapped = OverlayTextWrapped;
+    ui.text_warning = OverlayTextWarning;
+    ui.separator = OverlaySeparator;
+    ui.same_line = OverlaySameLine;
+    ui.spacing = OverlaySpacing;
+    ui.push_id = OverlayPushId;
+    ui.pop_id = OverlayPopId;
+    ui.begin_disabled = OverlayBeginDisabled;
+    ui.end_disabled = OverlayEndDisabled;
+    ui.tooltip = OverlayTooltip;
+    ui.default_focus = OverlayDefaultFocus;
+    ui.checkbox = OverlayCheckbox;
+    ui.combo = OverlayCombo;
+    ui.slider_int = OverlaySliderInt;
+    ui.slider_float = OverlaySliderFloat;
+    ui.button = OverlayButton;
+    ui.set_aspect = OverlaySetAspect;
+    ui.set_integer_scaling = OverlaySetIntegerScaling;
+    ui.set_fxaa = OverlaySetFxaa;
+    ui.set_cas = OverlaySetCas;
+    s_overlay_frame(s_overlay_context, &ui);
+    if (s_overlay_font_pushed)
+    {
+        // The host skipped end_menu(); keep ImGui's font stack balanced.
+        ImGui::PopFont();
+        s_overlay_font_pushed = false;
+    }
+}
+
+} // namespace
+
+extern "C" void rrv_pcsx2_gs_bridge_set_overlay(RrvPcsx2GsBridgeOverlayFrame frame, void* context)
+{
+    std::lock_guard<std::mutex> lock(s_overlay_mutex);
+    s_overlay_frame = frame;
+    s_overlay_context = frame ? context : nullptr;
+    s_overlay_registered.store(frame != nullptr, std::memory_order_release);
+    std::fprintf(stderr, "[pcsx2-gs-bridge] host overlay %s\n", frame ? "registered" : "cleared");
+}
+
+// Live render scale (Quest GT4: a higher resolution only in the head-tracked VR view, owner 2026-11-08).
+// Any thread may request; the GS owner applies it at the start of the next vsync (GSConfig and the
+// texture cache belong to that thread). x = RRV_PCSX2_GS_SCALE_X, y = UpscaleMultiplier; 0 = unchanged.
+// Changing the scale drops all cached render targets (PCSX2's own upscale-change path), so the first
+// picture after a switch can miss effects the game doesn't redraw every frame.
+namespace {
+std::atomic<uint32_t> s_scale_req_x{0}, s_scale_req_y{0};
+std::atomic<bool> s_scale_req{false};
+
+void ApplyPendingRenderScale()
+{
+    if (!s_scale_req.exchange(false, std::memory_order_acq_rel))
+        return;
+    float x = 0.0f, y = 0.0f;
+    const uint32_t bx = s_scale_req_x.load(std::memory_order_relaxed), by = s_scale_req_y.load(std::memory_order_relaxed);
+    std::memcpy(&x, &bx, sizeof x);
+    std::memcpy(&y, &by, sizeof y);
+    const float old_x = GSRrvGetScaleX(), old_y = GSConfig.UpscaleMultiplier;
+    const float new_y = y > 0.0f ? y : old_y;
+    const float new_x = x > 0.0f ? x : (old_x > 0.0f ? old_x : new_y);
+    if (std::fabs(new_x - (old_x > 0.0f ? old_x : old_y)) < 1e-3f && std::fabs(new_y - old_y) < 1e-3f)
+        return;
+    GSRrvSetScaleX(new_x);
+    Pcsx2Config::GSOptions cfg = GSConfig;
+    cfg.UpscaleMultiplier = new_y;
+    EmuConfig.GS.UpscaleMultiplier = new_y;
+    GSUpdateConfig(cfg); // purges the texture cache when the Y scale changed
+    if (std::fabs(new_y - old_y) < 1e-3f && g_gs_renderer)
+    {
+        // Only X changed: GSUpdateConfig does not see it, drop the targets made at the old X scale.
+        g_gs_renderer->PurgeTextureCache(true, true, true);
+        g_gs_device->ClearCurrent();
+        g_gs_device->PurgePool();
+    }
+    std::fprintf(stderr, "[pcsx2-gs-bridge] render scale %gx%g -> %gx%g (live)\n", static_cast<double>(old_x > 0.0f ? old_x : old_y),
+                 static_cast<double>(old_y), static_cast<double>(new_x), static_cast<double>(new_y));
+}
+} // namespace
+
+extern "C" RRV_PCSX2_GS_BRIDGE_API void rrv_pcsx2_gs_bridge_set_bright_gain(float gain)
+{
+    if (gain >= 0.25f && gain <= 2.0f)
+        GSRrvSetBrightGain(gain);
+}
+
+extern "C" RRV_PCSX2_GS_BRIDGE_API void rrv_pcsx2_gs_bridge_set_render_scale(float scale_x, float scale_y)
+{
+    if (!(scale_x >= 0.0f && scale_x <= 8.0f && scale_y >= 0.0f && scale_y <= 8.0f))
+        return;
+    uint32_t bx = 0, by = 0;
+    std::memcpy(&bx, &scale_x, sizeof bx);
+    std::memcpy(&by, &scale_y, sizeof by);
+    s_scale_req_x.store(bx, std::memory_order_relaxed);
+    s_scale_req_y.store(by, std::memory_order_relaxed);
+    s_scale_req.store(true, std::memory_order_release);
+}
+
+extern "C" int rrv_pcsx2_gs_bridge_vsync(
+    RrvPcsx2GsBridge* bridge, const RrvPcsx2GsPrivRegs regs,
+    uint64_t field_index, uint32_t field_parity, char* error, uint32_t error_capacity)
+{
+    const uint64_t rrv_vsync_t0 = RrvNowNs(); // RRV_GS_BUSY
+    if (!bridge || !bridge->open || !regs)
+    {
+        SetError(error, error_capacity, "PCSX2 GS bridge or privileged registers are null");
+        return 0;
+    }
+
+    if (field_parity > 1u)
+    {
+        SetError(error, error_capacity, "field parity must be 0 or 1 (got %u)", field_parity);
+        return 0;
+    }
+
+    ApplyPendingRenderScale();
+    const bool field_from_csr = VsyncFieldFromCsr();
+#if defined(RRV_PCSX2_GS_CANONICAL_RECEIPTS)
+    bool armed_after_vsync_this_call = false;
+#endif
+    std::array<uint64_t, kSlotCount> consumed_regs{};
+    for (size_t index = 0; index < kSlotCount; ++index)
+    {
+        uint64_t value = regs[index];
+        if (index == 15 && !field_from_csr)
+            value = (value & ~(uint64_t{1} << 13)) | (static_cast<uint64_t>(field_parity) << 13);
+        consumed_regs[index] = value;
+        std::memcpy(bridge->pcsx2_regs.data() + kPcsx2Offsets[index], &value, sizeof(value));
+    }
+
+    // Pinned PCSX2 MTGS.cpp passes inverse CSR.FIELD to GSvsync. The caller's
+    // authoritative field has just been mirrored into the PCSX2 register bank.
+    uint64_t csr = 0;
+    std::memcpy(&csr, bridge->pcsx2_regs.data() + kPcsx2Offsets[15], sizeof(csr));
+    const uint32_t pcsx2_field = (static_cast<uint32_t>(csr) & 0x2000u) ? 0u : 1u;
+    const bool verbose = BridgeDiagVerbose();
+    if (verbose)
+        std::fprintf(stderr, "[pcsx2-gs-bridge:vsync] GSvsync begin field=%u\n", pcsx2_field);
+    const ScopedBridgeGsFpcr fpcr_guard(bridge->fp_isolated);
+    // Host overlay (in-game menu): adds ImGui windows to the frame GSvsync is
+    // about to present. No callback registered (headless) -> one atomic load.
+    if (bridge->direct_present)
+        RunHostOverlay();
+    Gate4GsObserverV1& gate4_obs = Gate4GsObserver();
+    uint64_t gate4_vsync_t0 = 0u;
+    std::array<double, GSPerfMon::CounterLast> gate4_pre{};
+    if (gate4_obs.enabled)
+    {
+        gate4_obs.open_field.entry_ns = Gate4GsObserverV1::Now();
+        gate4_pre = Gate4GsObserverV1::Perf();
+        // GSvsync's present path reads and resets the accumulated GPU time
+        // (PerformanceMetrics); take what completed before it first.
+        gate4_obs.open_field.gpu_ms = g_gs_device ? g_gs_device->GetAndResetAccumulatedGPUTime() : -1.0f;
+        gate4_vsync_t0 = Gate4GsObserverV1::Now();
+    }
+    if (bridge->vsync_from_field && field_index >= bridge->vsync_from_field)
+    {
+        ApplyDisplaySync(bridge->display_sync, true);
+        std::fprintf(stderr, "[pcsx2-gs-bridge] fast-forward done at field %llu: presentation vsync=%s\n",
+                     static_cast<unsigned long long>(field_index), SyncModeName(bridge->display_sync));
+        bridge->vsync_from_field = 0;
+    }
+    gt4_overlay::NoteDisplay(regs);
+    gt4_overlay::PublishHudRects();
+    GSvsync(pcsx2_field, VsyncRegistersWritten());
+#if defined(__ANDROID__)
+    {
+        // Quest hitch log: a field over 50 ms (the game then runs slow and streamed audio stutters)
+        // with what the GS thread compiled meanwhile; a summary every 10 s.
+        struct Hitch
+        {
+            uint64_t last_ns = 0, sum_start_ns = 0, fields = 0, slow = 0, worst_ns = 0;
+            uint64_t s[5] = {}, sum_s[5] = {};
+            uint64_t skipped_report = 0;
+        };
+        static Hitch h;
+        const uint64_t now = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        uint64_t c[5];
+        GSRrvGetCompileStats(&c[0], &c[1], &c[2], &c[3], &c[4]);
+        if (h.last_ns != 0)
+        {
+            const uint64_t dt = now - h.last_ns;
+            ++h.fields;
+            h.worst_ns = std::max(h.worst_ns, dt);
+            if (dt > 50000000ull)
+            {
+                ++h.slow;
+                std::fprintf(stderr,
+                    "[hitch] field %llu: %.0f ms; meanwhile pipelines %llu (%.1f ms), shaders %llu (%.1f ms), cache flush %.1f ms\n",
+                    static_cast<unsigned long long>(field_index), dt / 1e6, static_cast<unsigned long long>(c[0] - h.s[0]),
+                    (c[1] - h.s[1]) / 1e3, static_cast<unsigned long long>(c[2] - h.s[2]), (c[3] - h.s[3]) / 1e3,
+                    (c[4] - h.s[4]) / 1e3);
+            }
+        }
+        else
+        {
+            h.sum_start_ns = now;
+            std::copy(std::begin(c), std::end(c), h.sum_s);
+        }
+        // Field skipping (RRV_PCSX2_GS_FRAMESKIP=1, immersive race view only): when the GS has
+        // fallen more than half a field behind a 59.94 Hz schedule, draw and present nothing in
+        // the next field, never two in a row. The game then keeps its speed and the SPU2 (guest
+        // time) keeps producing sound; the compositor holds the last picture at its pose.
+        {
+            static const bool s_skip_on = [] {
+                // On by default (Quest 3, 2026-10-29: start pack 31 -> 55-60 game fields/s at scale 6,
+                // identical pictures in A/B screenshots); RRV_PCSX2_GS_FRAMESKIP=0 turns it off.
+                const char* v = std::getenv("RRV_PCSX2_GS_FRAMESKIP");
+                const bool on = !(v && v[0] == '0');
+                std::fprintf(stderr, "[pcsx2-gs-bridge] field skipping when behind: %s\n", on ? "on" : "off");
+                return on;
+            }();
+            static uint64_t skipped = 0, skipped_sum = 0;
+            static int64_t debt = 0;
+            const bool skipped_this = GSRrvGetSkipField();
+            rrv_quest_hud::vsync_presented.store(skipped_this ? 0 : 1, std::memory_order_relaxed);
+            if (skipped_this)
+                ++skipped;
+            constexpr uint64_t kPeriod = 16683350ull; // 1 / 59.94 Hz
+            bool skip_next = false;
+            // Busy time of this field (RRV_GS_BUSY): more than a field period means the game waits
+            // for the GS. The debt (never below 0: idle time cannot be banked) grows by the excess
+            // and a skipped field, which costs a fraction, pays it back.
+            const uint64_t busy = g_rrv_busy_ns.exchange(0, std::memory_order_relaxed) + (RrvNowNs() - rrv_vsync_t0);
+            // Every view (race fly-in and replays are flat and just as heavy); light scenes never
+            // build a debt, so menus are not affected.
+            if (s_skip_on)
+            {
+                debt = std::clamp<int64_t>(debt + static_cast<int64_t>(busy) - static_cast<int64_t>(kPeriod), 0,
+                                           4 * static_cast<int64_t>(kPeriod));
+                skip_next = debt > static_cast<int64_t>(kPeriod / 2) && !skipped_this;
+            }
+            else
+                debt = 0;
+            GSRrvSetSkipField(skip_next);
+            if (now - h.sum_start_ns >= 10000000000ull)
+            {
+                skipped_sum = skipped;
+                skipped = 0;
+            }
+            h.skipped_report = skipped_sum;
+        }
+        if (now - h.sum_start_ns >= 10000000000ull)
+        {
+            std::fprintf(stderr,
+                "[hitch] 10 s: %llu fields (%.1f/s, %llu skipped), %llu over 50 ms, worst %.0f ms; pipelines %llu (%.0f ms), shaders %llu (%.0f ms), flush %.0f ms\n",
+                static_cast<unsigned long long>(h.fields), h.fields * 1e9 / static_cast<double>(now - h.sum_start_ns),
+                static_cast<unsigned long long>(h.skipped_report),
+                static_cast<unsigned long long>(h.slow), h.worst_ns / 1e6, static_cast<unsigned long long>(c[0] - h.sum_s[0]),
+                (c[1] - h.sum_s[1]) / 1e3, static_cast<unsigned long long>(c[2] - h.sum_s[2]), (c[3] - h.sum_s[3]) / 1e3,
+                (c[4] - h.sum_s[4]) / 1e3);
+            h.sum_start_ns = now;
+            h.fields = h.slow = h.worst_ns = 0;
+            std::copy(std::begin(c), std::end(c), h.sum_s);
+        }
+        h.last_ns = now;
+        std::copy(std::begin(c), std::end(c), h.s);
+    }
+#endif
+    if (bridge->dof_log)
+    {
+        // The draws of this field have been flushed by GSvsync.
+        const uint64_t forward = GSRrvGetNativeBlurCopyCount(1u), back = GSRrvGetNativeBlurCopyCount(2u);
+        if (forward != bridge->dof_seen[0] || back != bridge->dof_seen[1])
+            std::fprintf(stderr, "[pcsx2-gs-bridge] dof-native: field=%llu forward=%llu return=%llu\n",
+                         static_cast<unsigned long long>(field_index),
+                         static_cast<unsigned long long>(forward - bridge->dof_seen[0]),
+                         static_cast<unsigned long long>(back - bridge->dof_seen[1]));
+        bridge->dof_seen[0] = forward;
+        bridge->dof_seen[1] = back;
+    }
+    HudScaleFieldEnd();
+    gt4_overlay::FieldEnd();
+    if (SpriteCoverage().on)
+        GSRrvClearAlignedSprites(); // this field's draws are flushed
+    HudStatsFieldEnd();
+#if defined(__linux__)
+    GsWaitLogger().Field(bridge->direct_present);
+#endif
+    if (gate4_obs.enabled)
+    {
+        Gate4GsFieldV1& row = gate4_obs.open_field;
+        row.vsync_ns = Gate4GsObserverV1::Now() - gate4_vsync_t0;
+        row.field_index = field_index;
+        row.parity = field_parity;
+        if (g_gs_device)
+            row.gpu_ms += g_gs_device->GetAndResetAccumulatedGPUTime();
+        row.gpu_avg_ms = PerformanceMetrics::GetGPUAverageTime();
+        const auto post = Gate4GsObserverV1::Perf();
+        row.vsync_perf_valid = true;
+        for (size_t i = 0; i < post.size(); ++i)
+        {
+            row.perf[i] = gate4_pre[i] - gate4_obs.last_post[i];
+            row.vsync_perf[i] = post[i] - gate4_pre[i];
+            row.vsync_perf_valid &= post[i] >= gate4_pre[i];
+        }
+        gate4_obs.last_post = post;
+        if (gate4_obs.rows.size() < gate4_obs.rows.capacity())
+            gate4_obs.rows.push_back(row);
+#if defined(__ANDROID__)
+        // Android apps are killed, not exited: write what there is every 600 fields.
+        if (gate4_obs.rows.size() % 600u == 0u)
+        {
+            gate4_obs.written = false;
+            gate4_obs.Write();
+        }
+#endif
+        else
+            ++gate4_obs.dropped;
+        row = {};
+    }
+    if (verbose)
+        std::fprintf(stderr, "[pcsx2-gs-bridge:vsync] GSvsync end\n");
+#if defined(RRV_PCSX2_GS_CANONICAL_RECEIPTS)
+    // GSvsync synchronously flushes the open GS state and executes
+    // GSRenderer::VSync. Metal command execution/presentation remains
+    // asynchronous and is deliberately outside the consumed workload.
+    if (!bridge->canonical_receipt.acknowledgeVsync(
+            consumed_regs.data(), pcsx2_field, VsyncRegistersWritten(), field_parity))
+    {
+        SetError(error, error_capacity,
+                 "canonical consumer receipt overflowed or rejected a consumed VSync");
+        return 0;
+    }
+    if (bridge->receipt_boundary_ordering.arm_scheduled != 0u)
+    {
+        NoteConsumerAcknowledgement(bridge,
+                                    static_cast<uint32_t>(rrv::pcsx2::receipt::EventType::Vsync),
+                                    false);
+    }
+    if (bridge->receipt_arm_after_vsync_pending)
+    {
+        // The actual GSvsync and Collector's successful VSync acknowledgement
+        // above have closed the mixed field. Arm the preallocated collector
+        // before this synchronous ABI function returns. No GS transfer can
+        // interleave: Backend holds its existing serialized GS mutex across
+        // this entire bridge call.
+        bridge->receipt_boundary_ordering.mixed_vsync_consumer_ack_ordinal =
+            bridge->consumer_ack_ordinal;
+        if (!bridge->canonical_receipt.arm())
+        {
+            SetError(error, error_capacity,
+                     "canonical consumer receipt cannot arm after successful VSync");
+            return 0;
+        }
+        bridge->receipt_arm_after_vsync_pending = false;
+        bridge->receipt_boundary_ordering.armed_after_successful_vsync = 1u;
+        bridge->receipt_boundary_ordering.arm_consumer_ack_ordinal =
+            bridge->consumer_ack_ordinal;
+        armed_after_vsync_this_call = true;
+    }
+#endif
+
+    // RRV_PCSX2_GS_VSYNC_TRACE=1 prints one line per GSvsync with every input
+    // the CRTC composition depends on, in a format directly comparable with the
+    // MTGS side (KNOWN_ISSUES #24). CSR is read back AFTER the call so a field
+    // flip performed inside the GS is visible.
+    if (std::getenv("RRV_PCSX2_GS_VSYNC_TRACE"))
+    {
+        uint64_t csr_after = 0;
+        std::memcpy(&csr_after, bridge->pcsx2_regs.data() + kPcsx2Offsets[15], sizeof(csr_after));
+        std::fprintf(stderr,
+            "[vsync] n=%llu field=%u regw=%d csr_before=%016llx csr_after=%016llx "
+            "pmode=%016llx smode1=%016llx smode2=%016llx syncv=%016llx "
+            "dispfb1=%016llx display1=%016llx dispfb2=%016llx display2=%016llx\n",
+            static_cast<unsigned long long>(bridge->field_index), pcsx2_field,
+            VsyncRegistersWritten() ? 1 : 0,
+            static_cast<unsigned long long>(csr),
+            static_cast<unsigned long long>(csr_after),
+            static_cast<unsigned long long>(regs[0]), static_cast<unsigned long long>(regs[1]),
+            static_cast<unsigned long long>(regs[2]), static_cast<unsigned long long>(regs[6]),
+            static_cast<unsigned long long>(regs[7]), static_cast<unsigned long long>(regs[8]),
+            static_cast<unsigned long long>(regs[9]), static_cast<unsigned long long>(regs[10]));
+    }
+
+    // GSvsync is field-accurate and intentionally does no host presentation
+    // work. The frontend samples via snapshot at its own cadence.
+    bridge->display_enabled = (regs[0] & 0x3u) != 0;
+    bridge->field_index = field_index;
+    if (bridge->display_enabled && !gate4_obs.capture_ranges.empty() &&
+        gate4_obs.WantCapture(field_index))
+    {
+        // G4-6 pixel check only (see Gate4GsObserverV1). Internal resolution,
+        // no fit or stretch: the merged output of the field just serviced.
+        uint32_t width = 0, height = 0;
+        std::vector<uint32_t> pixels;
+        FILE* f = nullptr;
+        if (GSSaveSnapshotToMemory(0u, 0u, false, true, &width, &height, &pixels))
+        {
+            const std::string name = gate4_obs.capture_dir + "/field-" + std::to_string(field_index) +
+                                     "-" + std::to_string(width) + "x" + std::to_string(height) + ".rgba";
+            f = std::fopen(name.c_str(), "wb");
+        }
+        if (f && std::fwrite(pixels.data(), sizeof(uint32_t), pixels.size(), f) == pixels.size())
+            ++gate4_obs.captures;
+        else
+            ++gate4_obs.capture_failures;
+        if (f)
+            std::fclose(f);
+    }
+    if (bridge->direct_present)
+    {
+        // The renderer increments this only after it obtained a drawable and
+        // scheduled its Metal presentation (Vulkan: after vkQueuePresentKHR
+        // accepted the swap-chain image, pcsx2-gs-bridge-linux.patch).
+        // Nil-drawable/occluded/skipped fields do not inflate either counter.
+        bridge->stats.direct_gpu_presents = GSRrvGetDirectPresentCount();
+        bridge->stats.presented_frames = bridge->stats.direct_gpu_presents;
+    }
+    else if (bridge->display_enabled)
+    {
+        // Legacy has no native present callback; this remains a field attempt
+        // count for diagnostic snapshot consumers only.
+        ++bridge->stats.presented_frames;
+    }
+#if defined(RRV_PCSX2_GS_CANONICAL_RECEIPTS)
+    if (armed_after_vsync_this_call)
+    {
+        // The fixed ordering sample is intentionally made at the actual ABI
+        // return edge, after the wrapper's remaining host-only bookkeeping.
+        // It must equal arm_consumer_ack_ordinal; any larger value exposes an
+        // acknowledged GS consumer event between arm and return.
+        bridge->receipt_boundary_ordering.bridge_vsync_return_consumer_ack_ordinal =
+            bridge->consumer_ack_ordinal;
+    }
+#endif
+    return 1;
+}
+
+#if defined(RRV_PCSX2_GS_CANONICAL_RECEIPTS)
+extern "C" int rrv_pcsx2_gs_bridge_receipt_arm(
+    RrvPcsx2GsBridge* bridge, char* error, uint32_t error_capacity)
+{
+    if (!bridge || !bridge->open)
+    {
+        SetError(error, error_capacity, "PCSX2 GS bridge is not initialized");
+        return 0;
+    }
+    if (!bridge->canonical_receipt.arm())
+    {
+        SetError(error, error_capacity, "canonical consumer receipt cannot be armed");
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" int rrv_pcsx2_gs_bridge_receipt_arm_after_vsync(
+    RrvPcsx2GsBridge* bridge, char* error, uint32_t error_capacity)
+{
+    if (!bridge || !bridge->open)
+    {
+        SetError(error, error_capacity, "PCSX2 GS bridge is not initialized");
+        return 0;
+    }
+    const rrv::pcsx2::receipt::Status receipt_status = bridge->canonical_receipt.status();
+    if (!receipt_status.enabled || !receipt_status.armed || receipt_status.collecting ||
+        receipt_status.intervalComplete || receipt_status.overflowed)
+    {
+        SetError(error, error_capacity,
+                 "post-VSync receipt arm requires an enabled, pre-armed empty collector");
+        return 0;
+    }
+    if (bridge->receipt_arm_after_vsync_pending)
+        return 1;
+
+    bridge->receipt_boundary_ordering = {
+        sizeof(RrvPcsx2GsBridgeReceiptBoundaryOrdering), 1u, 0u, 0u,
+        0u, 0u, 0u, 0u, 0u};
+    // Start the sideband counter at the requested boundary. Pre-edge consumer
+    // events are deliberately outside this proof and cannot be mistaken for
+    // relative epoch 0; the mixed closing VSync receives ordinal 1.
+    bridge->consumer_ack_ordinal = 0u;
+    bridge->receipt_arm_after_vsync_pending = true;
+    return 1;
+}
+
+extern "C" int rrv_pcsx2_gs_bridge_receipt_boundary_ordering(
+    RrvPcsx2GsBridge* bridge,
+    RrvPcsx2GsBridgeReceiptBoundaryOrdering* ordering,
+    char* error, uint32_t error_capacity)
+{
+    if (!bridge || !bridge->open || !ordering ||
+        ordering->struct_size < sizeof(RrvPcsx2GsBridgeReceiptBoundaryOrdering))
+    {
+        SetError(error, error_capacity,
+                 "PCSX2 GS bridge or receipt boundary ordering output is invalid");
+        return 0;
+    }
+    *ordering = bridge->receipt_boundary_ordering;
+    return 1;
+}
+
+extern "C" int rrv_pcsx2_gs_bridge_receipt_set_epoch_identity(
+    RrvPcsx2GsBridge* bridge, uint64_t guest_field_id, uint64_t gs_field_epoch_id,
+    char* error, uint32_t error_capacity)
+{
+    if (!bridge || !bridge->open)
+    {
+        SetError(error, error_capacity, "PCSX2 GS bridge is not initialized");
+        return 0;
+    }
+    if (!bridge->canonical_receipt.setEpochIdentity(guest_field_id, gs_field_epoch_id))
+    {
+        SetError(error, error_capacity, "canonical consumer receipt rejected epoch identity");
+        return 0;
+    }
+    return 1;
+}
+#endif
+
+extern "C" int rrv_pcsx2_gs_bridge_resize(
+    RrvPcsx2GsBridge* bridge, uint32_t width_pixels, uint32_t height_pixels,
+    float backing_scale, char* error, uint32_t error_capacity)
+{
+    if (!bridge || !bridge->open || !bridge->direct_present || width_pixels == 0u ||
+        height_pixels == 0u || backing_scale <= 0.0f)
+    {
+        SetError(error, error_capacity,
+                 "direct presentation resize requires an active surface and non-zero dimensions");
+        return 0;
+    }
+#if defined(__APPLE__)
+    // Default ABI callers keep their original main-thread contract. The owner
+    // path uses pinned GSDeviceMTL::ResizeWindow, which only updates owner GS
+    // dimensions and CAMetalLayer.drawableSize; it never touches NSView or
+    // dispatches to main. SDL prepares its own view on main before submission.
+    if (!bridge->owner_thread_surface && !rrv_pcsx2_gs_bridge_is_macos_main_thread())
+    {
+        SetError(error, error_capacity,
+                 "direct presentation resize must run on AppKit's main thread");
+        return 0;
+    }
+#else
+    // Linux: GSDeviceVK::ResizeWindow only waits for the GPU and recreates the
+    // swap chain for the new extent on this (serialized GS owner) thread; the
+    // SDL window itself was already resized by the caller. No thread rule.
+#endif
+    const ScopedBridgeGsFpcr fpcr_guard(bridge->fp_isolated);
+    GSResizeDisplayWindow(width_pixels, height_pixels, backing_scale);
+    return 1;
+}
+
+extern "C" int rrv_pcsx2_gs_bridge_snapshot(
+    RrvPcsx2GsBridge* bridge, RrvPcsx2GsBridgeFrame* frame,
+    char* error, uint32_t error_capacity)
+{
+    if (!bridge || !bridge->open || !frame || frame->struct_size < sizeof(RrvPcsx2GsBridgeFrame))
+    {
+        SetError(error, error_capacity, "bridge/frame is null or frame struct is too small");
+        return 0;
+    }
+
+    const bool diag = BridgeDiagEnabled();
+    const bool verbose = BridgeDiagVerbose();
+
+    // RRV can ask before the first display-enabled field. PCSX2's screenshot
+    // path assumes a display surface, so return a deterministic blank instead.
+    if (!bridge->display_enabled)
+    {
+        const uint32_t width = bridge->snapshot_width != 0 ? bridge->snapshot_width : 640u;
+        const uint32_t height = bridge->snapshot_height != 0 ? bridge->snapshot_height : 448u;
+        bridge->pixels.assign(static_cast<size_t>(width) * height, 0u);
+        bridge->snapshot_width = width;
+        bridge->snapshot_height = height;
+        ++bridge->sequence;
+        frame->width = width;
+        frame->height = height;
+        frame->stride_bytes = width * sizeof(uint32_t);
+        frame->rgba = reinterpret_cast<const uint8_t*>(bridge->pixels.data());
+        frame->sequence = bridge->sequence;
+        return 1;
+    }
+
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::vector<uint32_t> snapshot_pixels;
+    if (verbose)
+        std::fprintf(stderr, "[pcsx2-gs-bridge:vsync] snapshot begin %ux%u\n",
+                     bridge->snapshot_width, bridge->snapshot_height);
+    // GSSaveSnapshotToMemory is the actual CPU-visible GPU readback point.
+    // Do not charge the deterministic pre-display blank above: it allocates
+    // CPU pixels only and does not submit Metal work or wait for a command
+    // buffer. A raw snapshot in direct mode remains an unexpected readback;
+    // capture_in_progress is set only by the explicit capture API below.
+    ++bridge->stats.synchronous_cpu_readbacks;
+    if (bridge->gpu_renderer)
+        ++bridge->stats.cpu_waits;
+    if (bridge->direct_present && !bridge->capture_in_progress)
+        ++bridge->stats.unexpected_readbacks;
+    // Window 0x0 + crop makes this byte-for-byte the operation
+    // `pcsx2-gsrunner -dumpdir` performs under ScreenshotSize=2: the merged
+    // texture at internal resolution, with no CalculateDrawDstRect fit and no
+    // bilinear StretchRect. Required for any pixel comparison against it.
+    const bool snap_internal = SnapshotAtInternalResolution();
+    const ScopedBridgeGsFpcr fpcr_guard(bridge->fp_isolated);
+    if (!GSSaveSnapshotToMemory(snap_internal ? 0u : bridge->snapshot_width,
+            snap_internal ? 0u : bridge->snapshot_height,
+            false, snap_internal, &width, &height, &snapshot_pixels))
+    {
+        if (!bridge->gpu_snapshot_fallback || bridge->has_successful_frame)
+        {
+            SetError(error, error_capacity, "PCSX2 failed to snapshot the completed GS field");
+            return 0;
+        }
+
+        // Metal can expose PMODE before it has produced a snapshotable target.
+        // Do not turn that normal startup transition into a frontend exception.
+        const uint32_t blank_width = bridge->snapshot_width != 0 ? bridge->snapshot_width : 640u;
+        const uint32_t blank_height = bridge->snapshot_height != 0 ? bridge->snapshot_height : 448u;
+        bridge->pixels.assign(static_cast<size_t>(blank_width) * blank_height, 0u);
+        bridge->snapshot_width = blank_width;
+        bridge->snapshot_height = blank_height;
+        ++bridge->sequence;
+        if (diag)
+            std::fprintf(stderr, "[pcsx2-gs-bridge:snapshot] fallback=blank reason=no-target field=%llu\n",
+                         static_cast<unsigned long long>(bridge->field_index));
+
+        frame->width = bridge->snapshot_width;
+        frame->height = bridge->snapshot_height;
+        frame->stride_bytes = bridge->snapshot_width * sizeof(uint32_t);
+        frame->rgba = reinterpret_cast<const uint8_t*>(bridge->pixels.data());
+        frame->sequence = bridge->sequence;
+        return 1;
+    }
+    if (verbose)
+        std::fprintf(stderr, "[pcsx2-gs-bridge:vsync] snapshot end %ux%u pixels=%zu\n",
+                     width, height, snapshot_pixels.size());
+    bridge->snapshot_width = width;
+    bridge->snapshot_height = height;
+    bridge->pixels = std::move(snapshot_pixels);
+    bridge->has_successful_frame = true;
+    ++bridge->sequence;
+    if (diag && (bridge->sequence <= 2u || (bridge->sequence % 60u) == 0u))
+    {
+        size_t rgb_nonzero = 0;
+        uint64_t hash = 1469598103934665603ull;
+        for (const uint32_t pixel : bridge->pixels)
+        {
+            rgb_nonzero += (pixel & 0x00ffffffu) != 0u;
+            hash ^= pixel;
+            hash *= 1099511628211ull;
+        }
+        std::fprintf(stderr,
+            "[pcsx2-gs-bridge:frame] seq=%llu field=%llu size=%ux%u rgb-nonzero=%zu hash=%016llx\n",
+            static_cast<unsigned long long>(bridge->sequence),
+            static_cast<unsigned long long>(bridge->field_index), width, height, rgb_nonzero,
+            static_cast<unsigned long long>(hash));
+    }
+    frame->width = bridge->snapshot_width;
+    frame->height = bridge->snapshot_height;
+    frame->stride_bytes = bridge->snapshot_width * sizeof(uint32_t);
+    frame->rgba = reinterpret_cast<const uint8_t*>(bridge->pixels.data());
+    frame->sequence = bridge->sequence;
+    return 1;
+}
+
+extern "C" int rrv_pcsx2_gs_bridge_capture(
+    RrvPcsx2GsBridge* bridge, const RrvPcsx2GsBridgeCaptureRequest* request,
+    RrvPcsx2GsBridgeCaptureResult* result, char* error, uint32_t error_capacity)
+{
+    if (!bridge || !bridge->open || !request || !result ||
+        request->struct_size < sizeof(RrvPcsx2GsBridgeCaptureRequest) ||
+        result->struct_size < sizeof(RrvPcsx2GsBridgeCaptureResult))
+    {
+        SetError(error, error_capacity, "bridge/capture request/result is null or too small");
+        return 0;
+    }
+    ++bridge->stats.requested_captures;
+
+    // Capture is synchronous and observes exactly the field which was last
+    // submitted to GS. Accepting an arbitrary historical/future tag would
+    // make regression hashes look correlated while reading a different field.
+    // For direct presentation, use PCSX2's renderer-side counter, which only
+    // advances once a drawable was acquired and scheduled for presentation.
+    if (bridge->direct_present)
+    {
+        bridge->stats.direct_gpu_presents = GSRrvGetDirectPresentCount();
+        bridge->stats.presented_frames = bridge->stats.direct_gpu_presents;
+    }
+    const uint64_t observed_present_index = bridge->stats.presented_frames;
+    if (request->field_index != bridge->field_index ||
+        request->present_index != observed_present_index)
+    {
+        SetError(error, error_capacity,
+                 "diagnostic capture tag is stale: requested field=%llu present=%llu, "
+                 "bridge observes field=%llu present=%llu",
+                 static_cast<unsigned long long>(request->field_index),
+                 static_cast<unsigned long long>(request->present_index),
+                 static_cast<unsigned long long>(bridge->field_index),
+                 static_cast<unsigned long long>(observed_present_index));
+        return 0;
+    }
+    RrvPcsx2GsBridgeFrame frame{sizeof(RrvPcsx2GsBridgeFrame), 0u, 0u, 0u, nullptr, 0u};
+    struct CaptureInProgressGuard
+    {
+        bool& value;
+        explicit CaptureInProgressGuard(bool& capture_in_progress) : value(capture_in_progress)
+        {
+            value = true;
+        }
+        ~CaptureInProgressGuard() { value = false; }
+    } capture_in_progress{bridge->capture_in_progress};
+    if (!rrv_pcsx2_gs_bridge_snapshot(bridge, &frame, error, error_capacity))
+    {
+        return 0;
+    }
+    result->flags = 0u;
+    result->guest_tick = request->guest_tick;
+    result->field_index = bridge->field_index;
+    result->present_index = observed_present_index;
+    result->frame = frame;
+    ++bridge->stats.completed_captures;
+    return 1;
+}
+
+extern "C" int rrv_pcsx2_gs_bridge_get_stats(
+    RrvPcsx2GsBridge* bridge, RrvPcsx2GsBridgeStats* stats,
+    char* error, uint32_t error_capacity)
+{
+    if (!bridge || !bridge->open || !stats || stats->struct_size < sizeof(RrvPcsx2GsBridgeStats))
+    {
+        SetError(error, error_capacity, "bridge/stats is null or stats struct is too small");
+        return 0;
+    }
+    *stats = bridge->stats;
+    return 1;
+}

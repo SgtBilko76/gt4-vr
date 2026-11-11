@@ -1,0 +1,58 @@
+From ea7ad982f288a832a565291b8c7141bed08c2e28 Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 19:41:15 +0100
+Subject: [PATCH 39/44] Quest VR mirror: GT4 480p brightens the 3D target in
+ place (Cd*FIX) before its copy - take the mirror out there, gain FIX/128
+ (fixes the white mirror and the dark rectangle in 480p)
+
+---
+ pcsx2/GS/Renderers/HW/GSRendererHW.cpp | 18 +++++++++++++++---
+ 1 file changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index 43ad6a6584..465466e5cb 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -158,6 +158,10 @@ namespace rrv_mirror
+ 	static GSTexture* s_mirror = nullptr;
+ 	static GSTexture* s_opaque = nullptr;
+ 	static u32 s_logged = 0;
++	// Brightness GT4 applies after the mirror: 0 = the composite's (RRV_GT4_MIRROR_GAIN, 2.35). In 480p
++	// GT4 brightens the 3D target IN PLACE first (full-target draw, blend Cd * FIX, FIX 0xFF = ~2x) and
++	// then copies it 1:1 (PC draw capture 2026-11-08): the mirror is taken out at that draw and gets FIX/128.
++	static float s_gain_now = 0.0f;
+ 	static GSTexture* Ensure(GSTexture*& t, int w, int h)
+ 	{
+ 		if (t && (t->GetWidth() != w || t->GetHeight() != h))
+@@ -413,9 +417,17 @@ void GSRendererHW::RrvHudSplitNoteDraw()
+ 				}
+ 			}
+ 		}
+-		else if (s_active && PRIM->TME && static_cast<int>(m_cached_ctx.TEX0.TBP0 >> 5) == s_main_fbp &&
+-				 (m_vt.m_max.p.x - m_vt.m_min.p.x) >= 600.0f)
++		else if (s_active &&
++				 ((PRIM->TME && static_cast<int>(m_cached_ctx.TEX0.TBP0 >> 5) == s_main_fbp && (m_vt.m_max.p.x - m_vt.m_min.p.x) >= 600.0f) ||
++				  // 480p: the in-place brightening of the 3D target (Cd * FIX + 0) comes before the copy. Taking
++				  // the mirror out after it put the unbrightened scene back under the mirror (a dark rectangle in
++				  // the VR picture) and brightened the mirror twice (owner 2026-11-08: mirror almost white).
++				  // FIX > 0x80 only: both modes draw an in-place Cd * 0x80 (= unchanged) pass earlier.
++				  (mfbp == s_main_fbp && m_context->ALPHA.A == 1 && m_context->ALPHA.B == 2 && m_context->ALPHA.C == 2 &&
++				   m_context->ALPHA.D == 2 && m_context->ALPHA.FIX > 0x80 && (m_vt.m_max.p.x - m_vt.m_min.p.x) >= 600.0f && (m_vt.m_max.p.y - m_vt.m_min.p.y) >= 400.0f)))
+ 		{
++			const bool in_place = static_cast<int>(m_cached_ctx.TEX0.TBP0 >> 5) != s_main_fbp || !PRIM->TME;
++			s_gain_now = in_place ? static_cast<float>(m_context->ALPHA.FIX) / 128.0f : 0.0f;
+ 			// The composite reads the 3D target: take the mirror out, put the scene back.
+ 			s_active = false;
+ 			GSTextureCache::Target* rt = g_texture_cache->GetExactTarget(s_main_fbp << 5, s_main_fbw, GSTextureCache::RenderTarget, s_main_fbp << 5);
+@@ -640,7 +652,7 @@ GSTexture* GSRendererHW::GetOutput(int i, GSVector2& scale, int& y_offset)
+ 				// mirror 35 -> 83, scene 39 -> 93 mean value). RRV_GT4_MIRROR_GAIN overrides.
+ 				static const float s_gain = [] { const char* g = std::getenv("RRV_GT4_MIRROR_GAIN"); return g ? std::strtof(g, nullptr) : 2.35f; }();
+ 				const float th = static_cast<float>(GSStereo::s_hud_tex->GetHeight());
+-				GSStereo::s_mirror_gain = s_gain;
++				GSStereo::s_mirror_gain = rrv_mirror::s_gain_now > 0.0f ? rrv_mirror::s_gain_now : s_gain;
+ 				GSStereo::s_mirror_v0 = dst.y / th;
+ 				GSStereo::s_mirror_v1 = dst.w / th;
+ 				if (rrv_mirror::Ensure(rrv_mirror::s_opaque, 4, 4))
+-- 
+2.53.0
+

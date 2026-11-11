@@ -1,0 +1,198 @@
+From 96c3703ecb1cf254cc6b6b751235ddaec0c56227 Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 13:04:25 +0100
+Subject: [PATCH 17/44] Quest: RRV_VKDIAG copy/render-pass attribution, feature
+ log; RRV_VK_CARRY A/B switch (off: slower on Adreno 740)
+
+---
+ pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp | 123 ++++++++++++++++++++++-
+ 1 file changed, 122 insertions(+), 1 deletion(-)
+
+diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
+index ef8c54813a..2fbbb14bb3 100644
+--- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
++++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
+@@ -70,6 +70,97 @@ namespace
+ #include <sstream>
+ #include <utility>
+ 
++// ---- RRV Quest diagnostic (RRV_VKDIAG=1): who issues copies and render passes ----------------
++// Counts call stacks (5 frames, _Unwind_Backtrace) of texture copies and render-pass ends, with
++// their pixel areas, and prints the top ones every 600 presents to stderr as offsets in this
++// library (symbolize with llvm-symbolizer against the unstripped build). Off: one branch.
++#if defined(__ANDROID__)
++#include <unwind.h>
++#include <dlfcn.h>
++namespace rrv_vkdiag
++{
++struct Bt
++{
++	uintptr_t* pcs;
++	int n, max;
++};
++_Unwind_Reason_Code Cb(_Unwind_Context* c, void* a)
++{
++	Bt* s = static_cast<Bt*>(a);
++	const uintptr_t pc = _Unwind_GetIP(c);
++	if (!pc || s->n >= s->max)
++		return _URC_END_OF_STACK;
++	s->pcs[s->n++] = pc;
++	return _URC_NO_REASON;
++}
++struct Slot
++{
++	int kind;
++	uintptr_t pcs[6];
++	u64 n, px;
++};
++static std::vector<Slot> s_slots;
++static int s_on = -1;
++static u32 s_presents = 0;
++static const char* const kKinds[] = {"copy", "multistretch", "drawstretch", "date", "endpass", "beginpass"};
++static bool On()
++{
++	if (s_on < 0)
++	{
++		const char* v = std::getenv("RRV_VKDIAG");
++		s_on = (v && v[0] == '1') ? 1 : 0;
++	}
++	return s_on == 1;
++}
++static void Hit(int kind, u64 px)
++{
++	if (!On())
++		return;
++	uintptr_t pcs[7] = {};
++	Bt bt{pcs, 0, 7};
++	_Unwind_Backtrace(Cb, &bt);
++	for (Slot& s : s_slots)
++		if (s.kind == kind && std::memcmp(s.pcs, pcs + 1, sizeof(s.pcs)) == 0)
++		{
++			s.n++;
++			s.px += px;
++			return;
++		}
++	Slot s{};
++	s.kind = kind;
++	std::memcpy(s.pcs, pcs + 1, sizeof(s.pcs));
++	s.n = 1;
++	s.px = px;
++	s_slots.push_back(s);
++}
++static void Present()
++{
++	if (!On() || ++s_presents % 600u != 0u)
++		return;
++	Dl_info info{};
++	dladdr(reinterpret_cast<void*>(&Present), &info);
++	const uintptr_t base = reinterpret_cast<uintptr_t>(info.dli_fbase);
++	std::sort(s_slots.begin(), s_slots.end(), [](const Slot& a, const Slot& b) { return a.px > b.px; });
++	std::fprintf(stderr, "[vkdiag] --- 600 presents, %zu stacks\n", s_slots.size());
++	for (size_t i = 0; i < s_slots.size() && i < 30; ++i)
++	{
++		const Slot& s = s_slots[i];
++		std::fprintf(stderr, "[vkdiag] %-12s n/f=%7.1f MP/f=%7.1f", kKinds[s.kind], s.n / 600.0, s.px / 600.0 / 1e6);
++		for (uintptr_t pc : s.pcs)
++			std::fprintf(stderr, " %llx", static_cast<unsigned long long>(pc >= base ? pc - base : pc));
++		std::fprintf(stderr, "\n");
++	}
++	s_slots.clear();
++}
++} // namespace rrv_vkdiag
++#define RRV_VKDIAG_HIT(kind, px) rrv_vkdiag::Hit(kind, px)
++#define RRV_VKDIAG_PRESENT() rrv_vkdiag::Present()
++#else
++#define RRV_VKDIAG_HIT(kind, px) ((void)0)
++#define RRV_VKDIAG_PRESENT() ((void)0)
++#endif
++
++
+ // Tweakables
+ enum : u32
+ {
+@@ -3409,6 +3500,23 @@ void GSDeviceVK::EndPresent()
+ 
+ 	m_swap_chain->GetCurrentTexture()->TransitionToLayout(cmdbuffer, GSTextureVK::Layout::PresentSrc);
+ 	g_perfmon.Put(GSPerfMon::RenderPasses, 1);
++	RRV_VKDIAG_PRESENT();
++	{
++		static bool s_features_logged = false;
++		if (!s_features_logged)
++		{
++			s_features_logged = true;
++			std::fprintf(stderr,
++				"[vk-features] texture_barrier=%d multidraw_fb_copy=%d cheap_rt_feedback_read=%d framebuffer_fetch=%d "
++				"feedback_loop_layout=%d fetch_orders_overlap=%d fast_stencil_shadow=%d stencil=%d dual_src=%d "
++				"test_and_sample_depth=%d depth_feedback=%d no_z_quant=%d prefer_new_textures=%d\n",
++				m_features.texture_barrier, m_features.multidraw_fb_copy, m_features.cheap_rt_feedback_read,
++				m_features.framebuffer_fetch, m_features.feedback_loop_layout, m_features.framebuffer_fetch_orders_overlap,
++				m_features.fast_stencil_shadow, m_features.stencil_buffer, m_features.dual_source_blend,
++				m_features.test_and_sample_depth, m_features.depth_feedback, m_features.no_ps2_z_quantization,
++				m_features.prefer_new_textures);
++		}
++	}
+ 
+ 	// Bring frame generation up or down to match the settings, once per frame and immediately
+ 	// before the present it hooks. Both calls are cheap no-ops in the steady state; the work
+@@ -4546,8 +4654,10 @@ void GSDeviceVK::DoHintReadbackSource(GSTexture* tex)
+ 	m_recent_readback_sources[0] = tex;
+ }
+ 
++
+ void GSDeviceVK::DoCopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i& r, u32 destX, u32 destY)
+ {
++	RRV_VKDIAG_HIT(0, static_cast<u64>(r.width()) * static_cast<u64>(std::max(r.height(), 0)));
+ 	// Empty rect, abort copy.
+ 	if (r.rempty())
+ 	{
+@@ -4711,6 +4821,7 @@ void GSDeviceVK::DoMultiStretchRects(
+ 	const MultiStretchRect* rects, u32 num_rects, GSTextureVK* dTex, ShaderConvertSelector shader)
+ {
+ 	g_perfmon.Put(GSPerfMon::TextureCopies, 1);
++	RRV_VKDIAG_HIT(1, static_cast<u64>(dTex->GetWidth()) * static_cast<u64>(dTex->GetHeight()));
+ 	
+ 	// Set up vertices first.
+ 	const u32 vertex_reserve_size = num_rects * 4 * sizeof(GSVertexPT1);
+@@ -4902,6 +5013,7 @@ static void RotateNDCForPresent(float& x, float& y)
+ void GSDeviceVK::DrawStretchRect(const GSVector4& sRect, const GSVector4& dRect, const GSVector2i& ds)
+ {
+ 	g_perfmon.Put(GSPerfMon::TextureCopies, 1);
++	RRV_VKDIAG_HIT(2, static_cast<u64>(std::max(0.0f, (dRect.z - dRect.x) * (dRect.w - dRect.y))));
+ 
+ 	// ia
+ 	const float inv_x = 2.0f / ds.x;
+@@ -8289,6 +8401,7 @@ void GSDeviceVK::EndRenderPass()
+ 	if (m_current_render_pass == VK_NULL_HANDLE)
+ 		return;
+ 
++	RRV_VKDIAG_HIT(4, static_cast<u64>(m_current_render_pass_area.width()) * static_cast<u64>(std::max(m_current_render_pass_area.height(), 0)));
+ 	m_current_render_pass = VK_NULL_HANDLE;
+ 	g_perfmon.Put(GSPerfMon::RenderPasses, 1);
+ 	m_render_passes_since_submit++;
+@@ -8617,6 +8730,7 @@ void GSDeviceVK::SetVSPushConstants(u32 base_vertex, u32 base_index, bool force_
+ 
+ void GSDeviceVK::SetupDATE(GSTexture* rt, GSTexture* ds, SetDATM datm, const GSVector4i& bbox)
+ {
++	RRV_VKDIAG_HIT(3, static_cast<u64>(bbox.width()) * static_cast<u64>(std::max(bbox.height(), 0)));
+ 	g_perfmon.Put(GSPerfMon::TextureCopies, 1);
+ 
+ 	GL_PUSH("SetupDATE {%d,%d} %dx%d", bbox.left, bbox.top, bbox.width(), bbox.height());
+@@ -9013,7 +9127,14 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
+ 		// to match, so a draw keeping the RT but swapping the depth target would otherwise
+ 		// inherit a stale depth feedback layout: precisely the flicker mode described above.
+ 		GSFeedbackLoopCarryInputs carry;
+-		carry.device_always_carries = IsDeviceBroadcom();
++		// RRV Quest (RRV_VK_CARRY=1, set by the fukami bridge on Android): Adreno 740 on the
++		// in-pass read (texture barriers, subpassLoad) restarted the pass ~380 times a field at
++		// every switch between reading and non-reading draws of RR5; carry it like Broadcom.
++		static const bool s_rrv_carry = [] {
++			const char* v = std::getenv("RRV_VK_CARRY");
++			return v && v[0] == '1';
++		}();
++		carry.device_always_carries = IsDeviceBroadcom() || s_rrv_carry;
+ 		carry.device_is_measured_vendor = IsDeviceMali();
+ 		carry.framebuffer_fetch = m_features.framebuffer_fetch;
+ 		carry.feedback_loop_layout = UseFeedbackLoopLayout();
+-- 
+2.53.0
+

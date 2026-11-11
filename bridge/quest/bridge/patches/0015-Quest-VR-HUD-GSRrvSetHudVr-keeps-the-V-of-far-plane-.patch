@@ -1,0 +1,56 @@
+From 057629e54e72b845c089d8e6aba3051fa323a850 Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 11:34:00 +0100
+Subject: [PATCH 15/44] Quest VR HUD: GSRrvSetHudVr keeps the V of far-plane
+ sprites the bridge has shrunk
+
+---
+ pcsx2/GS/GS.h                          | 4 ++++
+ pcsx2/GS/Renderers/HW/GSRendererHW.cpp | 9 +++++++++
+ 2 files changed, 13 insertions(+)
+
+diff --git a/pcsx2/GS/GS.h b/pcsx2/GS/GS.h
+index 493256081b..aad0ba5169 100644
+--- a/pcsx2/GS/GS.h
++++ b/pcsx2/GS/GS.h
+@@ -150,6 +150,10 @@ inline u64 GSRrvSpriteKey(u16 x0, u16 x1, u16 u0, u16 u1)
+ 	return static_cast<u64>(x0) | (static_cast<u64>(x1) << 16) | (static_cast<u64>(u0) << 32) | (static_cast<u64>(u1) << 48);
+ }
+ void GSRrvMarkAlignedSprite(u64 key);
++/// Quest VR race HUD (fukami bridge, rrv_quest_hud): the bridge scales far-plane 2D sprites to a
++/// fraction of their height, so the RoundSprite V fix (texels under the first and last NATIVE row)
++/// would sample only part of a 6-row label; while on, far-plane sprites keep the game's V.
++void GSRrvSetHudVr(bool on);
+ bool GSRrvIsAlignedSprite(u64 key);
+ void GSRrvClearAlignedSprites();
+ // RRV Gate-6 extension: when set, UserHacks_RewriteLargeST also collapses
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index e25cb7752d..e879771565 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -3171,6 +3171,12 @@ void GSRendererHW::RrvLinearSpriteEdges(float scale)
+ 	}
+ }
+ 
++static std::atomic<bool> s_rrv_hud_vr{false};
++void GSRrvSetHudVr(bool on)
++{
++	s_rrv_hud_vr.store(on, std::memory_order_relaxed);
++}
++
+ template <bool linear>
+ void GSRendererHW::RoundSpriteOffset()
+ {
+@@ -3266,6 +3272,9 @@ void GSRendererHW::RoundSpriteOffset()
+ 			}
+ 		}
+ #endif
++		// Quest VR HUD (GSRrvSetHudVr): a far-plane 2D sprite the bridge has shrunk keeps its V.
++		if (s_rrv_hud_vr.load(std::memory_order_relaxed) && v[i].XYZ.Z >= 0xFFFE28u)
++			continue;
+ 		// RRV Gate-6 full-frame extension (GSRrvSetRoundSpriteUOnly): vertically
+ 		// minified sprites round V on the progressive grid (else branch below).
+ 		if (!s_rrv_round_sprite_u_only || std::abs(static_cast<int>(v[i + 1].V) - static_cast<int>(v[i].V)) <= std::abs(Ly) + 8)
+-- 
+2.53.0
+

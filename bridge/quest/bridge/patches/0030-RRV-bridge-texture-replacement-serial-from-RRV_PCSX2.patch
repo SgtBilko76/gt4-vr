@@ -1,0 +1,58 @@
+From 94b4b08a57aa944653ff425591ba277580e290b9 Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 18:13:51 +0100
+Subject: [PATCH 30/44] RRV bridge: texture replacement serial from
+ RRV_PCSX2_GS_TEXTURE_SERIAL (no VM in the bridge)
+
+---
+ .../GS/Renderers/HW/GSTextureReplacements.cpp  | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/pcsx2/GS/Renderers/HW/GSTextureReplacements.cpp b/pcsx2/GS/Renderers/HW/GSTextureReplacements.cpp
+index a6e708cf57..7e678e8f07 100644
+--- a/pcsx2/GS/Renderers/HW/GSTextureReplacements.cpp
++++ b/pcsx2/GS/Renderers/HW/GSTextureReplacements.cpp
+@@ -20,6 +20,7 @@
+ #include "VMManager.h"
+ 
+ #include <cinttypes>
++#include <cstdlib>
+ #include <condition_variable>
+ #include <cstring>
+ #include <deque>
+@@ -474,9 +475,22 @@ std::string GSTextureReplacements::GetDumpFilename(const TextureName& name, u32
+ 	return ret;
+ }
+ 
++// RRV bridge: no VM runs, so there is no disc serial; RRV_PCSX2_GS_TEXTURE_SERIAL names the game's
++// texture folder (<EmuFolders::Textures>/<serial>/replacements) instead. Unset = PCSX2's behaviour.
++static std::string CurrentTextureSerial()
++{
++	std::string serial = VMManager::GetDiscSerial();
++	if (serial.empty())
++	{
++		if (const char* env = std::getenv("RRV_PCSX2_GS_TEXTURE_SERIAL"); env && *env)
++			serial = env;
++	}
++	return serial;
++}
++
+ void GSTextureReplacements::Initialize()
+ {
+-	s_current_serial = VMManager::GetDiscSerial();
++	s_current_serial = CurrentTextureSerial();
+ 
+ 	if (GSConfig.DumpReplaceableTextures || GSConfig.LoadTextureReplacements)
+ 		StartWorkerThread();
+@@ -486,7 +500,7 @@ void GSTextureReplacements::Initialize()
+ 
+ void GSTextureReplacements::GameChanged()
+ {
+-	std::string new_serial = VMManager::GetDiscSerial();
++	std::string new_serial = CurrentTextureSerial();
+ 	if (s_current_serial == new_serial)
+ 		return;
+ 
+-- 
+2.53.0
+

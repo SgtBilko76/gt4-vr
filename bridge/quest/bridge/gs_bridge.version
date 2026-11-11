@@ -1,0 +1,11 @@
+/* Exported symbols of librrv-pcsx2-gs-bridge.so on Android: the bridge C ABI
+ * (tools/pcsx2-gs-bridge/rrv_pcsx2_gs_bridge.h, rrv_pcsx2_gs_bridge_*) plus the Android
+ * path/surface helpers of quest/bridge/android_surface_adapter.cpp (same prefix).
+ * Everything else -- PCSX2, its static 3rdparty and libc++ -- stays local, so the
+ * bridge cannot interpose on (or be interposed by) another PCSX2 in the process. */
+{
+  global:
+    rrv_pcsx2_gs_bridge_*;
+  local:
+    *;
+};

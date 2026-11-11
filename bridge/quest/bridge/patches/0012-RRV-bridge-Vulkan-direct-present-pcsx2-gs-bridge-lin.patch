@@ -1,0 +1,864 @@
+From 47f04064e16b5e4a6e24ab7cccef611363d5fac2 Mon Sep 17 00:00:00 2001
+From: "Sgt.Bilko" <59089219+SgtBilko76@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 21:21:11 +0100
+Subject: [PATCH 12/44] RRV bridge: Vulkan direct present
+ (pcsx2-gs-bridge-linux.patch)
+
+Fukami tools/patches/pcsx2-gs-bridge-linux.patch on ARMSX2: direct-present
+count, GS-thread wait attribution, acquire helper thread, TFX pipeline
+front cache and the XXH3 block hash. Merged with ARMSX2's own
+instrumentation: present/acquire stats and the bounded 2 s acquire timeout
+stay, the RRV timers wrap the same calls; the pipeline front cache sits in
+front of ARMSX2's timed compile and periodic pipeline-cache flush; the
+SW-prim timer opens ARMSX2's refactored SwPrimRender.
+---
+ pcsx2/GS/GS.cpp                               |  11 ++
+ pcsx2/GS/GS.h                                 |  52 ++++++++
+ pcsx2/GS/GSXXH.cpp                            |  11 ++
+ pcsx2/GS/GSXXH.h                              |   1 +
+ pcsx2/GS/MultiISA.cpp                         |   1 +
+ pcsx2/GS/MultiISA.h                           |   1 +
+ pcsx2/GS/Renderers/HW/GSRendererHW.cpp        |   3 +
+ .../GS/Renderers/HW/GSRendererHWMultiISA.cpp  |  13 ++
+ pcsx2/GS/Renderers/HW/GSTextureCache.cpp      |  76 ++++++++++-
+ pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp      | 107 +++++++++++----
+ pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h        |   9 ++
+ pcsx2/GS/Renderers/Vulkan/GSTextureVK.cpp     |   2 +
+ pcsx2/GS/Renderers/Vulkan/VKStreamBuffer.cpp  |   6 +-
+ pcsx2/GS/Renderers/Vulkan/VKSwapChain.cpp     | 124 ++++++++++++++++++
+ pcsx2/GS/Renderers/Vulkan/VKSwapChain.h       |  29 ++++
+ 15 files changed, 411 insertions(+), 35 deletions(-)
+
+diff --git a/pcsx2/GS/GS.cpp b/pcsx2/GS/GS.cpp
+index ec5c9fa3f6..faafbccf2b 100644
+--- a/pcsx2/GS/GS.cpp
++++ b/pcsx2/GS/GS.cpp
+@@ -60,6 +60,7 @@
+ #include "fmt/format.h"
+ 
+ #include <atomic>
++#include <chrono>
+ #include <fstream>
+ #include <algorithm>
+ #include <array>
+@@ -157,6 +158,16 @@ u64 GSRrvGetDroppedLargeSTTriangles()
+ 	return GSState::s_rrv_dropped_large_st_triangles.load(std::memory_order_relaxed);
+ }
+ 
++GSRrvWaitStats g_rrv_wait_stats{};
++GSRrvWait g_rrv_wait_reason = GSRrvWait::Other;
++GSRrvRead g_rrv_read_cause = GSRrvRead::Other;
++
++u64 GSRrvNowNs()
++{
++	return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++		std::chrono::steady_clock::now().time_since_epoch()).count());
++}
++
+ static GSRendererType GSCurrentRenderer;
+ static bool GSCurrentPresenterOffsetsRead;
+ 
+diff --git a/pcsx2/GS/GS.h b/pcsx2/GS/GS.h
+index b90a3a420a..493256081b 100644
+--- a/pcsx2/GS/GS.h
++++ b/pcsx2/GS/GS.h
+@@ -156,6 +156,58 @@ void GSRrvClearAlignedSprites();
+ // every triangle whose ST it had to rewrite (degenerate Q), so it draws nothing.
+ void GSRrvSetDropLargeSTTriangles(bool drop);
+ u64 GSRrvGetDroppedLargeSTTriangles();
++// RRV GS bridge (pcsx2-gs-bridge-linux.patch): where the GS thread waits on
++// the GPU, and what the HW renderer's CPU fallbacks cost. Monotonic totals,
++// written and read on the GS thread only (the bridge samples them in GSvsync).
++// Observation only: nothing reads them back into a GS decision.
++enum class GSRrvWait : u8
++{
++	Other,    // a fence wait with no more specific cause
++	Forced,   // ExecuteCommandBuffer(wait) and downloads: a GPU->CPU readback
++	Rotation, // reusing a command buffer the GPU has not finished
++	Stream,   // a vertex/index/uniform/texture stream buffer ran out of space
++	Count
++};
++enum class GSRrvRead : u8
++{
++	Other,     // texture-cache lookups, ReadbackAll
++	SwPrim,    // CanUseSwPrimRender: source target read for the CPU sprite path
++	LocalRead, // InvalidateLocalMem: the guest reads GS memory (TRXDIR=1)
++	Count
++};
++struct GSRrvWaitStats
++{
++	u64 wait_ns[static_cast<size_t>(GSRrvWait::Count)];
++	u64 waits[static_cast<size_t>(GSRrvWait::Count)];
++	u64 acquire_ns, acquires; // vkAcquireNextImageKHR: time the GS thread was blocked in it or on it
++	u64 acquire_bg_ns; // its time on the helper thread (even frame pacing on)
++	u64 present_ns, presents; // vkQueuePresentKHR
++	u64 submits, midframe_submits; // vkQueueSubmit; those without a present
++	u64 sw_prim_ns, sw_prims; // SwPrimRender (CPU sprite/CLUT draws)
++	u64 read_ns[static_cast<size_t>(GSRrvRead::Count)];
++	u64 reads[static_cast<size_t>(GSRrvRead::Count)];
++	u64 read_pixels; // GSTextureCache::Read area, unscaled pixels
++	u32 swapchain_images;
++	bool async_acquire;
++};
++extern GSRrvWaitStats g_rrv_wait_stats;
++extern GSRrvWait g_rrv_wait_reason;
++extern GSRrvRead g_rrv_read_cause;
++u64 GSRrvNowNs();
++// Sets the cause of the fence waits in its scope.
++struct GSRrvWaitReasonScope
++{
++	GSRrvWait saved;
++	explicit GSRrvWaitReasonScope(GSRrvWait reason) : saved(g_rrv_wait_reason) { g_rrv_wait_reason = reason; }
++	~GSRrvWaitReasonScope() { g_rrv_wait_reason = saved; }
++};
++// Sets the cause of the texture-cache reads in its scope.
++struct GSRrvReadCauseScope
++{
++	GSRrvRead saved;
++	explicit GSRrvReadCauseScope(GSRrvRead cause) : saved(g_rrv_read_cause) { g_rrv_read_cause = cause; }
++	~GSRrvReadCauseScope() { g_rrv_read_cause = saved; }
++};
+ void GSvsync(u32 field, bool registers_written);
+ // Manual frameskip (Android low-end devices): present 1 of every (frames+1)
+ // VSyncs, skipping presentation of the rest. 0 disables. See GSRenderer::VSync.
+diff --git a/pcsx2/GS/GSXXH.cpp b/pcsx2/GS/GSXXH.cpp
+index 5212aa12ce..bf37f499e0 100644
+--- a/pcsx2/GS/GSXXH.cpp
++++ b/pcsx2/GS/GSXXH.cpp
+@@ -30,6 +30,17 @@ u32 CURRENT_ISA::GSXXH3_64_Update(void* state, const void* data, size_t len)
+ 	return XXH3_64bits_update(static_cast<XXH3_state_t*>(state), static_cast<const xxh_u8*>(data), len);
+ }
+ 
++// RRV (Linux/Vulkan bridge): consumes one whole 256-byte block into a streaming state straight from its source,
++// exactly as XXH3_64bits_update() does when it consumes its internal buffer, without first copying the block into
++// that buffer. The caller (BlockHashAccumulate, GSTextureCache.cpp) keeps the state's invariants.
++void CURRENT_ISA::GSXXH3_64_Block256(void* state, const void* block)
++{
++	XXH3_state_t* st = static_cast<XXH3_state_t*>(state);
++	const unsigned char* secret = (st->extSecret == NULL) ? st->customSecret : st->extSecret;
++	XXH3_consumeStripes(st->acc, &st->nbStripesSoFar, st->nbStripesPerBlock, static_cast<const xxh_u8*>(block),
++		256 / XXH_STRIPE_LEN, secret, st->secretLimit, XXH3_accumulate, XXH3_scrambleAcc);
++}
++
+ u64 CURRENT_ISA::GSXXH3_64_Digest(void* state)
+ {
+ 	return XXH3_64bits_digest(static_cast<XXH3_state_t*>(state));
+diff --git a/pcsx2/GS/GSXXH.h b/pcsx2/GS/GSXXH.h
+index 91c9983d58..2addab411c 100644
+--- a/pcsx2/GS/GSXXH.h
++++ b/pcsx2/GS/GSXXH.h
+@@ -14,6 +14,7 @@
+ MULTI_ISA_DEF(u64 GSXXH3_64_Long(const void* data, size_t len);)
+ MULTI_ISA_DEF(u32 GSXXH3_64_Update(void* state, const void* data, size_t len);)
+ MULTI_ISA_DEF(u64 GSXXH3_64_Digest(void* state);)
++MULTI_ISA_DEF(void GSXXH3_64_Block256(void* state, const void* block);)
+ 
+ static inline u64 __forceinline GSXXH3_64bits(const void* data, size_t len)
+ {
+diff --git a/pcsx2/GS/MultiISA.cpp b/pcsx2/GS/MultiISA.cpp
+index 247e9b3b15..047ab65684 100644
+--- a/pcsx2/GS/MultiISA.cpp
++++ b/pcsx2/GS/MultiISA.cpp
+@@ -104,3 +104,4 @@ const ProcessorFeatures g_cpu = getProcessorFeatures();
+ u64 (&MultiISAFunctions::GSXXH3_64_Long)(const void* data, size_t len) = MULTI_ISA_SELECT(GSXXH3_64_Long);
+ u32 (&MultiISAFunctions::GSXXH3_64_Update)(void* state, const void* data, size_t len) = MULTI_ISA_SELECT(GSXXH3_64_Update);
+ u64 (&MultiISAFunctions::GSXXH3_64_Digest)(void* state) = MULTI_ISA_SELECT(GSXXH3_64_Digest);
++void (&MultiISAFunctions::GSXXH3_64_Block256)(void* state, const void* block) = MULTI_ISA_SELECT(GSXXH3_64_Block256);
+diff --git a/pcsx2/GS/MultiISA.h b/pcsx2/GS/MultiISA.h
+index 70f171df78..9a3224653a 100644
+--- a/pcsx2/GS/MultiISA.h
++++ b/pcsx2/GS/MultiISA.h
+@@ -83,4 +83,5 @@ namespace MultiISAFunctions
+ 	extern u64 (&GSXXH3_64_Long)(const void* data, size_t len);
+ 	extern u32 (&GSXXH3_64_Update)(void* state, const void* data, size_t len);
+ 	extern u64 (&GSXXH3_64_Digest)(void* state);
++	extern void (&GSXXH3_64_Block256)(void* state, const void* block);
+ }
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index aa6aaadc0b..e25cb7752d 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -11389,7 +11389,10 @@ bool GSRendererHW::CanUseSwPrimRender(bool no_rt, bool no_ds, bool draw_sprite_t
+ 				(!src_target->m_32_bits_fmt || GSLocalMemory::m_psm[m_cached_ctx.TEX0.PSM].bpp != 16))
+ 			{
+ 				if (req_readback)
++				{
++					const GSRrvReadCauseScope rrv_cause(GSRrvRead::SwPrim); // pcsx2-gs-bridge-linux.patch
+ 					g_texture_cache->Read(src_target, src_target->m_drawn_since_read);
++				}
+ 				return true;
+ 			}
+ 
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHWMultiISA.cpp b/pcsx2/GS/Renderers/HW/GSRendererHWMultiISA.cpp
+index 5c16c015ea..cb86a1b9aa 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHWMultiISA.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHWMultiISA.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "GSRendererHW.h"
+ #include "GS/Renderers/SW/GSLevelOfDetail.h"
++#include "GS/GS.h"
+ 
+ #include "GS/Renderers/Common/GSSwPrimRender.h"
+ #include "GS/Renderers/SW/GSTextureCacheSW.h"
+@@ -47,6 +48,18 @@ static GIFRegDIMX s_last_dimx;
+ 
+ bool GSRendererHWFunctions::SwPrimRender(GSRendererHW& hw, bool invalidate_tc, bool add_ee_transfer)
+ {
++	// RRV GS bridge (pcsx2-gs-bridge-linux.patch): this rasterizes on the GS
++	// thread itself (GSSingleRasterizer), so its whole cost is GS-thread time.
++	struct RrvSwPrimScope
++	{
++		const u64 start = GSRrvNowNs();
++		~RrvSwPrimScope()
++		{
++			g_rrv_wait_stats.sw_prim_ns += GSRrvNowNs() - start;
++			g_rrv_wait_stats.sw_prims++;
++		}
++	} rrv_sw_prim;
++
+ 	const GSVector4i bbox = GSSwPrimRenderBBox(hw.m_vt, hw.m_context->scissor.in);
+ 	if (!GSSwPrimRenderFunctions::Run(hw, hw.m_sw_prim, bbox))
+ 		return false;
+diff --git a/pcsx2/GS/Renderers/HW/GSTextureCache.cpp b/pcsx2/GS/Renderers/HW/GSTextureCache.cpp
+index 06e8084ef9..77c5a5c17e 100644
+--- a/pcsx2/GS/Renderers/HW/GSTextureCache.cpp
++++ b/pcsx2/GS/Renderers/HW/GSTextureCache.cpp
+@@ -5193,6 +5193,7 @@ void GSTextureCache::InvalidateVideoMem(const GSOffset& off, const GSVector4i& r
+ void GSTextureCache::InvalidateLocalMem(
+ 	const GSOffset& off, const GSVector4i& r, bool full_flush, bool force_synchronous)
+ {
++	const GSRrvReadCauseScope rrv_cause(GSRrvRead::LocalRead); // pcsx2-gs-bridge-linux.patch
+ 	const u32 bp = off.bp();
+ 	const u32 psm = off.psm();
+ 	[[maybe_unused]] const u32 bw = off.bw();
+@@ -7619,6 +7620,20 @@ void GSTextureCache::Read(Target* t, const GSVector4i& r, bool force_synchronous
+ 	if ((!t->m_dirty.empty() && !t->m_dirty.GetTotalRect(t->m_TEX0, t->m_unscaled_size).rintersect(r).rempty()) || r.width() == 0 || r.height() == 0)
+ 		return;
+ 
++	// RRV GS bridge (pcsx2-gs-bridge-linux.patch): a GPU->CPU readback; the
++	// download's fence wait is also in the Forced wait bucket.
++	struct RrvReadScope
++	{
++		const u64 start = GSRrvNowNs();
++		~RrvReadScope()
++		{
++			const size_t cause = static_cast<size_t>(g_rrv_read_cause);
++			g_rrv_wait_stats.read_ns[cause] += GSRrvNowNs() - start;
++			g_rrv_wait_stats.reads[cause]++;
++		}
++	} rrv_read;
++	g_rrv_wait_stats.read_pixels += static_cast<u64>(r.width()) * static_cast<u64>(r.height());
++
+ 	const GIFRegTEX0& TEX0 = t->m_TEX0;
+ 	const bool is_depth = (t->m_type == DepthStencil);
+ 
+@@ -7852,6 +7867,19 @@ void GSTextureCache::Read(Source* t, const GSVector4i& r)
+ 	if (r.rempty())
+ 		return;
+ 
++	// RRV GS bridge (pcsx2-gs-bridge-linux.patch): see Read(Target*).
++	struct RrvReadScope
++	{
++		const u64 start = GSRrvNowNs();
++		~RrvReadScope()
++		{
++			const size_t cause = static_cast<size_t>(g_rrv_read_cause);
++			g_rrv_wait_stats.read_ns[cause] += GSRrvNowNs() - start;
++			g_rrv_wait_stats.reads[cause]++;
++		}
++	} rrv_read;
++	g_rrv_wait_stats.read_pixels += static_cast<u64>(r.width()) * static_cast<u64>(r.height());
++
+ 	const GSVector4i drc(0, 0, r.width(), r.height());
+ 
+ 	if (!PrepareDownloadTexture(drc.z, drc.w, GSTexture::Format::Color, &m_color_download_texture))
+@@ -9496,26 +9524,64 @@ GSTextureCache::SourceRegion GSTextureCache::SourceRegion::Create(GIFRegTEX0 TEX
+ 	return region;
+ }
+ 
+-using BlockHashState = XXH3_state_t;
++// RRV (Linux/Vulkan bridge): the same stock XXH3 stream hash, without the copy of every 256-byte GS block into the
++// streaming state's buffer (libc memmove was 6% of the GS thread in the 14-car race start on the Steam Deck,
++// 119 of 187 samples from GSXXH3_64_Update; 2026-10-05). XXH3_64bits_update() holds each block in its buffer
++// until the next one arrives and then consumes the buffer. Here the previous block stays where it is (GS local
++// memory; nothing writes it while a texture is hashed), is consumed in place when the next block arrives, and the
++// final block is put in the buffer at the end, which is the state the stock update leaves. Any other update, and a
++// block that arrives when the buffer is not empty, goes through the stock update. The values are bit-identical.
++struct BlockHashState
++{
++	XXH3_state_t st;
++	const u8* pending; // a whole block that counts as "in the buffer" and is not copied there yet
++};
+ 
+ __fi static void BlockHashReset(BlockHashState& st)
+ {
+-	XXH3_64bits_reset(&st);
++	XXH3_64bits_reset(&st.st);
++	st.pending = nullptr;
++}
++
++__fi static void BlockHashFlush(BlockHashState& st)
++{
++	if (!st.pending)
++		return;
++	memcpy(st.st.buffer, st.pending, GS_BLOCK_SIZE);
++	st.st.bufferedSize = GS_BLOCK_SIZE;
++	st.pending = nullptr;
+ }
+ 
+ __fi static void BlockHashAccumulate(BlockHashState& st, const u8* bp)
+ {
+-	GSXXH3_64bits_update(&st, bp, GS_BLOCK_SIZE);
++	static_assert(GS_BLOCK_SIZE == 256 && XXH3_INTERNALBUFFER_SIZE == 256);
++	if (st.pending)
++	{
++		MultiISAFunctions::GSXXH3_64_Block256(&st.st, st.pending);
++		st.pending = bp;
++		st.st.totalLen += GS_BLOCK_SIZE;
++	}
++	else if (st.st.bufferedSize == 0)
++	{
++		st.pending = bp;
++		st.st.totalLen += GS_BLOCK_SIZE;
++	}
++	else
++	{
++		GSXXH3_64bits_update(&st.st, bp, GS_BLOCK_SIZE);
++	}
+ }
+ 
+ __fi static void BlockHashAccumulate(BlockHashState& st, const u8* bp, u32 size)
+ {
+-	GSXXH3_64bits_update(&st, bp, size);
++	BlockHashFlush(st);
++	GSXXH3_64bits_update(&st.st, bp, size);
+ }
+ 
+ __fi static GSTextureCache::HashType FinishBlockHash(BlockHashState& st)
+ {
+-	return GSXXH3_64bits_digest(&st);
++	BlockHashFlush(st);
++	return GSXXH3_64bits_digest(&st.st);
+ }
+ 
+ static bool HashTextureLevel(const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA, GSTextureCache::SourceRegion region, BlockHashState& hash_st)
+diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
+index f043847818..c29a513a0f 100644
+--- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
++++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
+@@ -1740,7 +1740,13 @@ void GSDeviceVK::ReportDeviceFault()
+ void GSDeviceVK::WaitForCommandBufferCompletion(u32 index)
+ {
+ 	// Wait for this command buffer to be completed.
++	// RRV GS bridge (pcsx2-gs-bridge-linux.patch): time every fence wait and
++	// charge it to the cause the caller set (GSRrvWaitReasonScope).
++	const u64 rrv_wait_start = GSRrvNowNs();
+ 	const VkResult res = vkWaitForFences(m_device, 1, &m_frame_resources[index].fence, VK_TRUE, UINT64_MAX);
++	const size_t rrv_reason = static_cast<size_t>(g_rrv_wait_reason);
++	g_rrv_wait_stats.wait_ns[rrv_reason] += GSRrvNowNs() - rrv_wait_start;
++	g_rrv_wait_stats.waits[rrv_reason]++;
+ 	if (res != VK_SUCCESS)
+ 	{
+ 		LOG_VULKAN_ERROR(res, "vkWaitForFences failed: ");
+@@ -1769,10 +1775,16 @@ void GSDeviceVK::WaitForCommandBufferCompletion(u32 index)
+ 	m_completed_fence_counter = now_completed_counter;
+ }
+ 
++// RRV GS bridge (Linux/Vulkan): set by SubmitCommandBuffer when the
++// presentation engine accepted the swap-chain image; read by EndPresent.
++// Only the GS thread submits, so no synchronisation is needed.
++static bool s_rrv_present_accepted = false;
++
+ void GSDeviceVK::SubmitCommandBuffer(VKSwapChain* present_swap_chain)
+ {
+ 	m_render_passes_since_submit = 0;
+ 
++	s_rrv_present_accepted = false;
+ 	FrameResources& resources = m_frame_resources[m_current_frame];
+ 
+ 	// End the current command buffer.
+@@ -1897,6 +1909,9 @@ void GSDeviceVK::SubmitCommandBuffer(VKSwapChain* present_swap_chain)
+ 		m_last_submit_failed = true;
+ 		return;
+ 	}
++	g_rrv_wait_stats.submits++;
++	if (!present_swap_chain)
++		g_rrv_wait_stats.midframe_submits++;
+ 
+ 	if (spin_cycles != 0)
+ 		SubmitSpinCommand(m_current_frame, spin_cycles);
+@@ -1928,7 +1943,10 @@ void GSDeviceVK::SubmitCommandBuffer(VKSwapChain* present_swap_chain)
+ 
+ 		const bool stats = VKSwapChain::IsPresentStatsEnabled();
+ 		const Common::Timer::Value t_present_start = stats ? Common::Timer::GetCurrentValue() : 0;
++		const u64 rrv_present_start = GSRrvNowNs();
+ 		res = vkQueuePresentKHR(m_present_queue, &present_info);
++		g_rrv_wait_stats.present_ns += GSRrvNowNs() - rrv_present_start;
++		g_rrv_wait_stats.presents++;
+ 		if (stats)
+ 		{
+ 			const double present_elapsed_ms =
+@@ -1947,10 +1965,12 @@ void GSDeviceVK::SubmitCommandBuffer(VKSwapChain* present_swap_chain)
+ 			return;
+ 		}
+ 
++		s_rrv_present_accepted = true;
++
+ 		// Grab the next image as soon as possible, that way we spend less time blocked on the next
+ 		// submission. Don't care if it fails, we'll deal with that at the presentation call site.
+ 		// Credit to dxvk for the idea.
+-		present_swap_chain->AcquireNextImage();
++		present_swap_chain->AcquireNextImageAfterPresent();
+ 	}
+ }
+ 
+@@ -2016,7 +2036,10 @@ void GSDeviceVK::ActivateCommandBuffer(u32 index)
+ 	// coming round -- the pipeline is full -- not a stall anybody asked for, so it is deliberately
+ 	// outside GSPerfMon::GpuBlockingWaits.
+ 	if (resources.fence_counter > m_completed_fence_counter)
++	{
++		const GSRrvWaitReasonScope rrv_reason(GSRrvWait::Rotation);
+ 		WaitForCommandBufferCompletion(index);
++	}
+ 
+ 	// Reset fence to unsignaled before starting.
+ 	VkResult res = vkResetFences(m_device, 1, &resources.fence);
+@@ -2109,6 +2132,7 @@ void GSDeviceVK::ExecuteCommandBuffer(WaitType wait_for_completion)
+ 		// WaitForFenceCounter's.
+ 		g_perfmon.Put(GSPerfMon::GpuBlockingWaits, 1);
+ 
++		const GSRrvWaitReasonScope rrv_reason(GSRrvWait::Forced);
+ 		// Calibrate while we wait
+ 		if (m_wants_new_timestamp_calibration)
+ 			CalibrateSpinTimestamp();
+@@ -3397,6 +3421,15 @@ void GSDeviceVK::EndPresent()
+ 		GSLsfg::Shutdown();
+ 
+ 	SubmitCommandBuffer(m_swap_chain.get());
++	// RRV GS bridge (pcsx2-gs-bridge-linux.patch): the Vulkan counterpart of
++	// GSDeviceMTL::EndPresent's GSRrvRecordDirectPresent (target patch). Count
++	// a frame present only after vkQueuePresentKHR accepted the image, so
++	// skipped/out-of-date/lost presents and the swap chain's initial blank
++	// frame (RenderBlankFrame) do not inflate the bridge's present counter.
++	// A swap chain only exists for a real window, which in the bridge is
++	// always the RRV-supplied X11/Wayland surface.
++	if (s_rrv_present_accepted)
++		GSRrvRecordDirectPresent();
+ 	MoveToNextCommandBuffer();
+ 
+ 	InvalidateCachedState();
+@@ -7255,6 +7288,8 @@ void GSDeviceVK::DestroyResources()
+ 
+ 	for (auto& it : m_tfx_pipelines)
+ 		vkDestroyPipeline(m_device, it.second, nullptr);
++	for (RrvPipelineCacheEntry& entry : m_rrv_pipeline_cache)
++		entry.pipeline = VK_NULL_HANDLE;
+ 	for (auto& it : m_tfx_fragment_shaders)
+ 		vkDestroyShaderModule(m_device, it.second, nullptr);
+ 	for (auto& it : m_tfx_vertex_shaders)
+@@ -7694,40 +7729,54 @@ VkPipeline GSDeviceVK::CreateTFXPipeline(const PipelineSelector& p)
+ 
+ VkPipeline GSDeviceVK::GetTFXPipeline(const PipelineSelector& p)
+ {
++	RrvPipelineCacheEntry& front = m_rrv_pipeline_cache[PipelineSelectorHash()(p) % m_rrv_pipeline_cache.size()];
++	if (front.pipeline != VK_NULL_HANDLE && front.sel == p)
++		return front.pipeline;
++
++	VkPipeline pipeline;
+ 	const auto it = m_tfx_pipelines.find(p);
+ 	if (it != m_tfx_pipelines.end())
+-		return it->second;
+-
+-	// A cache miss compiles SYNCHRONOUSLY on the GS thread, freezing the picture for as long as the
+-	// driver takes. Normally invisible (a few ms, spread out), but fast-forward runs through content
+-	// at 4x+ and hits a burst of new variants at once — which is the other half of "turn fast-forward
+-	// off and it hangs for a few seconds". Timed so the stall is measurable instead of inferred;
+-	// only slow compiles are logged, so this costs nothing in the common case.
+-	const Common::Timer::Value tfx_compile_start = Common::Timer::GetCurrentValue();
+-	VkPipeline pipeline = CreateTFXPipeline(p);
+-	const double tfx_compile_ms =
+-		Common::Timer::ConvertValueToMilliseconds(Common::Timer::GetCurrentValue() - tfx_compile_start);
+-	if (tfx_compile_ms >= 20.0)
+-	{
+-		Console.Warning("@@ANDROID_TFXCOMPILE@@ %.1f ms for one pipeline (n=%u since last cache flush)",
+-			tfx_compile_ms, m_tfx_pipeline_compile_counter + 1);
+-	}
+-	m_tfx_pipelines.emplace(p, pipeline);
+-
+-	// Persist the pipeline cache every N new compiles so an Android OOM-kill
+-	// or crash mid-session doesn't throw away pipelines that compiled after
+-	// the last onPause flush. Android gets a larger threshold because the log
+-	// showed repeated synchronous disk writes during normal gameplay in heavy
+-	// scenes; onPause still performs a final flush.
++	{
++		pipeline = it->second;
++	}
++	else
++	{
++		// A cache miss compiles SYNCHRONOUSLY on the GS thread, freezing the picture for as long as the
++		// driver takes. Normally invisible (a few ms, spread out), but fast-forward runs through content
++		// at 4x+ and hits a burst of new variants at once — which is the other half of "turn fast-forward
++		// off and it hangs for a few seconds". Timed so the stall is measurable instead of inferred;
++		// only slow compiles are logged, so this costs nothing in the common case.
++		const Common::Timer::Value tfx_compile_start = Common::Timer::GetCurrentValue();
++		pipeline = CreateTFXPipeline(p);
++		const double tfx_compile_ms =
++			Common::Timer::ConvertValueToMilliseconds(Common::Timer::GetCurrentValue() - tfx_compile_start);
++		if (tfx_compile_ms >= 20.0)
++		{
++			Console.Warning("@@ANDROID_TFXCOMPILE@@ %.1f ms for one pipeline (n=%u since last cache flush)",
++				tfx_compile_ms, m_tfx_pipeline_compile_counter + 1);
++		}
++		m_tfx_pipelines.emplace(p, pipeline);
++
++		// Persist the pipeline cache every N new compiles so an Android OOM-kill
++		// or crash mid-session doesn't throw away pipelines that compiled after
++		// the last onPause flush. Android gets a larger threshold because the log
++		// showed repeated synchronous disk writes during normal gameplay in heavy
++		// scenes; onPause still performs a final flush.
+ #ifdef __ANDROID__
+-	static constexpr u32 PIPELINE_CACHE_FLUSH_THRESHOLD = 256;
++		static constexpr u32 PIPELINE_CACHE_FLUSH_THRESHOLD = 256;
+ #else
+-	static constexpr u32 PIPELINE_CACHE_FLUSH_THRESHOLD = 32;
++		static constexpr u32 PIPELINE_CACHE_FLUSH_THRESHOLD = 32;
+ #endif
+-	if (g_vulkan_shader_cache && ++m_tfx_pipeline_compile_counter >= PIPELINE_CACHE_FLUSH_THRESHOLD)
++		if (g_vulkan_shader_cache && ++m_tfx_pipeline_compile_counter >= PIPELINE_CACHE_FLUSH_THRESHOLD)
++		{
++			m_tfx_pipeline_compile_counter = 0;
++			g_vulkan_shader_cache->FlushPipelineCache();
++		}
++	}
++	if (pipeline != VK_NULL_HANDLE)
+ 	{
+-		m_tfx_pipeline_compile_counter = 0;
+-		g_vulkan_shader_cache->FlushPipelineCache();
++		front.sel = p;
++		front.pipeline = pipeline;
+ 	}
+ 	return pipeline;
+ }
+diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h
+index ca35a64b1f..4811b28e6b 100644
+--- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h
++++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h
+@@ -566,6 +566,15 @@ private:
+ 		m_tfx_fragment_shaders;
+ 	std::unordered_map<PipelineSelector, VkPipeline, PipelineSelectorHash> m_tfx_pipelines;
+ 	u32 m_tfx_pipeline_compile_counter = 0;
++	// RRV GS bridge (Linux): a direct-mapped front for m_tfx_pipelines. GetTFXPipeline runs once per draw and the
++	// map's modulo and node chase were 0.25-0.4 ms per start of the GS thread in the 14-car race start (Steam Deck,
++	// 2026-10-05). Pipelines are never destroyed before DestroyResources(), so an entry cannot go stale there.
++	struct RrvPipelineCacheEntry
++	{
++		PipelineSelector sel;
++		VkPipeline pipeline = VK_NULL_HANDLE;
++	};
++	std::array<RrvPipelineCacheEntry, 512> m_rrv_pipeline_cache;
+ 
+ 	VkRenderPass m_utility_color_render_pass_load = VK_NULL_HANDLE;
+ 	VkRenderPass m_utility_color_render_pass_clear = VK_NULL_HANDLE;
+diff --git a/pcsx2/GS/Renderers/Vulkan/GSTextureVK.cpp b/pcsx2/GS/Renderers/Vulkan/GSTextureVK.cpp
+index 8ecfa77bb3..1ef3d9a64a 100644
+--- a/pcsx2/GS/Renderers/Vulkan/GSTextureVK.cpp
++++ b/pcsx2/GS/Renderers/Vulkan/GSTextureVK.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "GS/GSGL.h"
+ #include "GS/GSPerfMon.h"
++#include "GS/GS.h"
+ #include "GS/Renderers/Vulkan/GSDeviceVK.h"
+ #include "GS/Renderers/Vulkan/GSTextureVK.h"
+ #include "GS/Renderers/Vulkan/VKBuilders.h"
+@@ -1049,6 +1050,7 @@ void GSDownloadTextureVK::Flush()
+ 	}
+ 	else
+ 	{
++		const GSRrvWaitReasonScope rrv_reason(GSRrvWait::Forced); // pcsx2-gs-bridge-linux.patch
+ 		GSDeviceVK::GetInstance()->WaitForFenceCounter(m_copy_fence_counter);
+ 	}
+ }
+diff --git a/pcsx2/GS/Renderers/Vulkan/VKStreamBuffer.cpp b/pcsx2/GS/Renderers/Vulkan/VKStreamBuffer.cpp
+index c578581553..38e13c1f81 100644
+--- a/pcsx2/GS/Renderers/Vulkan/VKStreamBuffer.cpp
++++ b/pcsx2/GS/Renderers/Vulkan/VKStreamBuffer.cpp
+@@ -4,6 +4,7 @@
+ #include "GS/Renderers/Vulkan/GSDeviceVK.h"
+ #include "GS/Renderers/Vulkan/VKBuilders.h"
+ #include "GS/Renderers/Vulkan/VKStreamBuffer.h"
++#include "GS/GS.h"
+ 
+ #include "common/Assertions.h"
+ #include "common/BitUtils.h"
+@@ -403,7 +404,10 @@ bool VKStreamBuffer::WaitForClearSpace(u32 num_bytes)
+ 	// Charged to THIS buffer. Every stream ring used to land on the same undifferentiated sync
+ 	// figure, so "the host is out of staging room" and "the host is draining a readback" read as
+ 	// one number, and the two want opposite fixes.
+-	GSDeviceVK::GetInstance()->WaitForFenceCounter(iter->first);
++	{
++		const GSRrvWaitReasonScope rrv_reason(GSRrvWait::Stream); // pcsx2-gs-bridge-linux.patch
++		GSDeviceVK::GetInstance()->WaitForFenceCounter(iter->first);
++	}
+ 	m_tracked_fences.erase(
+ 		m_tracked_fences.begin(), m_current_offset == iter->second ? m_tracked_fences.end() : ++iter);
+ 	m_current_offset = new_offset;
+diff --git a/pcsx2/GS/Renderers/Vulkan/VKSwapChain.cpp b/pcsx2/GS/Renderers/Vulkan/VKSwapChain.cpp
+index 3f93282958..7fa4194110 100644
+--- a/pcsx2/GS/Renderers/Vulkan/VKSwapChain.cpp
++++ b/pcsx2/GS/Renderers/Vulkan/VKSwapChain.cpp
+@@ -5,6 +5,7 @@
+ #include "GS/Renderers/Vulkan/GSDeviceVK.h"
+ #include "GS/Renderers/Vulkan/VKBuilders.h"
+ #include "GS/Renderers/Vulkan/VKSwapChain.h"
++#include "GS/GS.h"
+ #include "VMManager.h"
+ 
+ #include "common/Assertions.h"
+@@ -16,6 +17,13 @@
+ #include <array>
+ #include <atomic>
+ #include <cmath>
++#include <cstdlib>
++#include <mutex>
++#include <thread>
++
++#if defined(__linux__)
++#include <pthread.h>
++#endif
+ 
+ #if defined(VK_USE_PLATFORM_XLIB_KHR)
+ #include <X11/Xlib.h>
+@@ -70,6 +78,7 @@ VKSwapChain::VKSwapChain(const WindowInfo& wi, VkSurfaceKHR surface, VkPresentMo
+ 
+ VKSwapChain::~VKSwapChain()
+ {
++	RrvStopAcquireThread();
+ 	DestroySwapChainImages();
+ 	DestroySwapChain();
+ 	DestroySurface();
+@@ -835,6 +844,7 @@ bool VKSwapChain::CreateSwapChain()
+ 
+ 	m_images.reserve(image_count);
+ 	m_current_image = 0;
++	g_rrv_wait_stats.swapchain_images = image_count; // pcsx2-gs-bridge-linux.patch
+ 	for (u32 i = 0; i < image_count; i++)
+ 	{
+ 		std::unique_ptr<GSTextureVK> texture =
+@@ -876,6 +886,7 @@ bool VKSwapChain::CreateSwapChain()
+ 
+ void VKSwapChain::DestroySwapChainImages()
+ {
++	RrvJoinAcquire();
+ 	for (auto& it : m_images)
+ 	{
+ 		// don't defer view destruction, images are no longer valid
+@@ -917,6 +928,7 @@ VkFormat VKSwapChain::GetTextureFormat() const
+ 
+ VkResult VKSwapChain::AcquireNextImage()
+ {
++	RrvJoinAcquire();
+ 	if (m_image_acquire_result.has_value())
+ 		return m_image_acquire_result.value();
+ 
+@@ -928,6 +940,9 @@ VkResult VKSwapChain::AcquireNextImage()
+ 
+ 	const bool stats = s_stats_enabled.load(std::memory_order_relaxed);
+ 	const Common::Timer::Value t_start = stats ? Common::Timer::GetCurrentValue() : 0;
++	// RRV GS bridge (pcsx2-gs-bridge-linux.patch): with FIFO this can block the
++	// GS thread until the presentation engine releases an image.
++	const u64 rrv_acquire_start = GSRrvNowNs();
+ 	// ★ Bounded, NOT UINT64_MAX. On Android the surface can be destroyed under us (background,
+ 	// rotate, fold) while the GS thread is ALREADY inside this call — at which point an infinite
+ 	// timeout waits forever on a window nothing will ever present to. Everything that could
+@@ -942,6 +957,8 @@ VkResult VKSwapChain::AcquireNextImage()
+ 	VkResult res = vkAcquireNextImageKHR(GSDeviceVK::GetInstance()->GetDevice(), m_swap_chain,
+ 		ACQUIRE_TIMEOUT_NS, m_semaphores[m_current_semaphore].available_semaphore, VK_NULL_HANDLE,
+ 		&m_current_image);
++	g_rrv_wait_stats.acquire_ns += GSRrvNowNs() - rrv_acquire_start;
++	g_rrv_wait_stats.acquires++;
+ 	if (stats)
+ 	{
+ 		const double elapsed_ms =
+@@ -959,8 +976,114 @@ VkResult VKSwapChain::AcquireNextImage()
+ 	return res;
+ }
+ 
++// RRV GS bridge (pcsx2-gs-bridge-linux.patch). PCSX2 acquires the next image
++// right after each present, on the GS thread, with no timeout. With FIFO that
++// waits until the presentation engine frees an image, and the wait grows with
++// the internal scale (Steam Deck, 14-car race start: 0.3 ms per field at 1x,
++// 2.4 ms at 3x) while the thread has the next field to decode; at 3x that
++// pushed fields over their 16.7 ms (docs/TESTING.md T-DECK-GS-WAIT). Here that
++// one call runs on a helper thread. It follows the even-pacing setting:
++// RRV_PCSX2_GS_PRESENT_PACING=0 (menu "Even frame pacing" off) keeps PCSX2's
++// acquire on the GS thread. Vulkan wants the swap chain externally
++// synchronised: the GS thread does not use it until RrvJoinAcquire() returned
++// (every entry point that touches the swap chain, its images or its semaphores
++// calls it first). Presentation only: which image a frame lands in does not
++// reach the guest.
++void VKSwapChain::AcquireNextImageAfterPresent()
++{
++	static const bool enabled = [] {
++		const char* value = std::getenv("RRV_PCSX2_GS_PRESENT_PACING");
++		return !(value && value[0] == '0');
++	}();
++	g_rrv_wait_stats.async_acquire = enabled;
++	if (!enabled || !m_swap_chain || m_image_acquire_result.has_value())
++	{
++		AcquireNextImage();
++		return;
++	}
++	RrvJoinAcquire();
++	if (!m_rrv_acquire)
++	{
++		m_rrv_acquire = std::make_unique<RrvAcquire>();
++		RrvAcquire* const a = m_rrv_acquire.get();
++		const VkDevice device = GSDeviceVK::GetInstance()->GetDevice();
++		a->thread = std::thread([a, device] {
++#if defined(__linux__)
++			pthread_setname_np(pthread_self(), "rrv-vk-acquire");
++#endif
++			std::unique_lock lock(a->mutex);
++			for (;;)
++			{
++				a->cv.wait(lock, [a] { return a->request || a->quit; });
++				if (a->quit)
++					return;
++				a->request = false;
++				const VkSwapchainKHR swap_chain = a->swap_chain;
++				const VkSemaphore semaphore = a->semaphore;
++				lock.unlock();
++				u32 image = 0;
++				const u64 start = GSRrvNowNs();
++				const VkResult result =
++					vkAcquireNextImageKHR(device, swap_chain, UINT64_MAX, semaphore, VK_NULL_HANDLE, &image);
++				const u64 ns = GSRrvNowNs() - start;
++				lock.lock();
++				a->image = image;
++				a->result = result;
++				a->ns = ns;
++				a->done = true;
++				a->cv.notify_all();
++			}
++		});
++	}
++
++	// Use a different semaphore for each image.
++	m_current_semaphore = (m_current_semaphore + 1) % static_cast<u32>(m_semaphores.size());
++	{
++		std::lock_guard lock(m_rrv_acquire->mutex);
++		m_rrv_acquire->swap_chain = m_swap_chain;
++		m_rrv_acquire->semaphore = m_semaphores[m_current_semaphore].available_semaphore;
++		m_rrv_acquire->done = false;
++		m_rrv_acquire->request = true;
++	}
++	m_rrv_acquire->cv.notify_all();
++	m_rrv_acquire_pending = true;
++}
++
++void VKSwapChain::RrvJoinAcquire()
++{
++	if (!m_rrv_acquire_pending)
++		return;
++	m_rrv_acquire_pending = false;
++	RrvAcquire* const a = m_rrv_acquire.get();
++	// acquire_ns stays "the GS thread was blocked on the swap chain": only the
++	// part of the acquire that is still running when the thread needs the image.
++	const u64 start = GSRrvNowNs();
++	std::unique_lock lock(a->mutex);
++	a->cv.wait(lock, [a] { return a->done; });
++	g_rrv_wait_stats.acquire_ns += GSRrvNowNs() - start;
++	g_rrv_wait_stats.acquires++;
++	g_rrv_wait_stats.acquire_bg_ns += a->ns;
++	m_current_image = a->image;
++	m_image_acquire_result = a->result;
++}
++
++void VKSwapChain::RrvStopAcquireThread()
++{
++	RrvJoinAcquire();
++	if (!m_rrv_acquire)
++		return;
++	{
++		std::lock_guard lock(m_rrv_acquire->mutex);
++		m_rrv_acquire->quit = true;
++	}
++	m_rrv_acquire->cv.notify_all();
++	m_rrv_acquire->thread.join();
++	m_rrv_acquire.reset();
++}
++
+ void VKSwapChain::ReleaseCurrentImage()
+ {
++	RrvJoinAcquire();
+ 	if (!m_image_acquire_result.has_value())
+ 		return;
+ 
+@@ -989,6 +1112,7 @@ void VKSwapChain::ReleaseCurrentImage()
+ 
+ void VKSwapChain::ResetImageAcquireResult()
+ {
++	RrvJoinAcquire();
+ 	m_image_acquire_result.reset();
+ }
+ 
+diff --git a/pcsx2/GS/Renderers/Vulkan/VKSwapChain.h b/pcsx2/GS/Renderers/Vulkan/VKSwapChain.h
+index 67d1c95252..1e278032b8 100644
+--- a/pcsx2/GS/Renderers/Vulkan/VKSwapChain.h
++++ b/pcsx2/GS/Renderers/Vulkan/VKSwapChain.h
+@@ -9,8 +9,11 @@
+ #include "common/WindowInfo.h"
+ 
+ #include <array>
++#include <condition_variable>
+ #include <memory>
++#include <mutex>
+ #include <optional>
++#include <thread>
+ #include <vector>
+ 
+ class VKSwapChain
+@@ -102,6 +105,12 @@ public:
+ 	/// not acquire more than this: doing so is undefined behaviour, not a recoverable error.
+ 	__fi u32 GetExtraAcquirableImages() const { return m_extra_acquirable_images; }
+ 	VkResult AcquireNextImage();
++	// RRV GS bridge (pcsx2-gs-bridge-linux.patch): the acquire that follows a
++	// present. With even frame pacing on it runs on a helper thread and
++	// the GS thread goes on with the next field; AcquireNextImage() (the next
++	// BeginPresent) and everything that touches the swap chain wait for it
++	// first. Otherwise it is AcquireNextImage().
++	void AcquireNextImageAfterPresent();
+ 	void ReleaseCurrentImage();
+ 	void ResetImageAcquireResult();
+ 
+@@ -144,5 +153,25 @@ private:
+ 	VkPresentModeKHR m_present_mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+ 
+ 	std::optional<VkResult> m_image_acquire_result;
++
++	// RRV async acquire. The helper thread only calls vkAcquireNextImageKHR with
++	// the semaphore it was handed and writes image/result/ns under the mutex; the
++	// swap chain's own fields stay with the GS thread (RrvJoinAcquire copies).
++	struct RrvAcquire
++	{
++		std::thread thread;
++		std::mutex mutex;
++		std::condition_variable cv;
++		bool request = false, done = false, quit = false;
++		VkSwapchainKHR swap_chain = VK_NULL_HANDLE;
++		VkSemaphore semaphore = VK_NULL_HANDLE;
++		u32 image = 0;
++		VkResult result = VK_SUCCESS;
++		u64 ns = 0;
++	};
++	std::unique_ptr<RrvAcquire> m_rrv_acquire;
++	bool m_rrv_acquire_pending = false; // GS thread only
++	void RrvJoinAcquire();
++	void RrvStopAcquireThread();
+ 	std::optional<bool> m_exclusive_fullscreen_control;
+ };
+-- 
+2.53.0
+
