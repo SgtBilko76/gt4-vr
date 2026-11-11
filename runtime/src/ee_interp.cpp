@@ -555,8 +555,15 @@ void interpret(Cpu &c, std::uint32_t, std::uint32_t depth) {
                 if (frame_count() != frame) {
                     frame = frame_count();
                     ++g_epoch_src[4];
-                    static const bool frame_bump = [] { const char *v = std::getenv("PS2_EE_EPOCH_FRAME"); return !v || v[0] != '0'; }();
-                    if (frame_bump) code_may_change();
+                    // Safety re-check of all compiled blocks every N frames (PS2_EE_EPOCH_FRAME=N, 0 = never). It was
+                    // every frame (1.1 ms per frame on the Quest: ~9500 blocks re-compared and their links broken);
+                    // GT4 has no runtime-loaded code (port.sh: 0 window images) and FlushCache(2) / I-cache ops
+                    // still re-check at once. [perf] "ee stale" counts blocks it ever found changed.
+                    static const std::uint64_t every = [] {
+                        const char *v = std::getenv("PS2_EE_EPOCH_FRAME");
+                        return v ? std::strtoull(v, nullptr, 10) : 600ull;
+                    }();
+                    if (every && frame % every == 0) code_may_change();
                     static const bool stats = std::getenv("PS2_EE_EPOCH_STATS") != nullptr;
                     if (stats && frame % 600 == 0)
                         std::fprintf(stderr, "[ee] epoch bumps by source: icache-op %llu, dcache-op %llu, flush-icache %llu, flush-dcache %llu, frame %llu, exec %llu\n",
