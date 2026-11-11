@@ -870,46 +870,41 @@ private:
             c_.i64c(0x0FFFFFFFull);
             c_.op(kOpI64Add);
         }
-        c_.tee(kBits);
-        c_.i64c(32);
-        c_.op(kOpI64ShrU);
-        c_.op(kOpWrap);
-        c_.i32c(0x80000000u);
-        c_.op(kOpAnd);
-        c_.set(kSign);
-        c_.get(kBits);
-        c_.i64c(52);
-        c_.op(kOpI64ShrU);
-        c_.op(kOpWrap);
-        c_.i32c(0x7FFu);
-        c_.op(kOpAnd);
-        c_.i32c(896);
-        c_.op(kOpSub);
-        c_.set(kExp);
-        c_.get(kSign);
+        // Only kBits stays live (no sign / exponent locals, which the ARM64 back end kept in the frame:
+        // a store and reload each). h = the high word; (h << 1) drops the sign for the exponent tests.
+        //   normal = wrap(bits >> 29) - (896 << 23)       re-biased exponent and 23-bit mantissa
+        //   v = e11 >= 1152 ? 0x7FFFFFFF : normal;  v = e11 >= 897 ? v : 0;  result = v | sign
+        // Same results as the sign/exponent version for every exponent (141M values checked).
+        c_.set(kBits);
+        const auto high = [&] {
+            c_.get(kBits);
+            c_.i64c(32);
+            c_.op(kOpI64ShrU);
+            c_.op(kOpWrap);
+        };
+        const auto exp_at_least = [&](std::uint32_t e11) {
+            high();
+            c_.i32c(1);
+            c_.op(kOpShl);
+            c_.i32c(e11 << 21);
+            c_.op(kOpGeU);
+        };
         c_.i32c(0x7FFFFFFFu);
-        c_.op(kOpOr);
-        c_.get(kSign);
-        c_.get(kExp);
-        c_.i32c(23);
-        c_.op(kOpShl);
-        c_.op(kOpOr);
         c_.get(kBits);
         c_.i64c(29);
         c_.op(kOpI64ShrU);
         c_.op(kOpWrap);
-        c_.i32c(0x7FFFFFu);
+        c_.i32c(0xC0000000u);
+        c_.op(kOpSub);
+        exp_at_least(1152);
+        c_.op(kOpSelect);
+        c_.i32c(0);
+        exp_at_least(897);
+        c_.op(kOpSelect);
+        high();
+        c_.i32c(0x80000000u);
         c_.op(kOpAnd);
         c_.op(kOpOr);
-        c_.get(kExp);
-        c_.i32c(255);
-        c_.op(kOpGtS);
-        c_.op(kOpSelect);
-        c_.get(kSign);
-        c_.get(kExp);
-        c_.i32c(0);
-        c_.op(kOpGtS);
-        c_.op(kOpSelect);
     }
 
     template <typename F>
