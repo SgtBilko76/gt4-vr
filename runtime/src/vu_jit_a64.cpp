@@ -42,6 +42,7 @@ static_assert(sizeof(vuops::FlagPipe::mh) == 4 && sizeof(vuops::FlagPipe::t) == 
               "flag_stub: 32-bit fields within ldr w immediates");
 const bool g_regbase = [] { const char *v = std::getenv("PS2_VU_JIT_REGBASE"); return !v || std::strcmp(v, "0") != 0; }();
 const bool g_flagstub = [] { const char *v = std::getenv("PS2_VU_JIT_FLAGSTUB"); return !v || std::strcmp(v, "0") != 0; }();
+const bool g_pin_const = [] { const char *v = std::getenv("PS2_VU_JIT_PINCONST"); return !v || std::strcmp(v, "0") != 0; }();
 const bool g_movi = [] { const char *v = std::getenv("PS2_VU_JIT_MOVI"); return !v || std::strcmp(v, "0") != 0; }();
 const bool g_retarget = [] { const char *v = std::getenv("PS2_VU_JIT_RETARGET"); return !v || std::strcmp(v, "0") != 0; }();  // regs(1) and g_vu1_mem relative to g_base (init_base)
 
@@ -270,6 +271,7 @@ private:
     // d8..d15 are saved in the prologue as the ABI requires). The rest stay in the frame.
     void allocate_locals() {
         std::vector<std::uint32_t> uses(local_type_.size(), 0), writes(local_type_.size(), 0);
+        std::map<std::uint32_t, std::uint32_t> const_uses;
         Reader r = rd_;
         unsigned depth = 0;
         bool done = false;
@@ -289,6 +291,16 @@ private:
                 }
                 break;
             }
+            case 0xFD: {  // count splat v128.const values: candidates for a pinned register
+                Reader peek = r;
+                if (peek.u32() == 0x0C) {
+                    std::uint32_t lane[4] = {};
+                    for (int k = 0; k < 16; ++k) lane[k / 4] |= static_cast<std::uint32_t>(peek.byte()) << (8 * (k % 4));
+                    if (lane[0] == lane[1] && lane[0] == lane[2] && lane[0] == lane[3]) ++const_uses[lane[0]];
+                }
+                skip_immediates_in(r, op);
+                break;
+            }
             default: skip_immediates_in(r, op); break;
             }
         }
@@ -300,6 +312,30 @@ private:
         std::stable_sort(order.begin(), order.end(), [&](std::uint32_t a, std::uint32_t b) { return uses[a] > uses[b]; });
         local_reg_.assign(local_type_.size(), -1);
         unsigned next_int = 0, next_vec = 0;
+        // Splat constants used often (the clamp masks: thousands of times in the big programs) get a vector
+        // register for the whole program when they are used more than the vector local they displace: each
+        // use is then no instruction at all (PS2_VU_JIT_PINCONST=0: off). Ranked against the vector locals.
+        if (g_pin_const) {
+            std::vector<std::uint32_t> vec_counts;
+            for (std::uint32_t l = 0; l < local_type_.size(); ++l)
+                if (uses[l] && !(local_type_[l] == I32 || local_type_[l] == I64)) vec_counts.push_back(uses[l]);
+            std::sort(vec_counts.rbegin(), vec_counts.rend());
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> cands;  // (uses, value)
+            for (const auto &[value, n] : const_uses)
+                if (n >= 16) cands.emplace_back(n, value);
+            std::sort(cands.rbegin(), cands.rend());
+            const unsigned regs = sizeof kVecLocalRegs / sizeof kVecLocalRegs[0];
+            unsigned pinned = 0;
+            for (const auto &[n, value] : cands) {
+                if (pinned >= kMaxPinned) break;
+                // the local that would lose its register: the (regs - pinned)-th most used one
+                const std::size_t loser = regs - pinned - 1;
+                if (loser < vec_counts.size() && vec_counts[loser] >= n) break;
+                pinned_.push_back({value, kVecLocalRegs[regs - 1 - pinned]});
+                ++pinned;
+            }
+            vec_regs_avail_ = regs - pinned;
+        }
         for (std::uint32_t l : order) {
             if (!uses[l]) break;
             if (local_type_[l] == I32 || local_type_[l] == I64) ++locals_used_int_;
@@ -310,7 +346,7 @@ private:
                     local_reg_[l] = static_cast<int>(kIntLocalRegs[next_int++]);
                     if (caller_saved_int(static_cast<unsigned>(local_reg_[l]))) scratch_int_locals_.push_back(l);
                 }
-            } else if (next_vec < sizeof kVecLocalRegs / sizeof kVecLocalRegs[0]) {
+            } else if (next_vec < vec_regs_avail_) {
                 local_reg_[l] = static_cast<int>(kVecLocalRegs[next_vec++]);
                 vec_locals_.push_back(l);
             }
@@ -322,7 +358,16 @@ private:
         for (std::uint32_t l : vec_locals_) frame_st(V128, static_cast<unsigned>(local_reg_[l]), local_off_[l]);
         for (std::uint32_t l : scratch_int_locals_) frame_st(I64, static_cast<unsigned>(local_reg_[l]), local_off_[l]);
     }
+    // The pinned constants (caller-saved vector registers): set in the prologue and again after a call.
+    void load_pinned() {
+        for (const auto &[value, reg] : pinned_)
+            if (!splat_imm(reg, value)) {
+                pool_refs_.push_back({code_.size(), {value, value, value, value}});
+                w(0x9C000000u | reg);  // ldr q, literal
+            }
+    }
     void load_vec_locals() {
+        load_pinned();
         for (std::uint32_t l : vec_locals_) frame_ld(V128, static_cast<unsigned>(local_reg_[l]), local_off_[l]);
         for (std::uint32_t l : scratch_int_locals_) frame_ld(I64, static_cast<unsigned>(local_reg_[l]), local_off_[l]);
     }
@@ -538,6 +583,7 @@ private:
             if (local_reg_[p] >= 0) w(0x2A0003E0u | p << 16 | static_cast<unsigned>(local_reg_[p]));  // mov w, wp
             else frame_st(I32, p, local_off_[p]);
         }
+        load_pinned();
     }
     void epilogue() {
         add_sp(frame_);
@@ -1156,6 +1202,21 @@ private:
 
     // Vector ops that read lazy register locals directly.
     bool lazy_simd(std::uint32_t sub) {
+        if (sub == 0x0C && !pinned_.empty()) {
+            Reader peek = rd_;
+            std::uint32_t lane[4] = {};
+            for (int k = 0; k < 16; ++k) lane[k / 4] |= static_cast<std::uint32_t>(peek.byte()) << (8 * (k % 4));
+            if (lane[0] == lane[1] && lane[0] == lane[2] && lane[0] == lane[3])
+                for (const auto &[value, reg] : pinned_)
+                    if (value == lane[0]) {
+                        rd_ = peek;
+                        if (!push(V128)) return true;
+                        sync_lazy();
+                        lz_[top()] = Lazy{kReg, reg, 0};
+                        ++pinned_hits_;
+                        return true;
+                    }
+        }
         static const struct {
             std::uint32_t sub, enc;
             bool swap;
@@ -1849,10 +1910,15 @@ private:
     std::vector<Ctrl> ctrl_;
     bool dead_ = false;
     std::size_t barrier_ = 0;
-    std::vector<std::pair<std::size_t, std::uint32_t>> stub_calls_;  // bl positions + flag_stub kind     // code index of the last branch target: retarget_last never crosses it
+    std::vector<std::pair<std::size_t, std::uint32_t>> stub_calls_;
+    static constexpr unsigned kMaxPinned = 6;
+    std::vector<std::pair<std::uint32_t, unsigned>> pinned_;  // splat value, vector register
+    unsigned vec_regs_avail_ = sizeof kVecLocalRegs / sizeof kVecLocalRegs[0];  // bl positions + flag_stub kind     // code index of the last branch target: retarget_last never crosses it
     bool range_error_ = false;
 public:
     std::size_t retargeted_ = 0;  // local.set movs saved (stats)
+    std::size_t pinned_hits_ = 0;  // v128.const uses served by a pinned register (stats)
+    std::size_t pinned_count() const { return pinned_.size(); }
     std::size_t max_depth_ = 0;
     std::size_t locals_used_int_ = 0, locals_used_vec_ = 0;
 private:
@@ -1899,8 +1965,8 @@ ProgramFn compile_a64(const std::uint8_t *code, std::uint32_t entry) {
     std::uint32_t *fn = place(words);
     // PS2_VU_JIT_DUMP=<dir>: raw ARM64 code of every compiled program (vu1_<entry>_<address>.bin).
     if (const char *dir = std::getenv("PS2_VU_JIT_DUMP")) {
-        std::fprintf(stderr, "[vu-jit] %04X: %zu words, stack depth %zu, locals used %zu int / %zu vec, %zu movs saved\n", entry, words.size(),
-                     c.max_depth_, c.locals_used_int_, c.locals_used_vec_, c.retargeted_);
+        std::fprintf(stderr, "[vu-jit] %04X: %zu words, stack depth %zu, locals used %zu int / %zu vec, %zu movs saved, %zu consts pinned (%zu uses)\n", entry, words.size(),
+                     c.max_depth_, c.locals_used_int_, c.locals_used_vec_, c.retargeted_, c.pinned_count(), c.pinned_hits_);
         char name[512];
         std::snprintf(name, sizeof name, "%s/vu1_%04X_%llx.bin", dir, entry, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(fn)));
         if (std::FILE *f = std::fopen(name, "wb")) {
