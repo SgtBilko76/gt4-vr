@@ -7,6 +7,9 @@
 // returns with c.pc = the return address; anything else in c.pc (a thread switch, kUnwind, an
 // exception) makes every frame return to the main loop, which dispatches c.pc again. `jr $ra` sets
 // c.pc and returns. Jumps and branches stay in this frame.
+#include <vector>
+#include <algorithm>
+#include <unordered_map>
 #include "ee_core.hpp"
 #include "ps2/system.hpp"
 
@@ -517,6 +520,31 @@ void interpret(Cpu &c, std::uint32_t, std::uint32_t depth) {
         }
         const std::uint64_t r = use_jit ? jit_block(c) : interp_block(c);
         const std::uint32_t at = static_cast<std::uint32_t>(r >> 32);
+        {  // PS2_EE_EXIT_STATS=1: exits back to this loop by kind, and the busiest kNext / kJr targets
+            static const bool exit_stats = std::getenv("PS2_EE_EXIT_STATS") != nullptr;
+            if (exit_stats) [[unlikely]] {
+                static std::uint64_t kinds[16], total = 0;
+                static std::unordered_map<std::uint32_t, std::uint64_t> next_from, jr_to;
+                const unsigned k = static_cast<unsigned>(r & 0xFu);
+                ++kinds[k];
+                if (k == kNext) ++next_from[c.pc];
+                if (k == kJr) ++jr_to[c.pc];
+                if ((++total & ((1u << 22) - 1)) == 0) {
+                    std::fprintf(stderr, "[ee] exits %llu: next %llu back %llu call %llu return %llu jr %llu syscall %llu other %llu\n",
+                                 (unsigned long long)total, (unsigned long long)kinds[kNext], (unsigned long long)kinds[kBack],
+                                 (unsigned long long)kinds[kCall], (unsigned long long)kinds[kReturn], (unsigned long long)kinds[kJr],
+                                 (unsigned long long)kinds[kSyscall], (unsigned long long)(total - kinds[kNext] - kinds[kBack] - kinds[kCall] - kinds[kReturn] - kinds[kJr] - kinds[kSyscall]));
+                    for (auto *m : {&next_from, &jr_to}) {
+                        std::vector<std::pair<std::uint64_t, std::uint32_t>> v;
+                        for (const auto &[pc, n] : *m) v.emplace_back(n, pc);
+                        std::sort(v.rbegin(), v.rend());
+                        std::fprintf(stderr, "[ee]   %s (%zu distinct):", m == &next_from ? "next -> pc" : "jr -> pc", v.size());
+                        for (std::size_t q = 0; q < v.size() && q < 8; ++q) std::fprintf(stderr, " %08X:%llu", v[q].second, (unsigned long long)v[q].first);
+                        std::fprintf(stderr, "\n");
+                    }
+                }
+            }
+        }
         switch (static_cast<Exit>(r & 0xFFu)) {
         case kNext:
         case kJr:

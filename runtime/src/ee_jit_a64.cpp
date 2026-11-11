@@ -71,7 +71,14 @@ void ee_h_cache(std::uint32_t rt) { cache_op(rt); }
 std::uint64_t ee_h_call(Cpu *c, std::uint32_t target, std::uint32_t ret) {
     const std::uint32_t d = g_depth;
     c->pc = target;
-    call(*c, target, d + 1u);
+    // Without generated code (interpreting()) call() -> dispatch() only checks the depth, logs
+    // PS2_TRACE_CALLS and enters interpret(), which repeats dispatch's pc checks: go there directly.
+    static const bool direct = interpreting() && !std::getenv("PS2_TRACE_CALLS") && !std::getenv("PS2_EE_CALL_SLOW");
+    if (direct) {
+        if (d + 1u < kMaxDepth) interpret(*c, 0, d + 1u);
+    } else {
+        call(*c, target, d + 1u);
+    }
     g_depth = d;
     return c->pc == ret ? 1u : 0u;
 }
