@@ -236,6 +236,12 @@ public:
     void movi_zero_q(unsigned d) { w(0x6F00E400u | d); }  // movi vd.2d, #0
     // zip1 vd, vn, vm (size: 1 = 8h, 2 = 4s, 3 = 2d)
     void zip1(unsigned d, unsigned n, unsigned m, unsigned size) { w(0x4E003800u | size << 22 | m << 16 | n << 5 | d); }
+    // 128-bit NEON ops for MMI (q = 1). size: 0 = 16b, 1 = 8h, 2 = 4s, 3 = 2d
+    void vop3(std::uint32_t base, unsigned d, unsigned n, unsigned m, unsigned size = 0) { w(base | size << 22 | m << 16 | n << 5 | d); }
+    void shl_8h(unsigned d, unsigned n, unsigned sh) { w(0x4F005400u | (16u + sh) << 16 | n << 5 | d); }   // sh 1..15
+    void ushr_8h(unsigned d, unsigned n, unsigned sh) { w(0x6F000400u | (32u - sh) << 16 | n << 5 | d); }  // sh 1..15
+    void sshr_8h(unsigned d, unsigned n, unsigned sh) { w(0x4F000400u | (32u - sh) << 16 | n << 5 | d); }  // sh 1..15
+    void mvn_q(unsigned d, unsigned n) { w(0x6E205800u | n << 5 | d); }
     void add_xi(unsigned d, unsigned n, std::uint32_t imm12) { w(0x91000000u | imm12 << 10 | n << 5 | d); }
     // control
     void blr(unsigned n) { w(0xD63F0000u | n << 5); }
@@ -730,6 +736,59 @@ public:
             a_.str_q(2, C, gr(rd));
             return;
         }
+        // MMI lane ops in NEON (video / image loops: paddh, pextlb, ppacb, pmaxh ... were ~88 % of the
+        // simple() calls while a movie plays). s = rs, t = rt as in mmi.hpp; PS2_EE_JIT_MMI=0: simple() as before.
+        case Paddb: case Paddh: case Paddw: case Psubb: case Psubh: case Psubw: case Pmaxh: case Pminh: case Pmaxw: case Pminw:
+        case Pand: case Por: case Pxor: case Pnor: case Pextlb: case Pextub: case Pextuh: case Pextuw: case Ppacb: case Ppach: case Ppacw:
+        case Pcpyud: {
+            static const bool on = [] { const char *v = std::getenv("PS2_EE_JIT_MMI"); return !v || v[0] != '0'; }();
+            if (!on) break;
+            if (!rd) return;
+            if (rs) a_.ldr_q(1, C, gr(rs)); else a_.movi_zero_q(1);  // v1 = s
+            if (rt) a_.ldr_q(0, C, gr(rt)); else a_.movi_zero_q(0);  // v0 = t
+            switch (i.op) {
+            case Paddb: a_.vop3(0x4E208400u, 2, 1, 0, 0); break;
+            case Paddh: a_.vop3(0x4E208400u, 2, 1, 0, 1); break;
+            case Paddw: a_.vop3(0x4E208400u, 2, 1, 0, 2); break;
+            case Psubb: a_.vop3(0x6E208400u, 2, 1, 0, 0); break;
+            case Psubh: a_.vop3(0x6E208400u, 2, 1, 0, 1); break;
+            case Psubw: a_.vop3(0x6E208400u, 2, 1, 0, 2); break;
+            case Pmaxh: a_.vop3(0x4E206400u, 2, 1, 0, 1); break;  // smax
+            case Pminh: a_.vop3(0x4E206C00u, 2, 1, 0, 1); break;  // smin
+            case Pmaxw: a_.vop3(0x4E206400u, 2, 1, 0, 2); break;
+            case Pminw: a_.vop3(0x4E206C00u, 2, 1, 0, 2); break;
+            case Pand: a_.vop3(0x4E201C00u, 2, 1, 0); break;
+            case Por: a_.vop3(0x4EA01C00u, 2, 1, 0); break;
+            case Pxor: a_.vop3(0x6E201C00u, 2, 1, 0); break;
+            case Pnor: a_.vop3(0x4EA01C00u, 2, 1, 0); a_.mvn_q(2, 2); break;
+            case Pextlb: a_.vop3(0x4E003800u, 2, 0, 1, 0); break;  // zip1 t, s
+            case Pextub: a_.vop3(0x4E007800u, 2, 0, 1, 0); break;  // zip2 t, s
+            case Pextuh: a_.vop3(0x4E007800u, 2, 0, 1, 1); break;
+            case Pextuw: a_.vop3(0x4E007800u, 2, 0, 1, 2); break;
+            case Ppacb: a_.vop3(0x4E001800u, 2, 0, 1, 0); break;   // uzp1 t, s
+            case Ppach: a_.vop3(0x4E001800u, 2, 0, 1, 1); break;
+            case Ppacw: a_.vop3(0x4E001800u, 2, 0, 1, 2); break;
+            case Pcpyud: a_.vop3(0x4E007800u, 2, 1, 0, 3); break;  // zip2 s, t (.2d): s.d[1], t.d[1]
+            default: break;
+            }
+            a_.str_q(2, C, gr(rd));
+            return;
+        }
+        case Psllh: case Psrlh: case Psrah: {
+            static const bool on = [] { const char *v = std::getenv("PS2_EE_JIT_MMI"); return !v || v[0] != '0'; }();
+            if (!on) break;
+            if (!rd) return;
+            const unsigned sh = i.sa() & 15u;
+            if (rt) a_.ldr_q(0, C, gr(rt)); else a_.movi_zero_q(0);
+            if (!sh) a_.str_q(0, C, gr(rd));
+            else {
+                if (i.op == Psllh) a_.shl_8h(2, 0, sh);
+                else if (i.op == Psrlh) a_.ushr_8h(2, 0, sh);
+                else a_.sshr_8h(2, 0, sh);
+                a_.str_q(2, C, gr(rd));
+            }
+            return;
+        }
         case Ldl: case Ldr: case Lwl: case Lwr:
             if (!rt) return;
             address(i);
@@ -1035,6 +1094,13 @@ Block *compile(std::uint32_t pc) {
     g_chunks.back().used += (a.bytes() + 15u) & ~std::size_t{15};
     b->fn = reinterpret_cast<std::uint64_t (*)(Cpu *)>(a.start());
     ++g_compiled;
+    // PS2_EE_JIT_MAP=file: "host_start size ps2_pc words" per block, to map profiler samples back to game code
+    static FILE *map = [] { const char *p = std::getenv("PS2_EE_JIT_MAP"); return p ? std::fopen(p, "w") : nullptr; }();
+    if (map) {
+        std::fprintf(map, "%llx %zx %08x %u\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(a.start())), a.bytes(), pc,
+                     static_cast<unsigned>(b->words));
+        std::fflush(map);
+    }
     auto &slot = g_blocks[pc];
     if (slot) g_retired.push_back(std::move(slot));
     slot = std::move(b);
