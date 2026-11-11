@@ -29,13 +29,18 @@ constexpr ImportType kImportTypes[kImports] = {
 };
 
 enum Local : std::uint32_t {
-    kR, kMem, kPend, kPendj, kEnding, kJpc, kPcw, kExit, kUclip, kTmp, kTmp2, kMacv, kStat, kSlot, kT, kSign, kExp, kBi, kBk, kBkNext, kVi0, kI32Locals = kVi0 + 16,
+    kR, kMem, kPend, kPendj, kEnding, kJpc, kPcw, kExit, kUclip, kTmp, kTmp2, kMacv, kStat, kSlot, kT, kStatL, kExp, kBi, kBk, kBkNext, kVi0, kI32Locals = kVi0 + 16,
     kBits = kI32Locals, kUv, kV0, kV1, kV2, kV3, kV4, kV5, kShadow0
 };
 constexpr std::uint32_t kI32Count = kI32Locals - 2;
 constexpr std::uint32_t kVecTemps = kShadow0 - kUv;
 
 constexpr std::uint32_t kOne = 0x3F800000u;
+// kStatL: a copy of Vu0Regs::status for the whole program. Every write still goes to memory (exits,
+// imports and the interpreter read it there); reads take the local, so a flag update no longer waits for
+// the previous one's store (load-after-store chain: ~30 % of the car-select program 2058).
+// PS2_VU_JIT_STATL=0: read from memory as before.
+const bool g_stat_local = [] { const char *v = std::getenv("PS2_VU_JIT_STATL"); return !v || v[0] != '0'; }();
 
 std::uint32_t vf_off(unsigned reg) { return static_cast<std::uint32_t>(offsetof(Vu0Regs, vf) + reg * 16u); }
 std::uint32_t reg_off(int reg) { return reg == kAcc ? static_cast<std::uint32_t>(offsetof(Vu0Regs, acc)) : vf_off(static_cast<unsigned>(reg)); }
@@ -727,8 +732,7 @@ private:
         c_.get(kR);
         c_.get(kMacv);
         c_.store(kOffMac);
-        c_.get(kR);
-        c_.load(kOffStatus);
+        status_read();
         c_.i32c(0xFF0u);
         c_.op(kOpAnd);
         const std::pair<std::uint32_t, std::uint32_t> groups[3] = {{0xFu, 0}, {0xF0u, 1}, {0xF000u, 3}};
@@ -754,7 +758,7 @@ private:
         c_.set(kStat);
         c_.get(kR);
         c_.get(kStat);
-        c_.store(kOffStatus);
+        status_write();
         fl();
         fl();
         c_.load(kOffMh);
@@ -923,10 +927,23 @@ private:
         c_.store8(kOffQPending);
     }
 
+    // status reads / writes (see kStatL): write leaves nothing on the stack, like store
+    void status_read() {
+        if (g_stat_local) {
+            c_.get(kStatL);
+        } else {
+            c_.get(kR);
+            c_.load(kOffStatus);
+        }
+    }
+    void status_write() {
+        if (g_stat_local) c_.tee(kStatL);
+        c_.store(kOffStatus);
+    }
+
     void divide_status(std::uint32_t divisor) {
         c_.get(kR);
-        c_.get(kR);
-        c_.load(kOffStatus);
+        status_read();
         c_.i32c(~0x30u);
         c_.op(kOpAnd);
         c_.i32c(0);
@@ -936,7 +953,7 @@ private:
         c_.op(kOpAnd);
         c_.op(kOpSelect);
         c_.op(kOpOr);
-        c_.store(kOffStatus);
+        status_write();
     }
 
     void clip_value(const Up &u);
@@ -1712,13 +1729,12 @@ bool Translator::lower(std::uint32_t w, std::uint32_t pc) {
 void Translator::fsset(std::uint32_t w) {
     const std::uint32_t imm12 = ((w >> 10) & 0x800u) | (w & 0x7FFu);
     c_.get(kR);
-    c_.get(kR);
-    c_.load(kOffStatus);
+    status_read();
     c_.i32c(0x3Fu);
     c_.op(kOpAnd);
     c_.i32c(imm12 & 0xFC0u);
     c_.op(kOpOr);
-    c_.store(kOffStatus);
+    status_write();
     fl();
     c_.get(kR);
     c_.call(kForceMac);
@@ -1868,6 +1884,11 @@ void Translator::prologue() {
         fl();
         c_.get(kV0);
         c_.vstore(to + 16u);
+    }
+    if (g_stat_local) {
+        c_.get(kR);
+        c_.load(kOffStatus);
+        c_.set(kStatL);
     }
     fl();
     c_.i32c(0);
