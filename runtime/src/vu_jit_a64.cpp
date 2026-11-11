@@ -782,8 +782,11 @@ private:
         const std::size_t base = stack_.size() - imp.params;
         for (std::size_t d = 0; d < base; ++d) frame_st(stack_[d], reg_of(d), spill_off_ + 16u * static_cast<std::uint32_t>(d));
         for (std::size_t k = 0; k < imp.params; ++k) frame_st(I64, ireg(base + k), args_off_ + 8u * static_cast<std::uint32_t>(k));
-        for (std::size_t k = 0; k < imp.params; ++k) frame_ld(I32, static_cast<unsigned>(k), args_off_ + 8u * static_cast<std::uint32_t>(k));
+        // Save the register locals BEFORE the arguments go to x0..x3: integer locals may live in x3..x8,
+        // and a 4-argument import (efu) loads x3 - saving afterwards stored the argument as the local's
+        // value, so the local came back wrong (broken lighting / reflections: EFU normalises vectors).
         save_vec_locals();
+        for (std::size_t k = 0; k < imp.params; ++k) frame_ld(I32, static_cast<unsigned>(k), args_off_ + 8u * static_cast<std::uint32_t>(k));
         movx(X16, reinterpret_cast<std::uint64_t>(imp.fn));
         w(0xD63F0000u | X16 << 5);  // blr x16
         stack_.resize(base);

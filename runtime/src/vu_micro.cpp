@@ -865,6 +865,13 @@ void check_jit_against_interpreter(ProgramFn jit, std::uint32_t pc) {
     jit(g_vu1, g_vu1_mem);
     jit::g_dry = false;
     const std::int64_t jit_escape = jit::g_escape;
+    // A program the JIT left early is finished by the interpreter from there (as the real path does),
+    // without kicks, and compared too: those were ~85 % of the calls and were not checked before.
+    if (jit_escape >= 0) {
+        g_reference_dry = true;
+        run_fast(1, static_cast<std::uint32_t>(jit_escape));
+        g_reference_dry = false;
+    }
     const Vu0Regs after = g_vu1;
     std::memcpy(jit_mem, g_vu1_mem, sizeof jit_mem);
     g_vu1 = before;
@@ -872,7 +879,7 @@ void check_jit_against_interpreter(ProgramFn jit, std::uint32_t pc) {
     run_fast(1, pc);
     ++calls;
     if (jit_escape >= 0) ++escapes;
-    else if (std::memcmp(&after, &g_vu1, sizeof after) != 0 || std::memcmp(jit_mem, g_vu1_mem, sizeof jit_mem) != 0) {
+    if (std::memcmp(&after, &g_vu1, sizeof after) != 0 || std::memcmp(jit_mem, g_vu1_mem, sizeof jit_mem) != 0) {
         // PS2_VU_SNAP=<dir>: save the state before the call for tests/vu_jit_a64_test.cpp
         // (code, data memory, registers, entry, TOP/ITOP), up to 8 snapshots.
         static const char *snap = std::getenv("PS2_VU_SNAP");
@@ -896,8 +903,8 @@ void check_jit_against_interpreter(ProgramFn jit, std::uint32_t pc) {
                 if (after.vi[i] != g_vu1.vi[i]) vi = i;
             for (int i = 0; i < 16384 && word < 0; ++i)
                 if (jit_mem[i] != g_vu1_mem[i]) word = i;
-            std::fprintf(stderr, "[jit] differs from the interpreter at entry 0x%04X key %016llX: vf%d vi%d q/p/i/r %d flags %d mem %d\n", pc & 16383u,
-                         static_cast<unsigned long long>(g_entries[(pc & 16383u) >> 3].key), vf, vi,
+            std::fprintf(stderr, "[jit] differs from the interpreter at entry 0x%04X key %016llX%s: vf%d vi%d q/p/i/r %d flags %d mem %d\n", pc & 16383u,
+                         static_cast<unsigned long long>(g_entries[(pc & 16383u) >> 3].key), jit_escape >= 0 ? " (left early)" : "", vf, vi,
                          after.q != g_vu1.q || after.p != g_vu1.p || after.i != g_vu1.i || after.r != g_vu1.r,
                          after.mac != g_vu1.mac || after.status != g_vu1.status || after.clip != g_vu1.clip, word);
         }
@@ -905,6 +912,83 @@ void check_jit_against_interpreter(ProgramFn jit, std::uint32_t pc) {
     if (calls % 2000 == 0)
         std::fprintf(stderr, "[jit] checked %llu interpreted calls, %llu mismatches, %llu left early\n", static_cast<unsigned long long>(calls),
                      static_cast<unsigned long long>(mismatches), static_cast<unsigned long long>(escapes));
+}
+
+// PS2_VU_SHADOW=N (with PS2_VU_JIT=all or a build without generated code, so every program is the JIT):
+// every Nth VU1 call, before the real run, the JIT and the interpreter both run dry from the same state
+// (a JIT program that leaves early is finished by the interpreter, as the real path does) and are
+// compared. The real run is unchanged, so this works while playing. Differences are logged with the
+// values; PS2_VU_SNAP=<dir> saves up to 2 snapshots per program (tests/vu_jit_a64_test.cpp format).
+void shadow_check(ProgramFn jit, std::uint32_t pc) {
+    static std::uint64_t calls = 0, mismatches = 0;
+    static std::unordered_map<std::uint64_t, int> per_key;
+    static std::uint8_t before_mem[16384], jit_mem[16384];
+    const Vu0Regs before = g_vu1;
+    std::memcpy(before_mem, g_vu1_mem, sizeof before_mem);
+    std::vector<std::uint32_t> kicks;
+    jit::g_dry = true;
+    jit::g_escape = -1;
+    jit::g_kicks = &kicks;
+    jit(g_vu1, g_vu1_mem);
+    jit::g_dry = false;
+    const std::int64_t escape = jit::g_escape;
+    g_reference_dry = true;
+    if (escape >= 0) run_fast(1, static_cast<std::uint32_t>(escape));
+    const Vu0Regs after = g_vu1;
+    std::memcpy(jit_mem, g_vu1_mem, sizeof jit_mem);
+    g_vu1 = before;
+    std::memcpy(g_vu1_mem, before_mem, sizeof before_mem);
+    run_fast(1, pc);
+    g_reference_dry = false;
+    ++calls;
+    const bool regs_differ = std::memcmp(&after, &g_vu1, sizeof after) != 0, mem_differs = std::memcmp(jit_mem, g_vu1_mem, sizeof jit_mem) != 0;
+    if (regs_differ || mem_differs) {
+        const std::uint64_t key = g_entries[(pc & 16383u) >> 3].key;
+        int &seen = per_key[key];
+        ++mismatches;
+        static const char *snap = std::getenv("PS2_VU_SNAP");
+        if (snap && seen < 2) {
+            char name[160];
+            std::snprintf(name, sizeof name, "%s/shadow_%016llX_%04X_%d.bin", snap, static_cast<unsigned long long>(key), pc & 16383u, seen);
+            if (std::FILE *f = std::fopen(name, "wb")) {
+                const std::uint32_t head[4] = {pc & 16383u, g_top[1], g_itop[1], static_cast<std::uint32_t>(sizeof before)};
+                std::fwrite(head, sizeof head, 1, f);
+                std::fwrite(g_vu1_code, sizeof g_vu1_code, 1, f);
+                std::fwrite(before_mem, sizeof before_mem, 1, f);
+                std::fwrite(&before, sizeof before, 1, f);
+                std::fclose(f);
+            }
+        }
+        if (seen < 3) {
+            std::fprintf(stderr, "[vu-shadow] key %016llX entry %04X%s differs (call %llu):\n", static_cast<unsigned long long>(key), pc & 16383u,
+                         escape >= 0 ? " (left early)" : "", static_cast<unsigned long long>(calls));
+            for (int i = 0; i < 32; ++i)
+                if (std::memcmp(&after.vf[i], &g_vu1.vf[i], 16) != 0)
+                    std::fprintf(stderr, "   vf%-2d jit %08X %08X %08X %08X int %08X %08X %08X %08X\n", i, after.vf[i].w[0], after.vf[i].w[1], after.vf[i].w[2],
+                                 after.vf[i].w[3], g_vu1.vf[i].w[0], g_vu1.vf[i].w[1], g_vu1.vf[i].w[2], g_vu1.vf[i].w[3]);
+            for (int i = 0; i < 16; ++i)
+                if (after.vi[i] != g_vu1.vi[i]) std::fprintf(stderr, "   vi%-2d jit %04X int %04X\n", i, after.vi[i], g_vu1.vi[i]);
+            if (after.q != g_vu1.q || after.p != g_vu1.p) std::fprintf(stderr, "   q jit %08X int %08X  p jit %08X int %08X\n", after.q, g_vu1.q, after.p, g_vu1.p);
+            if (after.mac != g_vu1.mac || after.status != g_vu1.status || after.clip != g_vu1.clip)
+                std::fprintf(stderr, "   flags jit mac %04X status %04X clip %06X int mac %04X status %04X clip %06X\n", after.mac, after.status, after.clip,
+                             g_vu1.mac, g_vu1.status, g_vu1.clip);
+            int shown = 0;
+            for (int qw = 0; qw < 1024 && shown < 4; ++qw)
+                if (std::memcmp(jit_mem + qw * 16, g_vu1_mem + qw * 16, 16) != 0) {
+                    std::uint32_t a[4], b[4];
+                    std::memcpy(a, jit_mem + qw * 16, 16);
+                    std::memcpy(b, g_vu1_mem + qw * 16, 16);
+                    std::fprintf(stderr, "   mem %04X jit %08X %08X %08X %08X int %08X %08X %08X %08X\n", qw * 16, a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]);
+                    ++shown;
+                }
+        }
+        ++seen;
+    }
+    if (calls % 500 == 0)
+        std::fprintf(stderr, "[vu-shadow] checked %llu calls, %llu differ, %zu programs\n", static_cast<unsigned long long>(calls),
+                     static_cast<unsigned long long>(mismatches), per_key.size());
+    g_vu1 = before;
+    std::memcpy(g_vu1_mem, before_mem, sizeof before_mem);
 }
 
 bool g_chaining = false;
@@ -997,6 +1081,12 @@ void run_entry(int unit, std::uint32_t pc) {
                 if (escape >= 0) interpret(1, static_cast<std::uint32_t>(escape));
                 return;
             }
+            static const std::uint64_t shadow_every = [] {
+                const char *v = std::getenv("PS2_VU_SHADOW");
+                return v ? std::strtoull(v, nullptr, 10) : 0ull;
+            }();
+            static std::uint64_t shadow_n = 0;
+            if (shadow_every && ++shadow_n % shadow_every == 0) shadow_check(fn, pc);
             if (jit && jit != fn && ++sampled % 32 == 0) check_jit(fn, jit);
             else fn(g_vu1, g_vu1_mem);
             return;
