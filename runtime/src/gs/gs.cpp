@@ -34,6 +34,7 @@ void serve_state(const void *payload);
 namespace {
 
 alignas(64) std::uint8_t g_memory[kMemorySize];
+std::vector<std::uint32_t> g_blit_scratch;
 
 std::uint64_t g_pmode, g_smode1, g_smode2, g_srfsh, g_synch1, g_synch2, g_syncv;
 std::uint64_t g_dispfb[2], g_display[2], g_extbuf, g_extdata, g_extwrite, g_bgcolor;
@@ -289,7 +290,9 @@ void local_copy() {
     const std::uint32_t dsax = static_cast<std::uint32_t>(pos >> 32) & 0x7FFu, dsay = static_cast<std::uint32_t>(pos >> 48) & 0x7FFu;
     const std::uint32_t dir = static_cast<std::uint32_t>(pos >> 59) & 3u;
     const std::uint32_t rrw = static_cast<std::uint32_t>(reg) & 0xFFFu, rrh = static_cast<std::uint32_t>(reg >> 32) & 0xFFFu;
-    std::vector<std::uint32_t> pixels(static_cast<std::size_t>(rrw) * rrh);
+    const std::size_t blit_count = static_cast<std::size_t>(rrw) * rrh;
+    g_blit_scratch.resize(blit_count);
+    auto &pixels = g_blit_scratch;
     for (std::uint32_t y = 0; y < rrh; ++y)
         for (std::uint32_t x = 0; x < rrw; ++x)
             pixels[y * rrw + x] = read_pixel(spsm, sbp, sbw, (ssax + x) & 0x7FFu, (ssay + y) & 0x7FFu);
