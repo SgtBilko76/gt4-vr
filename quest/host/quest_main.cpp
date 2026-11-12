@@ -24,6 +24,8 @@
 #include <android/log.h>
 #include <android_native_app_glue.h>
 #include <pthread.h>
+#include <sched.h>
+#include <cerrno>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -544,8 +546,41 @@ std::atomic<bool> g_game_done{false};
 std::atomic<int> g_gs_state{0};  // 0 starting, 1 ready, -1 failed
 std::string g_elf_path;
 
+// Fast cores only for the game threads (EE, VU1, GS). Quest 3: cpu0-1 2.05 GHz (capacity 848), cpu2-5
+// 2.36 GHz (1024). The Spec II log of 2026-11-11 showed the main menu's car scene at 40-45 fps with
+// gt4-vu1 at 96-98 % (real work: it sleeps on a futex when idle) - left alone, the scheduler may run
+// it on a slow core. The mask holds every core of the highest cpu_capacity, so the scheduler still
+// picks among them. config.txt RRV_PIN_FAST_CORES=0 = old behaviour (no affinity).
+void pin_fast_cores(const char *name) {
+    const char *v = std::getenv("RRV_PIN_FAST_CORES");
+    if (v && v[0] == '0') return;
+    const int n = static_cast<int>(sysconf(_SC_NPROCESSORS_CONF));
+    std::vector<int> cap(std::max(n, 0), 0);
+    int best = 0;
+    for (int c = 0; c < n; ++c) {
+        std::ifstream in("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/cpu_capacity");
+        if (!(in >> cap[c])) cap[c] = 0;
+        best = std::max(best, cap[c]);
+    }
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    std::string list;
+    for (int c = 0; c < n; ++c)
+        if (best > 0 && cap[c] == best) {
+            CPU_SET(c, &set);
+            list += (list.empty() ? "" : ",") + std::to_string(c);
+        }
+    if (list.empty()) {
+        logf("[quest] %s: no cpu_capacity, not pinned", name);
+        return;
+    }
+    const int rc = sched_setaffinity(0, sizeof set, &set);
+    logf("[quest] %s pinned to fast cores %s (capacity %d): %s", name, list.c_str(), best, rc == 0 ? "ok" : std::strerror(errno));
+}
+
 void *ee_thread_main(void *) {
     pthread_setname_np(pthread_self(), "gt4-ee");
+    pin_fast_cores("gt4-ee");
     std::uint32_t entry = 0;
     if (!ps2::load_elf(g_elf_path, entry)) {
         logf("[quest] cannot load %s", g_elf_path.c_str());
@@ -568,6 +603,7 @@ void *ee_thread_main(void *) {
 // GS work is lost.
 void gs_thread_main() {
     pthread_setname_np(pthread_self(), "gt4-gs");
+    pin_fast_cores("gt4-gs");
     gt4::quest::Surface surface;
     while (!gt4::quest::waitForSurface(&surface, 500))
         if (gt4::quest::closeRequested()) {
@@ -1001,6 +1037,7 @@ bool start_game(const fs::path &files) {
     ps2::start_vu_thread();
     std::thread([] {
         pthread_setname_np(pthread_self(), "gt4-vu1");
+        pin_fast_cores("gt4-vu1");
         ps2::run_vu_thread();
     }).detach();
 
@@ -1037,15 +1074,18 @@ std::string thread_cpu(double seconds) {
             std::istringstream rest(line.substr(close + 2));
             std::string field;
             unsigned long long utime = 0, stime = 0;
-            for (int k = 3; k <= 15 && rest >> field; ++k) {
+            int core = -1;  // field 39: the CPU the thread last ran on
+            for (int k = 3; k <= 39 && rest >> field; ++k) {
                 if (k == 14) utime = std::strtoull(field.c_str(), nullptr, 10);
                 if (k == 15) stime = std::strtoull(field.c_str(), nullptr, 10);
+                if (k == 39) core = std::atoi(field.c_str());
             }
             now[tid] = utime + stime;
             const auto p = prev.find(tid);
             if (p != prev.end() && seconds > 0) {
                 const double pct = 100.0 * static_cast<double>(now[tid] - p->second) / hz / seconds;
-                if (pct >= 10.0) busy.emplace_back(pct, line.substr(open + 1, close - open - 1));
+                if (pct >= 10.0)
+                    busy.emplace_back(pct, line.substr(open + 1, close - open - 1) + (core >= 0 ? "@c" + std::to_string(core) : ""));
             }
         }
         closedir(dir);
