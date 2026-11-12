@@ -5,7 +5,7 @@
 # usage: quest/tools/build_quest.sh [--no-apk]
 #   GAME=gt4vr    "Gran Turismo 4 VR": Spec II 1.10 (/sdcard/GT4SpecII) + retail v2.00 online (/sdcard/GT4HD)
 #                 in one APK, selector at start (default). gt4s / gt4r = one version only.
-#   VERSION_NAME  versionName (default 0.3.0-beta), VERSION_CODE versionCode (default 9)
+#   VERSION_NAME  versionName (default 0.3.1-beta), VERSION_CODE versionCode (default 10)
 #   JOBS=N        parallel compile jobs (default 4: generated units take ~1 GB each)
 #   BRIDGE_BUILD  PCSX2 GS bridge build dir (default: the Ridge Racer V port's Android bridge)
 #   NOGEN=1       no game code in the APK: the EE runs the program from the player's ISO through the
@@ -142,7 +142,7 @@ ls -la "$STAGE/jniLibs/arm64-v8a"
 cd "$ROOT/quest/android"
 [ -f local.properties ] || echo "sdk.dir=$HOME/workspace/android-sdk" > local.properties
 JAVA_HOME=$(ls -d "$HOME"/tools/jdk-17* | head -1) ./gradlew --no-daemon -q --offline assembleRelease -PgtAppId="$APP_ID" -PgtAppLabel="$APP_LABEL" -PgtLauncher="$LAUNCHER" \
-  -PgtVersionName="${VERSION_NAME:-0.3.0-beta}" -PgtVersionCode="${VERSION_CODE:-9}"
+  -PgtVersionName="${VERSION_NAME:-0.3.1-beta}" -PgtVersionCode="${VERSION_CODE:-10}"
 mkdir -p "$ROOT/build/apk"
 SUFFIX=""
 if [ "${NOGEN:-0}" = 1 ]; then SUFFIX=-nogen; fi  # an `[ ] && echo` inside $() fails the assignment under set -e
