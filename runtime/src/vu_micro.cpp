@@ -1292,6 +1292,14 @@ void run(int n, std::uint32_t address) {
         interpret(n, address);
         return;
     }
+    // PS2_VU0_FAST=1: VU0 micro programs (VCALLMS) through the fast interpreter (decode cache, flag
+    // liveness) as VU1's fallback, instead of this exact one. Ridge Racer V runs VU0 programs every
+    // frame (~38 % of the EE thread on the Quest with the exact interpreter).
+    static const bool vu0_fast = [] { const char *v = std::getenv("PS2_VU0_FAST"); return v && v[0] == '1'; }();
+    if (n == 0 && vu0_fast && !exact) {
+        run_fast(0, address);
+        return;
+    }
     Unit u = unit_of(n);
     Vu0Regs &r = *u.regs;
     vuops::FlagPipe pipe;

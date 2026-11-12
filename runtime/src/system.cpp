@@ -476,6 +476,37 @@ void request_iop_sync() {
     if (g_cpu.budget > 64) set_budget(g_cpu, 64);
 }
 
+// Idle-loop skip (Ridge Racer V: the game spins on INTC_STAT until the vblank bit is set, ~25 % of the
+// EE thread on the Quest). PS2_EE_IDLE=pc:addr:mask[,...]: before the guest instruction at pc, if
+// (read32(addr) & mask) == 0 the rest of the time slice is used up at once, so emulated time jumps to
+// the next event (vblank, timer, DMA end) instead of stepping through the loop. The slice already ends
+// at the next due event (refill), so nothing is skipped over; only the loop's own idle cycles go.
+// Use only on pure polling loops (no side effects besides the polled read).
+void install_idle_skips() {
+    const char *spec = std::getenv("PS2_EE_IDLE");
+    if (!spec || !*spec) return;
+    static std::atomic<std::uint64_t> skips{0};
+    std::string list(spec);
+    std::size_t start = 0;
+    while (start < list.size()) {
+        const std::size_t end = std::min(list.find(',', start), list.size());
+        const std::string item = list.substr(start, end - start);
+        start = end + 1;
+        unsigned pc = 0, addr = 0, mask = 0;
+        if (std::sscanf(item.c_str(), "%x:%x:%x", &pc, &addr, &mask) != 3 || !mask) {
+            std::fprintf(stderr, "[ee] PS2_EE_IDLE: bad entry \"%s\" (pc:addr:mask, hex)\n", item.c_str());
+            continue;
+        }
+        set_probe_hook(pc, [addr, mask](Cpu &c) {
+            if ((hw::read32(addr) & mask) == 0 && c.budget > 0) {
+                c.budget = 0;
+                skips.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+        std::fprintf(stderr, "[ee] idle skip at %08X while (%08X & %X) == 0\n", pc, addr, mask);
+    }
+}
+
 void boot(std::uint32_t entry, const std::vector<std::string> &args) {
     init_watch();
     hw::reset();
@@ -499,6 +530,7 @@ void boot(std::uint32_t entry, const std::vector<std::string> &args) {
     store<std::uint32_t>(g_ram + argv + 4 * guest_args.size(), 0);
     kernel::start_main_thread(entry, 0, static_cast<std::uint32_t>(guest_args.size()), argv);
     apply_patches(true);
+    install_idle_skips();
     schedule(hw::kEventVblank, frame_cycles(), vblank);
 }
 

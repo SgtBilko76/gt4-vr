@@ -869,6 +869,11 @@ bool start_game(const fs::path &files) {
     setenv("RRV_PCSX2_GS_SPRITE_FILTER", "ps2", 0);
     setenv("RRV_PCSX2_GS_FULL_HWMIPMAP", "0", 0);
     setenv("RRV_PCSX2_GS_VSYNC", "1", 0);
+    // Speed (Quest profile 2026-11-12, headless 1500 boot frames: 40.3 -> 28.1 ms/frame, pictures
+    // bit-identical): skip RR5's vblank wait loop (INTC_STAT bit 2 polled at 0x2DC840) and run its VU0
+    // micro programs through the fast interpreter. config.txt PS2_EE_IDLE= / PS2_VU0_FAST=0 = off.
+    setenv("PS2_EE_IDLE", "2DC840:1000F000:4", 0);
+    setenv("PS2_VU0_FAST", "1", 0);
 #else
     setenv("RRV_PCSX2_GS_ASPECT", "stretch", 0);
     // GT4 profile of the bridge (PCSX2 GameDB fixes for GT4, field-mode upscaling); scale 2 =
