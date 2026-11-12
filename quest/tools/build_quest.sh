@@ -35,6 +35,13 @@ variant() {
                  -DGT4VR_NET_PRODUCT=SPEC2V110 -DGT4VR_CAMERA_HOOKS=ON -DGT4VR_ONLINE=OFF -DGT4VR_RELAY=OFF
                  -DGT4VR_ELF_CRC=646B2E29 "-DGT4VR_DISC_NAME=Gran Turismo 4 Spec II 1.10" -DGT4VR_LIB_NAME=gt4vr_specii)
         LIBNAME=gt4vr_specii; SRC=gt4s ;;
+  # Ridge Racer V (USA, SLUS-20002) without game code: the user's own ISO in /sdcard/RR5VR, program
+  # SLUS_200.02 checked (PCSX2 CRC 06AD9CA0); none of GT4's hooks, the bridge's RR5 profile.
+  rr5)  VARIANT=(-DGT4VR_DATA_DIR=/sdcard/RR5VR -DGT4VR_OLD_DATA_DIR= "-DGT4VR_TITLE=Ridge Racer V VR"
+                 -DGT4VR_NET_PRODUCT=SLUS20002 -DGT4VR_CAMERA_HOOKS=OFF -DGT4VR_ONLINE=OFF -DGT4VR_RELAY=OFF
+                 -DGT4VR_ELF_CRC=06AD9CA0 "-DGT4VR_DISC_NAME=Ridge Racer V (USA)" -DGT4VR_RR5=ON
+                 -DGT4VR_LIB_NAME=gt4vr_specii)
+        LIBNAME=gt4vr_specii; SRC=rr5 ;;
   *) echo "unknown GAME=$1" >&2; exit 2 ;;
   esac
 }
@@ -48,7 +55,9 @@ case "$GAME" in
   gt4vr) GAMES=(gt4s gt4r); APP_ID=online.portroyale.gt4vr; APP_LABEL="GT4 VR"; LAUNCHER=selector ;;
   gt4s)  GAMES=(gt4s); APP_ID=online.portroyale.gt4vr; APP_LABEL="GT4 Spec II VR"; LAUNCHER=specii ;;
   gt4r)  GAMES=(gt4r); APP_ID=online.portroyale.gt4hd; APP_LABEL="GT4 Online VR"; LAUNCHER=online ;;
-  *) echo "unknown GAME=$GAME (gt4vr, gt4s, gt4r)" >&2; exit 2 ;;
+  # Test app beside the Fukami RR5 app (com.bilko.rr5vr): own package, data in /sdcard/RR5VR.
+  rr5)   GAMES=(rr5); APP_ID=com.bilko.rr5vr.nogen; APP_LABEL="Ridge Racer V VR (test)"; LAUNCHER=specii ;;
+  *) echo "unknown GAME=$GAME (gt4vr, gt4s, gt4r, rr5)" >&2; exit 2 ;;
 esac
 BRIDGE_BUILD=${BRIDGE_BUILD:-$HOME/Projekte/fukami-wt-bridge/build-android-bridge}
 STAGE="$ROOT/quest/android/build/stage"

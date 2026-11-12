@@ -150,6 +150,7 @@ if(PS2_GENERATED)
         set(GT4VR_TITLE "GT4 VR" CACHE STRING "App name (log, OpenXR application name)")
         set(GT4VR_NET_PRODUCT "SCUS97436" CACHE STRING "Ad hoc server product code")
         option(GT4VR_CAMERA_HOOKS "A-Spec II race camera hooks (VR view)" ON)
+        option(GT4VR_RR5 "Ridge Racer V (no GT4 program hooks, the bridge's RR5 profile)" OFF)
         # Ad hoc play through the owner's relay by default (Multi-LAN Race). On in every online build;
         # the Spec II 1.10 app has it without GT4VR_ONLINE's leaderboard / lobby panel (retail data).
         option(GT4VR_RELAY "Relay server on by default" ${GT4VR_ONLINE})
@@ -161,7 +162,7 @@ if(PS2_GENERATED)
             GT4VR_OLD_DATA_DIR="${GT4VR_OLD_DATA_DIR}" GT4VR_TITLE="${GT4VR_TITLE}"
             GT4VR_NET_PRODUCT="${GT4VR_NET_PRODUCT}" GT4VR_CAMERA_HOOKS=$<BOOL:${GT4VR_CAMERA_HOOKS}>
             GT4VR_ONLINE=$<BOOL:${GT4VR_ONLINE}> GT4VR_RELAY=$<BOOL:${GT4VR_RELAY}>
-            GT4VR_ELF_CRC="${GT4VR_ELF_CRC}" GT4VR_DISC_NAME="${GT4VR_DISC_NAME}")
+            GT4VR_ELF_CRC="${GT4VR_ELF_CRC}" GT4VR_DISC_NAME="${GT4VR_DISC_NAME}" GT4VR_RR5=$<BOOL:${GT4VR_RR5}>)
         return()
     endif()
 

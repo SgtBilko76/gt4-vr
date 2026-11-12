@@ -116,6 +116,12 @@ namespace fs = std::filesystem;
 #ifndef GT4VR_ELF_CRC
 #define GT4VR_ELF_CRC ""
 #endif
+// Ridge Racer V on this runtime (build_quest.sh GAME=rr5, no game code in the APK): none of GT4's program
+// hooks (480p switch, camera, scene detection, flare table) - they patch GT4 addresses - and the bridge's
+// default RR5 hardware profile instead of the GT4 one.
+#ifndef GT4VR_RR5
+#define GT4VR_RR5 0
+#endif
 // The build's variant (CMakeLists.txt GT4VR_*): A-Spec II = /sdcard/GT4VR, retail v2.00 with LAN
 // play ("GT4 Online") = /sdcard/GT4Online.
 const std::string kDataDir = GT4VR_DATA_DIR;
@@ -848,6 +854,22 @@ bool start_game(const fs::path &files) {
     // screen's shape, so PCSX2 fills the surface.
     setenv("RRV_PCSX2_GS_RESOURCE_DIR", (files / "resources").c_str(), 0);
     setenv("RRV_PCSX2_GS_DATA_DIR", (files / "pcsx2-data").c_str(), 0);
+#if GT4VR_RR5
+    // Ridge Racer V: no RRV_PCSX2_GS_GAME = the bridge's RR5 profile (its GameDB fixes, field skipping on,
+    // which RR5 needs). Picture defaults of the Fukami RR5 app (owner-tuned): 3x wide / 6x tall, 16x
+    // anisotropic, FXAA, bilinear textures, PS2 sprite filter, no mipmaps. 4:3 until a widescreen patch
+    // exists (the Fukami app widens the game's own projection; here the game still renders 4:3).
+    setenv("RRV_PCSX2_GS_ASPECT", "4:3", 0);
+    setenv("RRV_PCSX2_GS_SCALE_X", "3", 0);
+    setenv("RRV_PCSX2_GS_FULL_SCALE", "6", 0);
+    setenv("RRV_PCSX2_GS_ANISO", "16", 0);
+    setenv("RRV_PCSX2_GS_FXAA", "1", 0);
+    setenv("RRV_PCSX2_GS_CAS", "0", 0);
+    setenv("RRV_PCSX2_GS_TEXTURE_FILTER", "bilinear", 0);
+    setenv("RRV_PCSX2_GS_SPRITE_FILTER", "ps2", 0);
+    setenv("RRV_PCSX2_GS_FULL_HWMIPMAP", "0", 0);
+    setenv("RRV_PCSX2_GS_VSYNC", "1", 0);
+#else
     setenv("RRV_PCSX2_GS_ASPECT", "stretch", 0);
     // GT4 profile of the bridge (PCSX2 GameDB fixes for GT4, field-mode upscaling); scale 2 =
     // scale 3 = 1920x1344 for the 640x448 picture (owner choice 2026-10-30: race 60 fps, a few
@@ -904,6 +926,7 @@ bool start_game(const fs::path &files) {
     // Hardware download Unsynchronized (ARMSX2 Quest's choice; owner 2026-11-01) instead of the
     // bridge profile's Disabled. RRV_PCSX2_GS_HWDOWNLOAD=4 = Disabled.
     setenv("RRV_PCSX2_GS_HWDOWNLOAD", "3", 0);
+#endif
     // Shader pipelines (owner 2026-11-01: collect / precompile the shaders). The bridge records every
     // pipeline it builds in its cache and builds the whole list up front at start; the list is
     // mirrored to /sdcard/GT4VR (the app is not debuggable) so quest/tools/quest_pull_pipelines.sh
@@ -984,11 +1007,11 @@ bool start_game(const fs::path &files) {
         logf("[quest] network id %s (%s, MAC %s)", id.c_str(), getenv("PS2_NET_NAME"), getenv("PS2_NET_MAC"));
     }
     ps2::g_options.rate_forced = true;
-    ps2::g_options.widescreen = config_string("widescreen", "1") == "1";
+    ps2::g_options.widescreen = config_string("widescreen", GT4VR_RR5 ? "0" : "1") == "1";
     ps2::g_options.on_vblank = [] {
         ps2::post_present();
         apply_pad();
-        gt4::display::tick();
+        if (!GT4VR_RR5) gt4::display::tick();
         pace();
     };
     ps2::set_audio_sink(queue_audio);
@@ -997,14 +1020,15 @@ bool start_game(const fs::path &files) {
     const bool retail_program = std::strcmp(GT4VR_NET_PRODUCT, "SCUS97328") == 0;
     // 480p progressive at start and after videos (owner 2026-11-08: far sharper in VR; GT4 itself starts
     // interlaced every time). config.txt PS2_GT4_480P=0 = GT4's own behaviour.
-    gt4::display::install(retail_program);
+    if (!GT4VR_RR5) gt4::display::install(retail_program);
     // Race camera hooks = the head-tracked VR view (both stick clicks). Spec II and, since
     // 2026-11-07 (owner), the retail online version too; they also feed the race scene detection.
     if (GT4VR_CAMERA_HOOKS) gt4::camera::install(quest_head, gt4::quest::noteHeadTrackedFrame, retail_program);
     // Spec II 1.10: Multi-LAN Race in the Arcade menu again (relay play with Spec II players only).
     // Opt-in (config.txt PS2_GT4_SPEC2LAN=1): the entry shows, but the beta's LAN mode hangs on its
     // loading screen (PC test 2026-11-06; the same is reported for the beta on PCSX2).
-    if (std::strcmp(GT4VR_NET_PRODUCT, "SPEC2V110") == 0 && std::getenv("PS2_GT4_SPEC2LAN")) gt4::lan::installSpecIIMenu();
+    if (GT4VR_RR5) {
+    } else if (std::strcmp(GT4VR_NET_PRODUCT, "SPEC2V110") == 0 && std::getenv("PS2_GT4_SPEC2LAN")) gt4::lan::installSpecIIMenu();
     else if (retail_program && !GT4VR_CAMERA_HOOKS) gt4::camera::installSceneDetector();
     // Player settings (VR menu > Settings): screen distance / size, swapped triggers / grips.
     gt4::settings::load(kDataDir + "/settings.txt");
