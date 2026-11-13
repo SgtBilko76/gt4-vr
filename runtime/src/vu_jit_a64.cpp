@@ -17,6 +17,7 @@
 #include "hw.hpp"
 #include "vu_micro.hpp"
 #include "ps2/vu_ops.hpp"
+#include "ps2/fpu.hpp"
 
 #include <sys/mman.h>
 
@@ -28,16 +29,23 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <vector>
 
 namespace ps2::vu::jit {
 
 namespace {
 
-vuops::FlagPipe g_fl;  // the flag pipe the translated programs use (Layout::flags)
+vuops::FlagPipe g_fl;   // the flag pipe the translated VU1 programs use (Layout::flags)
+vuops::FlagPipe g_fl0;  // VU0's (its programs run on the EE thread, at the same time as VU1's)
+// Layout::exact scratch for VU0 (s, t, acc, result; 4 lanes each). VU0 runs on the EE thread only.
+alignas(16) std::uint32_t g_vu0_scratch[16];
 std::uintptr_t g_base = 0;
 bool g_base_ok = false;
-std::uint64_t kParamOffset[2] = {};
+// Per unit: the registers and the data memory as offsets from g_base. The compiled code holds them as
+// constants; kParamOffset points at the unit being compiled (compile_a64 holds g_compile_mutex).
+std::uint64_t kParamOffsetUnit[2][2] = {};
+const std::uint64_t *kParamOffset = kParamOffsetUnit[1];
 static_assert(sizeof(vuops::FlagPipe::mh) == 4 && sizeof(vuops::FlagPipe::t) == 4 && offsetof(vuops::FlagPipe, clip_v) + 32 < 16384,
               "flag_stub: 32-bit fields within ldr w immediates");
 const bool g_regbase = [] { const char *v = std::getenv("PS2_VU_JIT_REGBASE"); return !v || std::strcmp(v, "0") != 0; }();
@@ -66,10 +74,41 @@ void vuj_kick(std::uint32_t address) {
     }
     vu::kick(1, address);
 }
+// Layout::exact: one upper instruction's lanes with the interpreter's PS2 float routines (vu_micro.cpp
+// upper()); kind = vu_jit.cpp Kind (Add 1, Sub 2, Madd 3, Msub 4, Mul 7, Opmula 12, Opmsub 13).
+void vuj_exact(std::uint32_t kind) {
+    const std::uint32_t *s = g_vu0_scratch, *t = g_vu0_scratch + 4, *acc = g_vu0_scratch + 8;
+    std::uint32_t *o = g_vu0_scratch + 12;
+    switch (kind) {
+    case 1: for (int i = 0; i < 4; ++i) o[i] = fp::add(s[i], t[i]); break;
+    case 2: for (int i = 0; i < 4; ++i) o[i] = fp::sub(s[i], t[i]); break;
+    case 3: for (int i = 0; i < 4; ++i) o[i] = fp::add(acc[i], fp::mul(s[i], t[i])); break;
+    case 4: for (int i = 0; i < 4; ++i) o[i] = fp::sub(acc[i], fp::mul(s[i], t[i])); break;
+    case 7: for (int i = 0; i < 4; ++i) o[i] = fp::mul(s[i], t[i]); break;
+    case 12:
+        o[0] = fp::mul(s[1], t[2]);
+        o[1] = fp::mul(s[2], t[0]);
+        o[2] = fp::mul(s[0], t[1]);
+        o[3] = 0;
+        break;
+    case 13:
+        o[0] = fp::sub(acc[0], fp::mul(s[1], t[2]));
+        o[1] = fp::sub(acc[1], fp::mul(s[2], t[0]));
+        o[2] = fp::sub(acc[2], fp::mul(s[0], t[1]));
+        o[3] = 0;
+        break;
+    default: for (int i = 0; i < 4; ++i) o[i] = 0; break;
+    }
+}
 std::uint32_t vuj_top() { return vu::top(1); }
 std::uint32_t vuj_itop() { return vu::itop(1); }
 void vuj_interpret(std::uint32_t r, std::uint32_t pc) {
-    g_fl.flush_q(*at<Vu0Regs>(r));
+    const bool vu0 = r == kParamOffsetUnit[0][0];
+    (vu0 ? g_fl0 : g_fl).flush_q(*at<Vu0Regs>(r));
+    if (vu0) {
+        vu::run_exact(0, pc);  // the rest of a VU0 program: the exact interpreter
+        return;
+    }
     if (g_dry) {
         g_escape = pc;
         return;
@@ -88,7 +127,7 @@ const Import kImportFns[kImports] = {
     {reinterpret_cast<const void *>(&vuj_clip), 1, true},    {reinterpret_cast<const void *>(&vuj_force_mac), 2, false},
     {reinterpret_cast<const void *>(&vuj_efu), 4, false},    {reinterpret_cast<const void *>(&vuj_kick), 1, false},
     {reinterpret_cast<const void *>(&vuj_top), 0, true},     {reinterpret_cast<const void *>(&vuj_itop), 0, true},
-    {reinterpret_cast<const void *>(&vuj_interpret), 2, false},
+    {reinterpret_cast<const void *>(&vuj_interpret), 2, false}, {reinterpret_cast<const void *>(&vuj_exact), 1, false},
 };
 
 // ---- executable memory (never freed: a program may be on the stack when another compiles)
@@ -1994,11 +2033,15 @@ bool init_base() {
     done = true;
     const auto lo = [](const void *p) { return reinterpret_cast<std::uintptr_t>(p); };
     const std::uintptr_t a = lo(&regs(1)), b = lo(g_vu1_mem), c = lo(&g_fl);
-    const std::uintptr_t low = std::min({a, b, c}) & ~std::uintptr_t{0xFFF};
-    const std::uintptr_t high = std::max({a + sizeof(Vu0Regs), b + sizeof g_vu1_mem, c + sizeof g_fl});
+    const std::uintptr_t a0 = lo(&regs(0)), b0 = lo(g_vu0_mem), c0 = lo(&g_fl0), d0 = lo(g_vu0_scratch);
+    const std::uintptr_t low = std::min({a, b, c, a0, b0, c0, d0}) & ~std::uintptr_t{0xFFF};
+    const std::uintptr_t high = std::max({a + sizeof(Vu0Regs), b + sizeof g_vu1_mem, c + sizeof g_fl, a0 + sizeof(Vu0Regs),
+                                          b0 + sizeof g_vu0_mem, c0 + sizeof g_fl0, d0 + sizeof g_vu0_scratch});
     g_base = low;
-    kParamOffset[0] = a - low;
-    kParamOffset[1] = b - low;
+    kParamOffsetUnit[1][0] = a - low;
+    kParamOffsetUnit[1][1] = b - low;
+    kParamOffsetUnit[0][0] = a0 - low;
+    kParamOffsetUnit[0][1] = b0 - low;
     g_base_ok = high - low < (std::uintptr_t{1} << 31);
     std::fprintf(stderr, "[vu-jit] ARM64 VU1 JIT %s (span %zu KB)\n", g_base_ok ? "on" : "off: data too far apart",
                  static_cast<std::size_t>((high - low) >> 10));
@@ -2019,10 +2062,22 @@ std::uintptr_t a64_base() { return init_base() ? g_base : 0; }
 void *a64_flags() { return &g_fl; }
 const void *a64_import(std::uint32_t i) { return i < kImports ? kImportFns[i].fn : nullptr; }
 
-ProgramFn compile_a64(const std::uint8_t *code, std::uint32_t entry) {
+ProgramFn compile_a64(const std::uint8_t *code, std::uint32_t entry, int unit) {
+    // VU0 programs compile on the EE thread, VU1's on the VU thread: one at a time (shared code chunk,
+    // kParamOffset).
+    static std::mutex compile_mutex;
+    const std::lock_guard<std::mutex> lock(compile_mutex);
     if (!init_base()) return nullptr;
+    kParamOffset = kParamOffsetUnit[unit ? 1 : 0];
     std::vector<std::uint8_t> module;
-    const Layout layout{static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(&g_fl) - g_base), a64_ftz()};
+    Layout layout{static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(unit ? &g_fl : &g_fl0) - g_base), a64_ftz()};
+    if (!unit) {
+        layout.code_mask = 4095u;
+        layout.data_qwords = 256u;
+        layout.keep_flags = true;
+        layout.exact = std::getenv("PS2_VU0_JIT_NATIVE") == nullptr;  // =1: native float arithmetic (test)
+        layout.scratch = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(g_vu0_scratch) - g_base);
+    }
     if (!translate(code, entry, layout, module)) return nullptr;
     Compiler c;
     std::vector<std::uint32_t> words;

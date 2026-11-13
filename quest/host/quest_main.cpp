@@ -880,6 +880,10 @@ bool start_game(const fs::path &files) {
     // PS2_VU0_FAST off (2026-11-13): on the Quest it drew RR5's intro and title under grainy noise
     // (headless x86/qemu runs were clean); off = clean. config.txt PS2_VU0_FAST=1 = on.
     setenv("PS2_VU0_FAST", "0", 0);
+    // VU0 micro programs through the VU JIT with the PS2 float routines (bit-exact against the exact
+    // interpreter: 1.6 M calls checked under qemu, 0 differ). Quest headless 1500 boot frames: ~5.5 ms/frame
+    // less. config.txt PS2_VU0_JIT=0 = exact interpreter, =check = both with a comparison in log.txt.
+    setenv("PS2_VU0_JIT", "1", 0);
 #else
     setenv("RRV_PCSX2_GS_ASPECT", "stretch", 0);
     // GT4 profile of the bridge (PCSX2 GameDB fixes for GT4, field-mode upscaling); scale 2 =

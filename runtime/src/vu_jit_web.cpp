@@ -115,6 +115,7 @@ EMSCRIPTEN_KEEPALIVE void ps2jit_interpret(Vu0Regs *r, std::uint32_t pc) {
     }
     vu::interpret(1, pc);
 }
+EMSCRIPTEN_KEEPALIVE void ps2jit_exact(std::uint32_t) {}  // Layout::exact is ARM64 VU0 only
 
 }
 

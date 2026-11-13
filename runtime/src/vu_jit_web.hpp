@@ -9,7 +9,7 @@ namespace ps2::vu::jit {
 
 int mode();
 ProgramFn compile(const std::uint8_t *code, std::uint32_t entry);
-ProgramFn compile_a64(const std::uint8_t *code, std::uint32_t entry);  // vu_jit_a64.cpp (ARM64 only)
+ProgramFn compile_a64(const std::uint8_t *code, std::uint32_t entry, int unit = 1);  // vu_jit_a64.cpp (ARM64 only)
 std::uintptr_t a64_base();
 bool a64_ftz();  // VU1 programs run with FPCR.FZ (vu_micro.cpp interpret)
 void *a64_flags();

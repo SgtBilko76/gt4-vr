@@ -11,12 +11,12 @@
 namespace ps2::vu::jit {
 
 const char *const kImportNames[kImports] = {
-    "mac", "status", "clip", "force_mac", "efu", "kick", "top", "itop", "interpret",
+    "mac", "status", "clip", "force_mac", "efu", "kick", "top", "itop", "interpret", "exact",
 };
 
 namespace {
 
-constexpr std::uint32_t kMask = 16383u;
+thread_local std::uint32_t kMask = 16383u;  // Layout::code_mask of the program being translated
 constexpr int kAcc = 32;
 
 struct ImportType {
@@ -25,7 +25,7 @@ struct ImportType {
 };
 
 constexpr ImportType kImportTypes[kImports] = {
-    {1, true}, {1, true}, {1, true}, {2, false}, {4, false}, {1, false}, {0, true}, {0, true}, {2, false},
+    {1, true}, {1, true}, {1, true}, {2, false}, {4, false}, {1, false}, {0, true}, {0, true}, {2, false}, {1, false},
 };
 
 enum Local : std::uint32_t {
@@ -661,7 +661,7 @@ private:
     void qword(F index) {
         c_.get(kMem);
         index();
-        c_.i32c(1023);
+        c_.i32c(layout_.data_qwords - 1u);
         c_.op(kOpAnd);
         c_.i32c(4);
         c_.op(kOpShl);
@@ -986,6 +986,7 @@ private:
     void itof(const Up &u);
     void ftoi(const Up &u);
     void outer_product(const Up &u);
+    void exact_arith(const Up &u);
     void upper_pre(const Up &u, bool flags_live);
     void upper_post(const Up &u, bool flags_live);
     bool lower(std::uint32_t w, std::uint32_t pc);
@@ -1130,12 +1131,62 @@ void Translator::outer_product(const Up &u) {
     c_.set(kUv);
 }
 
+// Layout::exact: the operands (raw register bits) to the scratch, the kExact import computes the lanes
+// with the interpreter's fp:: routines, the result comes back from scratch + 48.
+void Translator::exact_arith(const Up &u) {
+    raw_vec(u.fs);
+    c_.set(kV2);
+    if (outer(u.kind)) {
+        raw_vec(u.ft);
+    } else {
+        switch (u.src) {
+        case Vec: raw_vec(u.ft); break;
+        case Bc:
+            raw_lane(u.ft, u.bc);
+            c_.simd(kVSplat);
+            break;
+        case Q:
+            c_.get(kR);
+            c_.load(kOffQ);
+            c_.simd(kVSplat);
+            break;
+        default:
+            c_.get(kR);
+            c_.load(kOffI);
+            c_.simd(kVSplat);
+            break;
+        }
+    }
+    c_.set(kV3);
+    c_.i32c(0);
+    c_.get(kV2);
+    c_.vstore(layout_.scratch);
+    c_.i32c(0);
+    c_.get(kV3);
+    c_.vstore(layout_.scratch + 16u);
+    if (u.kind == Madd || u.kind == Msub || u.kind == Opmsub) {
+        c_.i32c(0);
+        c_.get(kR);
+        c_.vload(reg_off(kAcc));
+        c_.vstore(layout_.scratch + 32u);
+    }
+    c_.i32c(static_cast<std::uint32_t>(u.kind));
+    c_.call(kExact);
+    c_.i32c(0);
+    c_.vload(layout_.scratch + 48u);
+    c_.set(kUv);
+}
+
 void Translator::upper_pre(const Up &u, bool flags_live) {
     if (u.kind == Clip) {
         clip_value(u);
         return;
     }
     if (!active(u, flags_live)) return;
+    if (layout_.exact && (arithmetic(u.kind) || outer(u.kind))) {
+        exact_arith(u);
+        return;
+    }
     if (outer(u.kind)) {
         outer_product(u);
         return;
@@ -1957,6 +2008,7 @@ void Translator::prologue() {
 bool Translator::run(std::vector<std::uint8_t> &out) {
     pcs_ = reachable(code_, kMask, entry_);
     if (pcs_.empty() || branch_in_delay_slot(code_, kMask, entry_)) return false;
+    if (layout_.keep_flags) code_flags_ = any_flags_ = any_status_ = any_clip_ = true;
     for (std::uint32_t pc = 0; pc <= kMask && !code_flags_; pc += 8) {
         if (word(pc + 4) & 0x80000000u) continue;
         switch (word(pc) >> 25) {
@@ -2019,9 +2071,10 @@ bool Translator::run(std::vector<std::uint8_t> &out) {
         }
     }
 
-    std::set<int> shadowed;
+    std::set<int> shadowed;  // none with Layout::exact (its arithmetic reads the raw registers)
     for (std::uint32_t pc : pcs_)
-        for (int reg : shadow_reads(word(pc + 4))) shadowed.insert(reg);
+        if (!layout_.exact)
+            for (int reg : shadow_reads(word(pc + 4))) shadowed.insert(reg);
     std::uint32_t next_local = kShadow0;
     for (int reg : shadowed) shadow_[reg] = next_local++;
     std::vector<std::uint64_t> uses(2048, 0), defs(2048, 0);
@@ -2186,6 +2239,7 @@ bool Translator::run(std::vector<std::uint8_t> &out) {
 }
 
 bool translate(const std::uint8_t *code, std::uint32_t entry, const Layout &layout, std::vector<std::uint8_t> &out) {
+    kMask = layout.code_mask;
     Translator t(code, entry, layout);
     const bool ok = t.run(out);
     if (ok && std::getenv("PS2_VU_JIT_FLAGSTAT")) t.flag_stats();

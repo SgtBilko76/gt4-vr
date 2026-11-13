@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1287,12 +1288,95 @@ void run_fast(int n, std::uint32_t address) {
     std::fprintf(stderr, "[vu%d] program at 0x%04X did not end\n", n, address);
 }
 
+#if defined(__aarch64__) && !defined(__EMSCRIPTEN__)
+// VU0 JIT (PS2_VU0_JIT=1; =check runs the exact interpreter after every compiled program and compares
+// registers and data memory, keeping the interpreter's result). Same Translator / ARM64 back end as VU1
+// (jit::compile_a64 unit 0: 4 KB code, 256 data qwords, every flag update kept for CFC2). Programs are
+// keyed like VU1's (program_key of the reachable code) and found again per entry until VU0 code changes.
+int vu0_jit_mode() {
+    static const int mode = [] {
+        const char *v = std::getenv("PS2_VU0_JIT");
+        if (!v) return 0;
+        if (std::strcmp(v, "check") == 0) return 2;
+        return v[0] == '1' ? 1 : 0;
+    }();
+    return mode;
+}
+
+struct Vu0Entry {
+    std::uint32_t generation = 0;
+    ProgramFn fn = nullptr;
+};
+Vu0Entry g_vu0_entries[512];
+std::unordered_map<std::uint64_t, ProgramFn> g_vu0_programs;
+
+void check_vu0(ProgramFn fn, std::uint32_t address) {
+    static std::uint64_t calls = 0, mismatches = 0;
+    static std::uint8_t before_mem[4096], jit_mem[4096];
+    const Vu0Regs before = g_cpu.vu0;
+    std::memcpy(before_mem, g_vu0_mem, sizeof before_mem);
+    fn(g_cpu.vu0, g_vu0_mem);
+    const Vu0Regs after = g_cpu.vu0;
+    std::memcpy(jit_mem, g_vu0_mem, sizeof jit_mem);
+    g_cpu.vu0 = before;
+    std::memcpy(g_vu0_mem, before_mem, sizeof before_mem);
+    run_exact(0, address);
+    ++calls;
+    const bool regs_differ = std::memcmp(&after, &g_cpu.vu0, sizeof after) != 0;
+    const bool mem_differs = std::memcmp(jit_mem, g_vu0_mem, sizeof jit_mem) != 0;
+    if (regs_differ || mem_differs) {
+        if (++mismatches <= 30) {
+            int field = -1, word = -1;
+            const auto *a = reinterpret_cast<const std::uint8_t *>(&after), *b = reinterpret_cast<const std::uint8_t *>(&g_cpu.vu0);
+            for (int i = 0; i < static_cast<int>(sizeof after) && field < 0; ++i)
+                if (a[i] != b[i]) field = i;
+            for (int i = 0; i < 4096 && word < 0; i += 4)
+                if (std::memcmp(jit_mem + i, g_vu0_mem + i, 4) != 0) word = i;
+            std::uint32_t ja = 0, ia = 0;
+            if (field >= 0) {
+                std::memcpy(&ja, a + (field & ~3), 4);
+                std::memcpy(&ia, b + (field & ~3), 4);
+            }
+            std::fprintf(stderr, "[vu0-jit] check: program 0x%03X differs: regs byte %d (vf ends at %zu, vi at %zu; jit %08X interp %08X), mem byte %d\n",
+                         address & 4095u, field, offsetof(Vu0Regs, vf) + sizeof(Vu0Regs::vf), offsetof(Vu0Regs, vi) + sizeof(Vu0Regs::vi), ja, ia, word);
+        }
+    }
+    if (calls % 20000 == 0)
+        std::fprintf(stderr, "[vu0-jit] check: %llu calls, %llu differ\n", static_cast<unsigned long long>(calls), static_cast<unsigned long long>(mismatches));
+}
+
+bool run_vu0_jit(std::uint32_t address) {
+    const std::uint32_t pc = address & 4095u;
+    Vu0Entry &e = g_vu0_entries[pc >> 3];
+    if (e.generation != g_generation[0]) {
+        e.generation = g_generation[0];
+        const std::uint64_t key = program_key(g_vu0_code, reachable(g_vu0_code, 4095u, pc), pc);
+        auto it = g_vu0_programs.find(key);
+        if (it == g_vu0_programs.end()) {
+            it = g_vu0_programs.emplace(key, jit::compile_a64(g_vu0_code, pc, 0)).first;
+            static unsigned logged = 0;
+            if (logged++ < 40) std::fprintf(stderr, "[vu0-jit] program 0x%03X key %016llX %s\n", pc, static_cast<unsigned long long>(key), it->second ? "compiled" : "NOT compiled (interpreter)");
+        }
+        e.fn = it->second;
+    }
+    if (!e.fn) return false;
+    const FtzScope ftz;
+    if (vu0_jit_mode() == 2) check_vu0(e.fn, address);
+    else e.fn(g_cpu.vu0, g_vu0_mem);
+    return true;
+}
+#else
+int vu0_jit_mode() { return 0; }
+bool run_vu0_jit(std::uint32_t) { return false; }
+#endif
+
 void run(int n, std::uint32_t address) {
     static const bool exact = std::getenv("PS2_VU_EXACT") != nullptr;
     if (n == 1 && !exact) {
         interpret(n, address);
         return;
     }
+    if (n == 0 && !exact && vu0_jit_mode() && run_vu0_jit(address)) return;
     // PS2_VU0_FAST=1: VU0 micro programs (VCALLMS) through the fast interpreter (decode cache, flag
     // liveness) as VU1's fallback, instead of this exact one. Ridge Racer V runs VU0 programs every
     // frame (~38 % of the EE thread on the Quest with the exact interpreter).
@@ -1301,6 +1385,10 @@ void run(int n, std::uint32_t address) {
         run_fast(0, address);
         return;
     }
+    run_exact(n, address);
+}
+
+void run_exact(int n, std::uint32_t address) {
     Unit u = unit_of(n);
     Vu0Regs &r = *u.regs;
     vuops::FlagPipe pipe;

@@ -14,6 +14,8 @@ void state(ps2::state::Stream &s);
 
 void reset();
 void run(int unit, std::uint32_t address);
+// The exact VU interpreter (VU0 programs; the rest of a VU0 program the JIT left).
+void run_exact(int unit, std::uint32_t address);
 std::uint32_t tpc(int unit);
 void set_tops(int unit, std::uint32_t top, std::uint32_t itop);
 void code_changed(int unit);
