@@ -877,7 +877,9 @@ bool start_game(const fs::path &files) {
     // bit-identical): skip RR5's vblank wait loop (INTC_STAT bit 2 polled at 0x2DC840) and run its VU0
     // micro programs through the fast interpreter. config.txt PS2_EE_IDLE= / PS2_VU0_FAST=0 = off.
     setenv("PS2_EE_IDLE", "2DC840:1000F000:4", 0);
-    setenv("PS2_VU0_FAST", "1", 0);
+    // PS2_VU0_FAST off (2026-11-13): on the Quest it drew RR5's intro and title under grainy noise
+    // (headless x86/qemu runs were clean); off = clean. config.txt PS2_VU0_FAST=1 = on.
+    setenv("PS2_VU0_FAST", "0", 0);
 #else
     setenv("RRV_PCSX2_GS_ASPECT", "stretch", 0);
     // GT4 profile of the bridge (PCSX2 GameDB fixes for GT4, field-mode upscaling); scale 2 =
