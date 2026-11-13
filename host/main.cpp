@@ -13,7 +13,9 @@
 #include "profile.hpp"
 #endif
 
+#include <atomic>
 #include <chrono>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -158,6 +160,49 @@ int main(int argc, char **argv) {
         return ps2::run();
 #endif
     };
+    // PS2_THREADED=dir: the Quest's thread layout (render queue + GS thread, VU1/GIF thread) with the
+    // software GS, every presented frame whose number is a multiple of PS2_THREADED_EVERY (default 150)
+    // written to dir as frame_NNNNN.ppm. For faults that only show with the queues (path 3 holding etc.).
+    if (const char *threaded = std::getenv("PS2_THREADED"); threaded && *threaded) {
+        static std::string dir = threaded;
+        static const unsigned long long every = [] { const char *v = std::getenv("PS2_THREADED_EVERY"); return v ? std::strtoull(v, nullptr, 10) : 150ull; }();
+        {
+            const auto previous = ps2::g_options.on_vblank;
+            ps2::g_options.on_vblank = [previous] {
+                ps2::post_present();
+                if (previous) previous();
+            };
+        }
+        ps2::start_render_thread();
+        ps2::start_vu_thread();
+        std::thread([] { ps2::run_vu_thread(); }).detach();
+        static std::atomic<bool> done{false};
+        std::thread gs([] {
+            unsigned long long last = 0;
+            const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> save = [&last](const std::uint32_t *rgba, std::uint32_t w, std::uint32_t h) {
+                const unsigned long long f = ps2::frame_count();
+                if (f / every == last / every) return;
+                last = f;
+                char name[600];
+                std::snprintf(name, sizeof name, "%s/frame_%05llu.ppm", dir.c_str(), f / every * every);
+                if (std::FILE *out = std::fopen(name, "wb")) {
+                    std::fprintf(out, "P6\n%u %u\n255\n", w, h);
+                    for (std::size_t i = 0; i < static_cast<std::size_t>(w) * h; ++i) {
+                        const std::uint8_t px[3] = {static_cast<std::uint8_t>(rgba[i]), static_cast<std::uint8_t>(rgba[i] >> 8), static_cast<std::uint8_t>(rgba[i] >> 16)};
+                        std::fwrite(px, 1, 3, out);
+                    }
+                    std::fclose(out);
+                }
+            };
+            while (!done.load())
+                if (ps2::render_pending(false, save, nullptr, 8.0) == ps2::Rendered::idle) ps2::wait_render_work(4);
+        });
+        const int result = emulate();
+        done = true;
+        gs.join();
+        std::fflush(stderr);
+        std::_Exit(result);
+    }
 #ifdef PS2_WINDOW
     if (window) return run_window(emulate);
 #endif

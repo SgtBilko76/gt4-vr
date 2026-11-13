@@ -860,6 +860,10 @@ bool start_game(const fs::path &files) {
     // anisotropic, FXAA, bilinear textures, PS2 sprite filter, no mipmaps. 4:3 until a widescreen patch
     // exists (the Fukami app widens the game's own projection; here the game still renders 4:3).
     setenv("RRV_PCSX2_GS_ASPECT", "4:3", 0);
+    // Full-frame mode as in the Fukami app (RRV_GS_RENDER_MODE=full): the bridge's RR5 hardware profile and
+    // RRV_PCSX2_GS_FULL_SCALE only apply there. Field mode drew RR5's intro / title effects as coloured noise
+    // with a magenta bar, at native resolution (2026-11-13). config.txt PS2_PCSX2_RENDER_MODE=field = old.
+    setenv("PS2_PCSX2_RENDER_MODE", "full", 0);
     setenv("RRV_PCSX2_GS_SCALE_X", "3", 0);
     setenv("RRV_PCSX2_GS_FULL_SCALE", "6", 0);
     setenv("RRV_PCSX2_GS_ANISO", "16", 0);
@@ -1063,12 +1067,17 @@ bool start_game(const fs::path &files) {
     std::thread(gs_thread_main).detach();
     while (g_gs_state.load() == 0) usleep(2000);
     if (g_gs_state.load() < 0) return false;
-    ps2::start_vu_thread();
-    std::thread([] {
-        pthread_setname_np(pthread_self(), "gt4-vu1");
-        pin_fast_cores("gt4-vu1");
-        ps2::run_vu_thread();
-    }).detach();
+    // config.txt PS2_VU_THREAD=0: VU1 (and VIF1/GIF) on the EE thread, no separate VU thread (diagnosis).
+    if (const char *vt = std::getenv("PS2_VU_THREAD"); !(vt && vt[0] == '0')) {
+        ps2::start_vu_thread();
+        std::thread([] {
+            pthread_setname_np(pthread_self(), "gt4-vu1");
+            pin_fast_cores("gt4-vu1");
+            ps2::run_vu_thread();
+        }).detach();
+    } else {
+        logf("[quest] VU1 on the EE thread (PS2_VU_THREAD=0)");
+    }
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
