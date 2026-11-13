@@ -21,6 +21,7 @@
 
 #include <aaudio/AAudio.h>
 #include <android/asset_manager.h>
+#include <android/api-level.h>
 #include <android/log.h>
 #include <android_native_app_glue.h>
 #include <pthread.h>
@@ -574,6 +575,13 @@ void pin_fast_cores(const char *name) {
         logf("[quest] %s: no cpu_capacity, not pinned", name);
         return;
     }
+    // Only where the fast cluster can hold the three game threads (Quest 3/3S: 4 cores). Quest 2 / Pro /
+    // Pico may have one or two cores at the top capacity: pinning EE, VU1 and GS there would make them
+    // share them - left to the scheduler there, as before 0.3.1.
+    if (const long fast = std::count(list.begin(), list.end(), ',') + 1; fast < 3) {
+        logf("[quest] %s: only %ld fast core(s) (%s), not pinned", name, fast, list.c_str());
+        return;
+    }
     const int rc = sched_setaffinity(0, sizeof set, &set);
     logf("[quest] %s pinned to fast cores %s (capacity %d): %s", name, list.c_str(), best, rc == 0 ? "ok" : std::strerror(errno));
 }
@@ -778,13 +786,17 @@ bool gt4_core_to_elf(const std::vector<std::uint8_t> &core, std::vector<std::uin
 }
 
 // Puts the program from the user's ISO into core.elf when it is the expected version. Returns the
-// ISO path, or "" with the reason in the log.
-std::string prepare_user_disc() {
-    const std::string iso = find_user_iso();
+// ISO path, or "" with the reason in the log and in heading / body (shown in the headset).
+std::string prepare_user_disc(const std::string &iso, std::string &heading, std::string &body) {
     if (!readable(iso)) {
         logf("[quest] no disc image: copy your %s ISO into %s", GT4VR_DISC_NAME, kDataDir.c_str());
+        heading = "No disc image found";
+        body = std::string("Copy your ") + GT4VR_DISC_NAME + " disc image (any file name ending in .iso) into the folder " +
+               kDataDir + " on the headset, for example with SideQuest or a USB cable.\n"
+               "The game starts by itself as soon as the file is there.";
         return "";
     }
+    const std::string name = fs::path(iso).filename().string();
     std::vector<std::uint8_t> cnf, elf;
     std::string boot;
     if (read_iso_root_file(iso, "SYSTEM.CNF", cnf)) {
@@ -796,6 +808,9 @@ std::string prepare_user_disc() {
     }
     if (boot.empty() || !read_iso_root_file(iso, boot, elf)) {
         logf("[quest] %s is not a PS2 disc image (no SYSTEM.CNF / boot program)", iso.c_str());
+        heading = "Not a PS2 disc image";
+        body = name + " in " + kDataDir + " is not a PS2 disc image, or it is still being copied.\n" +
+               "This app needs the " + GT4VR_DISC_NAME + " disc image. Replace the file; the game starts by itself.";
         return "";
     }
     const std::uint32_t want = static_cast<std::uint32_t>(std::strtoul(GT4VR_ELF_CRC, nullptr, 16));
@@ -812,23 +827,127 @@ std::string prepare_user_disc() {
     if (crc != want) {
         logf("[quest] %s: program %s has CRC %08X, this version needs %08X (%s).", iso.c_str(), boot.c_str(), crc,
              want, GT4VR_DISC_NAME);
+        char ids[64];
+        std::snprintf(ids, sizeof ids, "(program CRC %08X, needed %08X)", crc, want);
+        heading = "Wrong disc version";
+        body = name + " is a different game version " + ids + ".\nThis app needs the " + GT4VR_DISC_NAME +
+               " disc image in " + kDataDir + ". Replace the file; the game starts by itself.";
         return "";
     }
     std::vector<std::uint8_t> have;
     if (std::ifstream old(g_elf_path, std::ios::binary); old) have.assign(std::istreambuf_iterator<char>(old), {});
     if (have != elf) {
-        std::ofstream(g_elf_path, std::ios::binary).write(reinterpret_cast<const char *>(elf.data()), elf.size());
+        std::ofstream out(g_elf_path, std::ios::binary);
+        out.write(reinterpret_cast<const char *>(elf.data()), static_cast<std::streamsize>(elf.size()));
+        if (!out) {
+            logf("[quest] cannot write %s", g_elf_path.c_str());
+            heading = "Cannot write to the game folder";
+            body = "The app could not write " + g_elf_path + ". Check that the headset has free storage and that the app "
+                   "is allowed to access all files.";
+            return "";
+        }
         logf("[quest] program %s (CRC %08X) taken from %s", boot.c_str(), crc, iso.c_str());
     }
     return iso;
 }
 
+// ---------------------------------------------------------------- shared storage permission
+// The ISO lives in /sdcard/<data dir>: on Android 11+ (Quest, Pico 4 Ultra) that needs "all files access"
+// (MANAGE_EXTERNAL_STORAGE), on Android 10 (Pico 4) READ_EXTERNAL_STORAGE. A fresh install has neither:
+// before 0.3.2 the 2D start screen asked for it, but the release apps start the VR activity directly, so
+// nobody asked and the game found no ISO - a black screen (user reports 2026-11-12). The activity's Java
+// code (StorageAccess) now asks; this only checks.
+JavaVM *g_vm = nullptr;
+jobject g_activity = nullptr;  // global ref
+
+bool storage_access() {
+    if (!g_vm) return true;
+    JNIEnv *env = nullptr;
+    bool attached = false;
+    if (g_vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
+        if (g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return true;
+        attached = true;
+    }
+    bool ok = true;
+    if (android_get_device_api_level() >= 30) {
+        jclass c = env->FindClass("android/os/Environment");
+        jmethodID m = c ? env->GetStaticMethodID(c, "isExternalStorageManager", "()Z") : nullptr;
+        if (m) ok = env->CallStaticBooleanMethod(c, m) == JNI_TRUE;
+        if (c) env->DeleteLocalRef(c);
+    } else if (g_activity) {
+        jclass c = env->GetObjectClass(g_activity);
+        jmethodID m = c ? env->GetMethodID(c, "checkSelfPermission", "(Ljava/lang/String;)I") : nullptr;
+        jstring perm = env->NewStringUTF("android.permission.READ_EXTERNAL_STORAGE");
+        if (m) ok = env->CallIntMethod(g_activity, m, perm) == 0;  // PERMISSION_GRANTED
+        env->DeleteLocalRef(perm);
+        if (c) env->DeleteLocalRef(c);
+    }
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        ok = true;  // can't tell: let the file checks decide
+    }
+    if (attached) g_vm->DetachCurrentThread();
+    return ok;
+}
+
+// Waits until the app may read shared storage and the data folder holds the right ISO; meanwhile the
+// headset shows what is missing (a panel instead of a black screen). Returns the ISO path, or "" when the
+// app is closed first. A file that failed is only read again after it changed (size / time).
+std::string wait_for_user_disc(const fs::path &files) {
+    const std::string font = (files / "resources" / "fonts" / "Roboto-Regular.ttf").string();
+    std::string shown, failed_key, failed_heading, failed_body;
+    for (;;) {
+        if (gt4::quest::closeRequested()) return "";
+        std::string heading, body;
+        if (!storage_access()) {
+            heading = "Allow access to your files";
+            body = std::string("This app reads your disc image from ") + kDataDir +
+                   ", so it needs permission to access all files.\n"
+                   "Take off the headset, open Settings > Apps (or Privacy > Permissions), choose " + GT4VR_TITLE +
+                   " and allow access to all files. If a permission window opened when the app started, you can turn "
+                   "it on there.\nThe game starts by itself as soon as access is allowed.";
+        } else {
+            std::error_code ec;
+            fs::create_directories(kDataDir, ec);
+            if (!g_log) g_log = std::fopen((kDataDir + "/log.txt").c_str(), "w");  // failed without the permission
+            const std::string iso = find_user_iso();
+            struct stat st{};
+            const std::string key = stat(iso.c_str(), &st) == 0
+                                        ? iso + "|" + std::to_string(st.st_size) + "|" + std::to_string(st.st_mtime)
+                                        : "missing";
+            if (key != "missing" && key == failed_key) {
+                heading = failed_heading;
+                body = failed_body;
+            } else {
+                const std::string disc = prepare_user_disc(iso, heading, body);
+                if (!disc.empty()) {
+                    if (!shown.empty()) logf("[quest] disc ready, notice closed");
+                    gt4::panel::clearNotice();
+                    return disc;
+                }
+                failed_key = key;
+                failed_heading = heading;
+                failed_body = body;
+            }
+        }
+        if (heading + body != shown) {
+            logf("[quest] waiting: %s", heading.c_str());
+            gt4::panel::setNotice(font, GT4VR_TITLE, heading, body);
+            shown = heading + body;
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+}
+
 bool start_game(const fs::path &files) {
-    fs::create_directories(kDataDir);
+    {
+        std::error_code ec;
+        fs::create_directories(kDataDir, ec);  // no throw: may fail without the storage permission
+    }
     g_elf_path = kDataDir + "/core.elf";
     std::string disc = kDataDir + "/disc.iso";
     if (GT4VR_ELF_CRC[0] != '\0') {
-        disc = prepare_user_disc();
+        disc = wait_for_user_disc(files);
         if (disc.empty()) return false;
     }
     if (!readable(disc) && !kOldDataDir.empty() && readable(kOldDataDir + "/disc.iso")) disc = kOldDataDir + "/disc.iso";
@@ -1136,6 +1255,9 @@ void android_main(android_app *app) {
     load_config();
 
     const fs::path files = app->activity->internalDataPath;
+    // For storage_access() on the game thread (activity->clazz is a global ref NativeActivity holds).
+    g_vm = app->activity->vm;
+    g_activity = app->activity->clazz;
     if (!extract_assets(app->activity->assetManager, files)) logf("[quest] no PCSX2 resources in the APK");
 
     JavaVM *vm = app->activity->vm;

@@ -484,6 +484,82 @@ void draw(std::vector<std::uint8_t> &px, const Data &d, const Context &ctx) {
     else draw_settings(cv);
 }
 
+// ---- start-up notice
+std::atomic<bool> g_notice_on{false};
+std::string g_notice_app, g_notice_heading, g_notice_body;  // under g_mutex
+
+bool g_font_loaded = false;  // under g_mutex
+bool load_font(const std::string &font) {
+    if (g_font_loaded) return true;
+    std::ifstream in(font, std::ios::binary);
+    g_font_data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    g_font_loaded = !g_font_data.empty() &&
+                    stbtt_InitFont(&g_font, g_font_data.data(), stbtt_GetFontOffsetForIndex(g_font_data.data(), 0));
+    return g_font_loaded;
+}
+
+void draw_notice(std::vector<std::uint8_t> &px) {
+    Canvas cv{px};
+    cv.rect(0, 0, kWidth, kHeight, kBg);
+    cv.rect(0, 0, kWidth, 96, kHeader);
+    cv.rect(0, 96, kWidth, 4, kAccent);
+    cv.text(g_notice_app, 40, 62, 40, kText, kWidth - 80);
+    cv.text(g_notice_heading, 60, 180, 40, kGold, kWidth - 120);
+    // Body: paragraphs split at \n, words wrapped to the panel width.
+    constexpr int kSize = 30, kLine = 44, kLeft = 60, kMaxW = kWidth - 120;
+    int y = 250;
+    std::size_t start = 0;
+    while (start <= g_notice_body.size() && y < kHeight - 70) {
+        std::size_t end = g_notice_body.find('\n', start);
+        if (end == std::string::npos) end = g_notice_body.size();
+        const std::string para = g_notice_body.substr(start, end - start);
+        std::string line, word;
+        auto flush = [&] {
+            if (!line.empty() && y < kHeight - 70) cv.text(line, kLeft, y, kSize, kText, kMaxW);
+            y += kLine;
+            line.clear();
+        };
+        for (std::size_t i = 0; i <= para.size(); ++i) {
+            if (i < para.size() && para[i] != ' ') {
+                word += para[i];
+                continue;
+            }
+            if (word.empty()) continue;
+            const std::string next = line.empty() ? word : line + " " + word;
+            if (!line.empty() && cv.width(next, kSize) > kMaxW) flush(), line = word;
+            else line = next;
+            word.clear();
+        }
+        if (!line.empty()) flush();
+        y += kLine / 3;  // gap between paragraphs
+        start = end + 1;
+    }
+    cv.rect(0, kHeight - 56, kWidth, 56, kHeader);
+    cv.text("3D/VR port by Sgt.Bilko  ·  portroyale.online  ·  help: #support on the Discord", 40, kHeight - 20, 22, kDim,
+            kWidth - 80, 2);
+}
+
+}
+
+bool setNotice(const std::string &font, const std::string &app, const std::string &heading, const std::string &body) {
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!load_font(font)) {
+            std::fprintf(stderr, "[panel] font %s not loaded: notice not shown\n", font.c_str());
+            return false;
+        }
+        g_notice_app = app;
+        g_notice_heading = heading;
+        g_notice_body = body;
+    }
+    g_notice_on = true;
+    g_dirty = true;
+    return true;
+}
+
+void clearNotice() {
+    if (!g_notice_on.exchange(false)) return;
+    g_dirty = true;
 }
 
 bool start(const std::string &server, const std::string &font, ContextFn context) {
@@ -495,9 +571,12 @@ bool start(const std::string &server, const std::string &font, ContextFn context
             g_host.resize(colon);
         }
     }
-    std::ifstream in(font, std::ios::binary);
-    g_font_data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-    if (g_font_data.empty() || !stbtt_InitFont(&g_font, g_font_data.data(), stbtt_GetFontOffsetForIndex(g_font_data.data(), 0))) {
+    bool font_ok;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        font_ok = load_font(font);
+    }
+    if (!font_ok) {
         std::fprintf(stderr, "[panel] font %s not loaded: online menu off\n", font.c_str());
         return false;
     }
@@ -524,7 +603,7 @@ void setOpen(bool open) {
     std::fprintf(stderr, "[panel] %s\n", open ? "open" : "closed");
 }
 
-bool isOpen() { return g_open.load(); }
+bool isOpen() { return g_open.load() || g_notice_on.load(); }
 void toggle() { setOpen(!g_open.load()); }
 
 namespace {
@@ -558,6 +637,7 @@ void change_setting(int dx) {
 }  // namespace
 
 void input(int dx, int dy) {
+    if (g_notice_on.load()) return;
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_page == kSettings) {
         if (dy) {
@@ -574,6 +654,7 @@ void input(int dx, int dy) {
 }
 
 void nextPage(int d) {
+    if (g_notice_on.load()) return;
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_lobby || !d) return;
     g_page = g_page == kLobby ? kSettings : kLobby;
@@ -581,6 +662,7 @@ void nextPage(int d) {
 }
 
 void select() {
+    if (g_notice_on.load()) return;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (g_page == kSettings || !g_lobby) {
@@ -610,6 +692,7 @@ void select() {
 }
 
 void setTab(int tab) {
+    if (g_notice_on.load()) return;
     std::lock_guard<std::mutex> lock(g_mutex);
     g_page = g_lobby && tab == 0 ? kLobby : kSettings;
     g_dirty = true;
@@ -663,7 +746,13 @@ bool renderBadge(std::vector<std::uint8_t> &rgba) {
 }
 
 bool render(std::vector<std::uint8_t> &rgba) {
-    if (!g_available.load() || !g_dirty.exchange(false)) return false;
+    if ((!g_available.load() && !g_notice_on.load()) || !g_dirty.exchange(false)) return false;
+    if (g_notice_on.load()) {
+        rgba.assign(static_cast<std::size_t>(kWidth) * kHeight * 4, 0);
+        std::lock_guard<std::mutex> lock(g_mutex);
+        draw_notice(rgba);
+        return true;
+    }
     const Context ctx = g_context ? g_context() : Context{};
     rgba.assign(static_cast<std::size_t>(kWidth) * kHeight * 4, 0);
     std::lock_guard<std::mutex> lock(g_mutex);

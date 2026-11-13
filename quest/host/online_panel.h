@@ -27,6 +27,13 @@ using ContextFn = Context (*)();
 bool start(const std::string &server, const std::string &font, ContextFn context);
 bool available();
 
+// Start-up notice (0.3.2: users saw a black screen when file access or the ISO was missing): while
+// set, the panel shows `heading` and `body` (\n = new paragraph, long lines wrap) under the app name and
+// counts as open; the player cannot close it and the menu input is ignored. Works before start().
+// Returns false when the font can't be loaded. clearNotice() removes it.
+bool setNotice(const std::string &font, const std::string &app, const std::string &heading, const std::string &body);
+void clearNotice();
+
 void setOpen(bool open);
 bool isOpen();
 void toggle();
