@@ -1211,7 +1211,8 @@ void run_fast(int n, std::uint32_t address) {
     Unit u = unit_of(n);
     Vu0Regs &r = *u.regs;
     if (g_scan[n]) scan_flags(n, u.code, u.code_mask + 1);
-    const bool flags = g_flags_used[n];
+    // VU0: the EE reads MAC/status/clip after VCALLMS (cfc2), so every flag update is kept there.
+    const bool flags = n == 0 || g_flags_used[n];
     Decoded *cache = g_decoded[n];
     vuops::FlagPipe pipe;
     pipe.start(r);
