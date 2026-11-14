@@ -866,8 +866,10 @@ bool start_game(const fs::path &files) {
     setenv("PS2_PCSX2_RENDER_MODE", "full", 0);
     setenv("RRV_PCSX2_GS_SCALE_X", "3", 0);
     setenv("RRV_PCSX2_GS_FULL_SCALE", "6", 0);
-    setenv("RRV_PCSX2_GS_ANISO", "16", 0);
-    setenv("RRV_PCSX2_GS_FXAA", "1", 0);
+    // Owner release settings 2026-11-14 (Fukami app 0.1.1): 4x anisotropic, FXAA off - 16x + FXAA
+    // overloaded the GPU in City 1 and stalled the compositor at race starts.
+    setenv("RRV_PCSX2_GS_ANISO", "4", 0);
+    setenv("RRV_PCSX2_GS_FXAA", "0", 0);
     setenv("RRV_PCSX2_GS_CAS", "0", 0);
     setenv("RRV_PCSX2_GS_TEXTURE_FILTER", "bilinear", 0);
     setenv("RRV_PCSX2_GS_SPRITE_FILTER", "ps2", 0);

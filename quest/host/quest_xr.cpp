@@ -13,6 +13,10 @@
 // own camera; the surface is sized so both eye images fit side by side later.
 #include "quest_xr.h"
 
+#ifndef GT4VR_RR5
+#define GT4VR_RR5 0
+#endif
+
 #include "quest_host.h"
 #include "rrv_pcsx2_gs_bridge.h"
 #include "gt4_camera.h"
@@ -85,7 +89,7 @@ constexpr float kHudWorldWidthM = 1.8f; // Wipeout Pure VR: PURE_VR_HUD_WIDTH=1.
 //   adb shell setprop debug.gt4vr.conv 0.0
 //   adb shell setprop debug.gt4vr.stereo 0       (flat: both eyes the same picture)
 //   adb shell setprop debug.gt4vr.showdepth 1    (diagnostic: draw the depth buffer)
-constexpr float kStereoSeparation = 0.011f;
+constexpr float kStereoSeparation = GT4VR_RR5 ? 0.016f : 0.011f; // RR5: the Fukami app's (owner 2026-11-08)
 constexpr float kStereoConvergence = 0.0f;
 // Retail race renderer states with depth 3D (bit n = value n allowed): mode 0 (the race scene, not
 // menus / briefing / result), showcase 0 (driving; 1.. = after the finish).
@@ -185,7 +189,7 @@ constexpr float kHudHalfWidth = 0.45f; // Wipeout Pure VR: 1.8 m wide at 2 m
 // Owner 2026-11-01: 5.71 m at 2.0 m (110 deg) put the HUD outside the Quest's ~104 deg view; moved
 // back to 3.0 m at the same width (~87 deg), "looks good".
 constexpr float kScreenDistanceM = 3.0f;
-constexpr float kScreenWidthM = 5.71f;
+constexpr float kScreenWidthM = GT4VR_RR5 ? 5.76f : 5.71f; // RR5: 5.76 m at 3 m (owner "jetzt ist es perfect")
 // Screen height off the head / eye level, in metres; negative = the screen sits below the eyes
 // (owner: the screen was much too high -> correct the vertical height, put it below eye level).
 // Live tuning:
@@ -257,6 +261,9 @@ class TouchMapper
 public:
     gt4::quest::Pad Update(const ControllerInput &in, double now)
     {
+#if GT4VR_RR5
+        return UpdateRr5(in, now);
+#endif
         // A trigger counts as held above 8 % travel (released below 4 %), with its travel as pressure.
         const auto trigger = [](bool &held, float v) {
             held = held ? v > 0.04f : v > 0.08f;
@@ -416,6 +423,133 @@ public:
     }
 
 private:
+    // Ridge Racer V: the Fukami RR5 app's mapping (owner-approved, website controls table). A / right trigger
+    // = Cross (accelerate), X / left trigger = Square (brake), B = Triangle (view), Y = Circle, grips = L1 / R1
+    // (shift down / up), either stick's directions = D-pad, left stick = analog steering, left stick click
+    // short = Start (pause), held 1 s = the VR menu (Settings: screen distance / size, 3D strength), right
+    // stick click held = R2 (look back), both stick clicks = VR view / curved screen (while racing only).
+    // The Menu button opens / closes the VR menu too. Triggers and grips are digital (45 % / 25 %).
+    gt4::quest::Pad UpdateRr5(const ControllerInput &in, double now)
+    {
+        const auto hyst = [](bool &state, float value) {
+            if (!state && value > 0.45f)
+                state = true;
+            else if (state && value < 0.25f)
+                state = false;
+            return state;
+        };
+        const gt4::settings::Values set = gt4::settings::get();
+        const bool rt = hyst(m_rt, set.swap_triggers ? in.leftTrigger : in.rightTrigger);
+        const bool lt = hyst(m_lt, set.swap_triggers ? in.rightTrigger : in.leftTrigger);
+        const bool lg = hyst(m_lg, set.swap_grips ? in.rightGrip : in.leftGrip);
+        const bool rg = hyst(m_rg, set.swap_grips ? in.leftGrip : in.rightGrip);
+        const auto stickDir = [](bool &state, float value, float sign) {
+            const float v = value * sign;
+            if (!state && v > 0.75f)
+                state = true;
+            else if (state && v < 0.5f)
+                state = false;
+            return state;
+        };
+        const bool up = stickDir(m_ls[0], in.leftY, 1.0f) | stickDir(m_rs[0], in.rightY, 1.0f);
+        const bool down = stickDir(m_ls[1], in.leftY, -1.0f) | stickDir(m_rs[1], in.rightY, -1.0f);
+        const bool left = stickDir(m_ls[2], in.leftX, -1.0f) | stickDir(m_rs[2], in.rightX, -1.0f);
+        const bool right = stickDir(m_ls[3], in.leftX, 1.0f) | stickDir(m_rs[3], in.rightX, 1.0f);
+
+        bool toggle = in.menu && !m_menuPrev;
+        m_menuPrev = in.menu;
+        if (in.leftStickClick && !m_lscPrev)
+        {
+            m_lscDownAt = now;
+            m_lscLong = false;
+        }
+        if (in.leftStickClick && in.rightStickClick && !m_stickCombo)
+        {
+            m_stickCombo = true;
+            m_lscLong = true;
+            if (g_vr_allowed.load(std::memory_order_relaxed) && g_racing.load(std::memory_order_relaxed))
+                gt4::quest::setCurvedView(!gt4::quest::curvedView());
+            else
+                XR_LOG("VR view: not racing - stays on the curved screen");
+        }
+        else if (!in.leftStickClick && !in.rightStickClick)
+        {
+            m_stickCombo = false;
+        }
+        if (in.leftStickClick && !m_lscLong && now - m_lscDownAt >= 1.0)
+        {
+            m_lscLong = true;
+            toggle = true;
+        }
+        if (!in.leftStickClick && m_lscPrev && !m_lscLong)
+            m_startUntil = now + 0.12;
+        m_lscPrev = in.leftStickClick;
+        if (toggle && gt4::panel::available())
+        {
+            if (!gt4::panel::isOpen())
+                gt4::panel::setTab(0);
+            gt4::panel::toggle();
+        }
+
+        const bool was_a = m_panelA, was_b = m_panelB;
+        m_panelA = in.a || rt;
+        m_panelB = in.b;
+        if (gt4::panel::isOpen())
+        {
+            const int dx = (right && !m_panelDir[3]) - (left && !m_panelDir[2]);
+            const int dy = (down && !m_panelDir[1]) - (up && !m_panelDir[0]);
+            if (dx || dy)
+                gt4::panel::input(dx, dy);
+            const int page = (rg && !m_panelGrip[1]) - (lg && !m_panelGrip[0]);
+            if (page)
+                gt4::panel::nextPage(page);
+            m_panelGrip[0] = lg, m_panelGrip[1] = rg;
+            if (m_panelB && !was_b)
+                gt4::panel::setOpen(false);
+            if (m_panelA && !was_a)
+                gt4::panel::select();
+            m_panelDir[0] = up, m_panelDir[1] = down, m_panelDir[2] = left, m_panelDir[3] = right;
+            m_panelHeld = true;
+            gt4::quest::Pad idle;
+            idle.connected = true;
+            return idle;
+        }
+        if (m_panelHeld)  // after closing: released until the closing press is let go
+        {
+            if (in.a || in.b || rt || up || down || left || right || lg || rg)
+            {
+                gt4::quest::Pad idle;
+                idle.connected = true;
+                return idle;
+            }
+            m_panelHeld = false;
+        }
+
+        gt4::quest::Pad pad;
+        pad.connected = true;
+        uint32_t b = 0;
+        if (in.a || rt) b |= gt4::quest::HostPadButtonCross;
+        if (in.b) b |= gt4::quest::HostPadButtonTriangle;
+        if (in.x || lt) b |= gt4::quest::HostPadButtonSquare;
+        if (in.y) b |= gt4::quest::HostPadButtonCircle;
+        if (lg) b |= gt4::quest::HostPadButtonL1;
+        if (rg) b |= gt4::quest::HostPadButtonR1;
+        if (now < m_startUntil) b |= gt4::quest::HostPadButtonStart;
+        const bool look_back = in.rightStickClick && !m_stickCombo;
+        if (look_back) b |= gt4::quest::HostPadButtonR2;
+        if (up) b |= gt4::quest::HostPadButtonUp;
+        if (down) b |= gt4::quest::HostPadButtonDown;
+        if (left) b |= gt4::quest::HostPadButtonLeft;
+        if (right) b |= gt4::quest::HostPadButtonRight;
+        pad.buttons = b;
+        pad.leftX = in.leftX;
+        pad.leftY = in.leftY;
+        pad.r2 = look_back ? 1.0f : 0.0f;
+        return pad;  // cross / square pressure 0 = full (apply_pad), as the Fukami app's digital buttons
+    }
+
+    bool m_menuPrev = false, m_lscPrev = false, m_lscLong = false;
+    double m_lscDownAt = 0.0;
     bool m_rt = false, m_lt = false, m_lg = false, m_rg = false;
     bool m_stickCombo = false;
     bool m_rs[4] = {};
