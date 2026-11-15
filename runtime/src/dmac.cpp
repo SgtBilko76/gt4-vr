@@ -40,6 +40,19 @@ bool g_mfifo_waiting = false;
 // D_RBSR) and VIF1 runs a chain out of it, stalling while its tag address has caught up
 // with fromSPR's write address.
 bool mfifo_vif1() { return ((g_ctrl >> 2) & 3u) == 2u; }
+struct Ch2Log { char kind; std::uint32_t at, id, qwc, addr, chcr, ctrl, stadr, ch8chcr, ch8madr; };
+Ch2Log g_ch2log[48];
+std::uint32_t g_ch2pos = 0;
+void ch2_note(char kind, std::uint32_t at, std::uint32_t id, std::uint32_t qwc, std::uint32_t addr);
+std::uint32_t g_last2_addr = 0, g_last2_qwc = 0;
+struct Ch2Del { std::uint64_t first; std::uint32_t address, qwc; };
+Ch2Del g_ch2del[256];
+std::uint32_t g_ch2delpos = 0;
+std::uint64_t g_ch2qw = 0;
+void ch2_deliver_note(std::uint32_t address, std::uint32_t qwc) {
+    g_ch2del[g_ch2delpos++ % 256u] = {g_ch2qw, address, qwc};
+    g_ch2qw += qwc;
+}
 std::uint32_t ring(std::uint32_t a) { return g_rbor | (a & g_rbsr); }
 bool tag_data_in_ring(std::uint32_t chcr) {
     const std::uint32_t id = (chcr >> 28) & 7u;
@@ -67,6 +80,7 @@ void deliver(int ch, std::uint32_t address, std::uint32_t qwc) {
         for (std::uint32_t i = 0; i < qwc; ++i) std::memcpy(buffer.data() + i * 16, source(address + i * 16), 16);
         data = buffer.data();
     }
+    if (ch == 2) { ch2_deliver_note(address, qwc); g_last2_addr = address; g_last2_qwc = qwc; }
     switch (ch) {
     case 0: vif::transfer(0, data, qwc); break;
     case 1: vif::transfer(1, data, qwc); break;
@@ -144,6 +158,11 @@ void run_from_spr_chain() {
         c.sadr = (c.sadr + 16) & (kScratchpadSize - 1);
         c.chcr = (c.chcr & 0xFFFFu) | (static_cast<std::uint32_t>(tag >> 16) << 16);
         const std::uint32_t qwc = static_cast<std::uint32_t>(tag) & 0xFFFFu;
+        static const bool trace8 = std::getenv("PS2_TRACE_DMA8") != nullptr;
+        if (trace8)
+            std::fprintf(stderr, "[dma8] tag at spr 0x%04X: %016llX qwc %u id %u addr 0x%08X (madr before 0x%08X)\n",
+                         (c.sadr - 16) & (kScratchpadSize - 1), static_cast<unsigned long long>(tag), qwc,
+                         static_cast<unsigned>((tag >> 28) & 7u), static_cast<std::uint32_t>(tag >> 32), c.madr);
         c.madr = static_cast<std::uint32_t>(tag >> 32);
         spr_to_ram(c, qwc);
         c.madr = spr_advance(c.madr, qwc);
@@ -286,6 +305,7 @@ void run_chain(int ch) {
             c.tadr = ring(c.tadr);
         }
         c.madr = data;
+        if (ch == 2) ch2_note('T', tag_at, id, qwc, addr_full);
         if (ch == 2 && g_starts[2] <= 2) std::fprintf(stderr, "[dma] gif tag id %u qwc %u addr 0x%08X data 0x%08X\n", id, qwc, addr_full, data);
         static const bool trace_tags = std::getenv("PS2_TRACE_DMA1") != nullptr;
         if (trace_tags && ch == 1) std::fprintf(stderr, "[dma] ch1 tag at 0x%08X id %u qwc %u irq %d addr 0x%08X next 0x%08X\n", tag_at, id, qwc, irq ? 1 : 0, addr_full, c.tadr);
@@ -306,11 +326,12 @@ void run_chain(int ch) {
     finish(ch);
 }
 
-void start(int ch) {
+void start_now(int ch) {
     Channel &c = g_ch[ch];
     c.paused = false;
     c.tag_end = c.qwc && chain_ends_after_current(c);
     ++g_starts[ch];
+    if (ch == 2) ch2_note('S', c.tadr, (c.chcr >> 2) & 3u, c.qwc, c.madr);
     static const bool trace = std::getenv("PS2_TRACE_DMA") != nullptr;
     if (trace) std::fprintf(stderr, "[dma] ch%d chcr 0x%08X madr 0x%08X qwc %u tadr 0x%08X thread %d%s\n", ch, c.chcr, c.madr, c.qwc, c.tadr,
                             kernel::current_thread(), kernel::in_handler() ? " (handler)" : "");
@@ -327,6 +348,24 @@ void start(int ch) {
     if (mode == 1 && ch == 8) run_from_spr_chain();
     else if (mode == 1) run_chain(ch);
     else run_normal(ch);
+}
+
+// PS2_VIF1_DELAY=<EE cycles>: a VIF1 DMA starts that many cycles after its kick instead of at once. On a real
+// PS2 the VIF1 list runs for most of a frame and a GIF (PATH3) transfer the game kicks right after it gets
+// drawn early; Ridge Racer V kicks its frame clear and EE-built geometry on channel 2 just after the VIF1
+// list and counts on that. Started at once here, the whole VIF1 scene was drawn first and the clear for the
+// same buffer painted over it (sky-blue picture, 2026-11-15).
+std::uint64_t vif1_delay() {
+    static const std::uint64_t d = [] { const char *e = std::getenv("PS2_VIF1_DELAY"); return e ? std::strtoull(e, nullptr, 10) : 0ull; }();
+    return d;
+}
+
+void start(int ch) {
+    if (ch == 1 && vif1_delay()) {
+        schedule(hw::kEventDma0 + 1, now() + vif1_delay(), [] { if (g_ch[1].chcr & 0x100u) start_now(1); });
+        return;
+    }
+    start_now(ch);
 }
 
 }
@@ -439,7 +478,10 @@ std::uint32_t read(std::uint32_t a) {
 
 void write(std::uint32_t a, std::uint32_t v) {
     switch (a) {
-    case 0x1000E000u: g_ctrl = v; return;
+    case 0x1000E000u:
+        if ((v & 0xF0u) != (g_ctrl & 0xF0u) || ((v >> 2) & 3u) != ((g_ctrl >> 2) & 3u))
+            std::fprintf(stderr, "[dma] D_CTRL 0x%08X (mfifo %u, stall source %u, stall drain %u)\n", v, (v >> 2) & 3u, (v >> 4) & 3u, (v >> 6) & 3u);
+        g_ctrl = v; return;
     case 0x1000E020u: g_pcr = v; return;
     case 0x1000E030u: g_sqwc = v; return;
     case 0x1000E040u: g_rbsr = v; return;
@@ -493,4 +535,52 @@ void state(ps2::state::Stream &s) {
     }
 }
 
+}
+
+namespace ps2::dmac {
+namespace {
+void ch2_note(char kind, std::uint32_t at, std::uint32_t id, std::uint32_t qwc, std::uint32_t addr) {
+    g_ch2log[g_ch2pos++ % 48u] = {kind, at, id, qwc, addr, g_ch[2].chcr, g_ctrl, g_stadr, g_ch[8].chcr, g_ch[8].madr};
+}
+}
+void dump_ch2_qword(std::uint64_t n) {
+    std::fprintf(stderr, "[ch2] delivered %llu qwords so far\n", (unsigned long long)g_ch2qw);
+    for (std::uint32_t k = 0; k < 256u; ++k) {
+        const Ch2Del &d = g_ch2del[(g_ch2delpos + k) % 256u];
+        if (!d.qwc) continue;
+        const bool hit = n >= d.first && n < d.first + d.qwc;
+        if (hit || (n >= d.first ? n - d.first : d.first - n) < 40)
+            std::fprintf(stderr, "[ch2] %s delivery qwords %llu..%llu from 0x%08X (%u qw)%s\n", hit ? "=>" : "  ",
+                         (unsigned long long)d.first, (unsigned long long)(d.first + d.qwc - 1), d.address, d.qwc,
+                         hit ? "" : "");
+        if (hit) std::fprintf(stderr, "[ch2]    the qword is at 0x%08X\n", d.address + static_cast<std::uint32_t>(n - d.first) * 16u);
+    }
+}
+void dump_last2_short(std::uint32_t qword_in_call) {
+    std::fprintf(stderr, "from guest 0x%08X (delivery 0x%08X qwc %u)\n", g_last2_addr + qword_in_call * 16u, g_last2_addr, g_last2_qwc);
+}
+void dump_last2(std::uint32_t qword_in_call) {
+    const std::uint32_t at = g_last2_addr + qword_in_call * 16u;
+    std::fprintf(stderr, "[ch2] last delivery 0x%08X qwc %u; bad qword %u -> address 0x%08X\n", g_last2_addr, g_last2_qwc, qword_in_call, at);
+    for (int k = -6; k <= 2; ++k) {
+        const std::uint8_t *m = source(at + static_cast<std::uint32_t>(k * 16));
+        std::uint64_t a, b; std::memcpy(&a, m, 8); std::memcpy(&b, m + 8, 8);
+        std::fprintf(stderr, "[ch2]   0x%08X: %016llX %016llX\n", at + k * 16, (unsigned long long)a, (unsigned long long)b);
+    }
+}
+void dump_ch2_history() {
+    for (std::uint32_t k = 0; k < 48u; ++k) {
+        const Ch2Log &l = g_ch2log[(g_ch2pos + k) % 48u];
+        if (!l.kind) continue;
+        if (l.kind == 'S')
+            std::fprintf(stderr, "[ch2] start mode %u tadr 0x%08X qwc %u madr 0x%08X chcr 0x%08X ctrl 0x%X stadr 0x%08X ch8 chcr 0x%08X madr 0x%08X\n",
+                         l.id, l.at, l.qwc, l.addr, l.chcr, l.ctrl, l.stadr, l.ch8chcr, l.ch8madr);
+        else
+            std::fprintf(stderr, "[ch2]   tag at 0x%08X id %u qwc %u addr 0x%08X\n", l.at, l.id, l.qwc, l.addr);
+    }
+}
+}
+
+namespace ps2::dmac {
+void start_delayed(int ch) { if (g_ch[ch].chcr & 0x100u) start_now(ch); }
 }

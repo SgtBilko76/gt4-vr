@@ -8,9 +8,14 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <vector>
 
+namespace ps2::gs { void set_trace_path(int); }
+namespace ps2::dmac { void dump_ch2_history(); void dump_ch2_qword(std::uint64_t); void dump_last2(std::uint32_t); void dump_last2_short(std::uint32_t); }
 namespace ps2::gif {
+extern std::uint64_t g_in3, g_out3, g_dropped3, g_drops;
+void path3_counts(const char *why);
 
 namespace {
 
@@ -23,6 +28,11 @@ struct Path {
 };
 
 Path g_paths[4];
+std::uint32_t g_walk_i = 0;
+struct TagLog { std::uint64_t tag[2]; std::uint32_t qw; };
+TagLog g_taglog[4][16];
+std::uint32_t g_tagpos[4] = {};
+std::uint64_t g_qw[4] = {};
 std::uint32_t g_stat = 0;
 std::uint64_t g_tags[4][4];
 
@@ -31,6 +41,8 @@ void walk(Path &p, const std::uint8_t *data, std::uint32_t qwc, Sink &sink) {
     for (std::uint32_t i = 0; i < qwc; ++i) {
         Reg128 q;
         std::memcpy(&q, data + static_cast<std::size_t>(i) * 16, 16);
+        ++g_qw[&p - g_paths < 4 && &p >= g_paths ? &p - g_paths : 0];
+        g_walk_i = i;
         if (!p.active) {
             p.nloop = static_cast<std::uint32_t>(q.d[0]) & 0x7FFFu;
             p.eop = (q.d[0] >> 15) & 1u;
@@ -73,14 +85,68 @@ void walk(Path &p, const std::uint8_t *data, std::uint32_t qwc, Sink &sink) {
     }
 }
 
+// PS2_TRACE_GIFBAD=1 (diagnosis): an A+D write of TRXDIR with a direction other than host->local, or a
+// BITBLTBUF/TRXREG with an implausible size, prints the path and that path's last tags.
+
 struct GsSink {
     int path;
     void tag(const Path &p, const Reg128 &q) {
+        static const bool bad = std::getenv("PS2_TRACE_GIFBAD") != nullptr;
+        if (bad) g_taglog[path][g_tagpos[path]++ & 15u] = {{q.d[0], q.d[1]}, static_cast<std::uint32_t>(g_qw[path])};
+        static int odd = 0;
+        if (bad && path == 3 && p.flg == 0 && q.d[1] == 0 && p.nloop && odd < 3) {
+            ++odd;
+            std::fprintf(stderr, "[gifbad] path 3 implausible tag %016llX %016llX at qword %llu\n", (unsigned long long)q.d[0],
+                         (unsigned long long)q.d[1], (unsigned long long)g_qw[path]);
+            for (std::uint32_t k = 0; k < 16; ++k) {
+                const TagLog &t = g_taglog[path][(g_tagpos[path] + k) & 15u];
+                std::fprintf(stderr, "[gifbad]   tag at qword %u: %016llX %016llX\n", t.qw, (unsigned long long)t.tag[0], (unsigned long long)t.tag[1]);
+            }
+            path3_counts("at implausible tag");
+            ps2::dmac::dump_last2(g_walk_i);
+            ps2::dmac::dump_ch2_history();
+            for (std::uint32_t k = 1; k <= 4; ++k) {
+                const TagLog &t = g_taglog[path][(g_tagpos[path] - k) & 15u];
+                std::fprintf(stderr, "[gifbad] tag %u back at path-3 qword %u:\n", k, t.qw);
+                ps2::dmac::dump_ch2_qword(t.qw - 1);
+            }
+        }
         ++g_tags[path][p.flg];
         gs::g_state.q = 1.0f;
         if (((q.d[0] >> 46) & 1u) && p.flg == 0) gs::write(0x00, (q.d[0] >> 47) & 0x7FFu);
     }
-    void packed(std::uint32_t reg, const Reg128 &q) { gs::write_packed(reg, q); }
+    void packed(std::uint32_t reg, const Reg128 &q) {
+        // PS2_TRACE_FRAME2=1: every A+D write of FRAME_1/FRAME_2 on path 3 with the guest address it came from.
+        static const bool tf = std::getenv("PS2_TRACE_FRAME2") != nullptr;
+        if (tf && reg == 0xEu && path == 3) {
+            const std::uint32_t a = static_cast<std::uint32_t>(q.d[1] & 0xFFu);
+            if (a == 0x4C || a == 0x4D) {
+                static int shown = 0;
+                if (shown++ < 60) { std::fprintf(stderr, "[frame2] reg %02X = %016llX ", a, (unsigned long long)q.d[0]); ps2::dmac::dump_last2_short(g_walk_i); }
+            }
+        }
+        static const bool bad = std::getenv("PS2_TRACE_GIFBAD") != nullptr;
+        if (bad && reg == 0xEu) {
+            const std::uint32_t a = static_cast<std::uint32_t>(q.d[1] & 0xFFu);
+            const bool suspicious = (a == 0x53 && (q.d[0] & 3u) != 0) ||
+                                    (a == 0x52 && ((q.d[0] & 0xFFFu) > 1024 || ((q.d[0] >> 32) & 0xFFFu) > 1024));
+            static int shown = 0;
+            if (suspicious && shown < 12) {
+                if (shown == 0 && path == 3) ps2::dmac::dump_ch2_history();
+                ++shown;
+                const Path &p = g_paths[path];
+                std::fprintf(stderr, "[gifbad] path %d reg 0x%02X value %016llX (hi %016llX) at qword %llu; packet nloop %u loop %u nreg %u reg %u flg %u regs %016llX\n",
+                             path, a, (unsigned long long)q.d[0], (unsigned long long)q.d[1], (unsigned long long)g_qw[path], p.nloop, p.loop, p.nreg, p.reg, p.flg, (unsigned long long)p.regs);
+                for (std::uint32_t k = 0; k < 16; ++k) {
+                    const TagLog &t = g_taglog[path][(g_tagpos[path] + k) & 15u];
+                    std::fprintf(stderr, "[gifbad]   tag at qword %u: %016llX %016llX (nloop %llu eop %llu flg %llu nreg %llu)\n", t.qw,
+                                 (unsigned long long)t.tag[0], (unsigned long long)t.tag[1], (unsigned long long)(t.tag[0] & 0x7FFF),
+                                 (unsigned long long)((t.tag[0] >> 15) & 1), (unsigned long long)((t.tag[0] >> 58) & 3), (unsigned long long)((t.tag[0] >> 60) & 15));
+                }
+            }
+        }
+        gs::write_packed(reg, q);
+    }
     void reglist(std::uint32_t reg, std::uint64_t value) { gs::write(reg, value); }
     void image(const std::uint8_t *data, std::uint32_t qwords) { gs::write_image(data, qwords); }
 };
@@ -164,6 +230,7 @@ bool hold_here() { return !gs::queue::vu_active() || gs::queue::role() == gs::qu
 
 void out(int path, const std::uint8_t *data, std::uint32_t qwc) {
     if (!qwc) return;
+    if (path == 3) g_out3 += qwc;
     if (!gs::queue::active()) {
         render(path, data, qwc);
         return;
@@ -218,7 +285,22 @@ void release(bool only_one) {
 
 }
 
+std::uint64_t g_in3 = 0, g_out3 = 0, g_dropped3 = 0, g_drops = 0;
+void path3_counts(const char *why) {
+    std::fprintf(stderr, "[gif3] %s: in %llu out %llu held %zu dropped %llu (%llu drops) masked %d mid %d\n", why,
+                 (unsigned long long)g_in3, (unsigned long long)g_out3, g_held.data.size() / 16, (unsigned long long)g_dropped3,
+                 (unsigned long long)g_drops, g_held.masked ? 1 : 0, g_held.mid_packet ? 1 : 0);
+}
 void drop_held() {
+    if (!g_held.data.empty() || g_held.mid_packet) {
+        g_dropped3 += g_held.data.size() / 16; ++g_drops;
+        static int shown = 0;
+        if (shown++ < 20) {
+            std::fprintf(stderr, "[gif3] GIF reset drops %zu held qwords (mid_packet %d left %llu)\n", g_held.data.size() / 16,
+                         g_held.mid_packet ? 1 : 0, (unsigned long long)g_held.left);
+            path3_counts("at drop");
+        }
+    }
     const bool masked = g_held.masked;
     g_held = Held{};
     g_held.masked = masked;
@@ -240,12 +322,20 @@ void render_reset() {
 }
 
 void render(int path, const std::uint8_t *data, std::uint32_t qwc) {
+    ps2::gs::set_trace_path(path);
     GsSink sink{path};
     walk(g_paths[path], data, qwc, sink);
 }
 
 void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
     Held &h = g_held;
+    if (path == 3) g_in3 += qwc;
+    static const bool no_hold = [] { const char *e = std::getenv("PS2_GIF_NOHOLD"); return e && e[0] == '1'; }();  // diagnosis
+    if (no_hold) {
+        if (!h.data.empty()) release(false);
+        out(path, data, qwc);
+        return;
+    }
     if (!hold_here()) {
         out(path, data, qwc);
         return;

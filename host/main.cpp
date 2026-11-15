@@ -124,6 +124,7 @@ int main(int argc, char **argv) {
             }
         };
     }
+    if (std::getenv("PS2_RR5_LZCHECK")) { void rr5_install_lzcheck(); rr5_install_lzcheck(); }
 #ifdef PS2_GT4_CAMERA
     if (std::getenv("PS2_GT4_SCENELOG")) gt4::camera::installSceneDetector(); // retail scene probe test
     // ps2run: test pose from PS2_GT4_TEST_* only; PS2_GT4_RETAIL=1 = the retail v2.00 hook addresses.

@@ -297,6 +297,7 @@ namespace ps2::hw {
 std::function<void()> event_action(int id, std::uint64_t at) {
     if (id == kEventVblankEnd) return [] { intc_raise(3); };
     if (id >= kEventTimer0 && id <= kEventTimer3) return [n = id - kEventTimer0, at] { timer_event(n, at); };
+    if (id == kEventDma0 + 1) return [] { dmac::start_delayed(1); };
     return [] {};
 }
 

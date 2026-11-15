@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "raster.hpp"
 
 #include <algorithm>
@@ -138,6 +139,9 @@ std::uint32_t z_max(std::uint32_t psm) {
     }
 }
 
+}
+std::uint64_t g_pixels_written = 0;
+namespace {
 void plot(const Setup &s, int x, int y, const Attr &at) {
     if (x < s.scax0 || x > s.scax1 || y < s.scay0 || y > s.scay1) return;
     if (s.scanmsk == 2 && !(y & 1)) return;
@@ -185,7 +189,8 @@ void plot(const Setup &s, int x, int y, const Attr &at) {
             break;
         }
     }
-    if (s.fge) {
+    static const bool no_fog = std::getenv("PS2_GS_NOFOG") != nullptr;  // diagnosis
+    if (s.fge && !no_fog) {
         const int f = static_cast<int>(at.f);
         const int fr = static_cast<int>(s.fogcol & 0xFFu), fg = static_cast<int>((s.fogcol >> 8) & 0xFFu), fb = static_cast<int>((s.fogcol >> 16) & 0xFFu);
         r = (f * r + (255 - f) * fr) >> 8;
@@ -219,14 +224,16 @@ void plot(const Setup &s, int x, int y, const Attr &at) {
 
     std::uint32_t dst = 0;
     bool have_dst = false;
-    if (s.date) {
+    static const bool no_date = std::getenv("PS2_GS_NODATE") != nullptr;  // diagnosis
+    if (s.date && !no_date) {
         dst = read_frame(s, x, y);
         have_dst = true;
         const bool bit = (s.fpsm == PSMCT16 || s.fpsm == PSMCT16S) ? (dst & 0x80000000u) != 0 : (dst & 0x80000000u) != 0;
         if (bit != s.datm) return;
     }
 
-    if (s.zte) {
+    static const bool no_ztest = std::getenv("PS2_GS_NOZTEST") != nullptr;  // diagnosis
+    if (s.zte && !no_ztest) {
         const std::uint32_t old = read_pixel(s.zpsm, s.zbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y)) & zmax;
         bool pass;
         switch (s.ztst) {
@@ -265,6 +272,7 @@ void plot(const Setup &s, int x, int y, const Attr &at) {
         if (s.fba) out_a |= 0x80u;
         std::uint32_t mask = s.fbmsk;
         if (!write_alpha) mask |= 0xFF000000u;
+        ++g_pixels_written;
         write_frame(s, x, y, static_cast<std::uint32_t>(r) | (static_cast<std::uint32_t>(g) << 8) | (static_cast<std::uint32_t>(b) << 16) | (out_a << 24), mask);
     }
     if (write_z && s.zte) {

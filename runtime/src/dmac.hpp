@@ -7,6 +7,7 @@ class Stream;
 }
 
 namespace ps2::dmac {
+void start_delayed(int ch);
 
 void state(ps2::state::Stream &s);
 

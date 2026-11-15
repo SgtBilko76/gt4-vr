@@ -890,6 +890,13 @@ bool start_game(const fs::path &files) {
     // follows the eye image's aspect (arc * h / w): with the headset's recommended near-square size
     // (~2184x2288) the 5.76 m screen stood about 6 m tall instead of 4.3 m (owner 2026-11-15).
     setenv("RRV_VR_EYE", "1920x1440", 0);
+    // Ridge Racer V's frame (2026-11-15): (1) byte stores to DMAC registers change only their byte lanes
+    // (the game starts its fromSPR copies with "sb 1(D8_CHCR)"; lost, the GIF chain sent stale packets:
+    // garbage textures); (2) a VIF1 DMA starts a moment after its kick, so the GIF (PATH3) list the game
+    // kicks right after it - the frame clear and EE-built geometry - is drawn first, as on a real PS2
+    // (started at once, the clear for the same buffer painted the whole scene sky blue).
+    setenv("PS2_SUBIO_RMW", "1", 0);
+    setenv("PS2_VIF1_DELAY", "20000", 0);
 #else
     setenv("RRV_PCSX2_GS_ASPECT", "stretch", 0);
     // GT4 profile of the bridge (PCSX2 GameDB fixes for GT4, field-mode upscaling); scale 2 =

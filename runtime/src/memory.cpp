@@ -147,7 +147,28 @@ void write_slow(std::uint32_t a, T v) {
     }
     if (t.region == Region::Io) {
         if constexpr (sizeof(T) == 8) hw::write64(t.address, v);
-        else hw::write32(t.address, static_cast<std::uint32_t>(v));
+        else if constexpr (sizeof(T) < 4) {
+            // Byte / halfword stores to a DMAC register change only their lanes of the 32-bit register
+            // (read-modify-write). Ridge Racer V starts its fromSPR copies with "sb 1(D8_CHCR)" (STR bit 8):
+            // passed on as a 32-bit write to 0x1000D001 the start was lost, the copy never ran and the GIF
+            // chain sent the stale bytes in its place (garbage textures, no track; 2026-11-15).
+            static const bool trace_sub = std::getenv("PS2_TRACE_SUBIO") != nullptr;
+            if (trace_sub) {
+                static std::unordered_set<std::uint64_t> seen;
+                const std::uint64_t key = (static_cast<std::uint64_t>(t.address) << 32) | g_cpu.pc;
+                if (seen.size() < 400 && seen.insert(key).second)
+                    std::fprintf(stderr, "[subio] %zu-byte write 0x%08X = 0x%X pc 0x%08X\n", sizeof(T), t.address, static_cast<unsigned>(v), g_cpu.pc);
+            }
+            static const bool rmw = [] { const char *e = std::getenv("PS2_SUBIO_RMW"); return e && e[0] == '1'; }();
+            if (rmw && t.address >= 0x10008000u && t.address < 0x1000F000u) {
+                const std::uint32_t word_at = t.address & ~3u, shift = (t.address & 3u) * 8u;
+                const std::uint32_t mask = (sizeof(T) == 1 ? 0xFFu : 0xFFFFu) << shift;
+                const std::uint32_t word = (hw::read32(word_at) & ~mask) | ((static_cast<std::uint32_t>(v) << shift) & mask);
+                hw::write32(word_at, word);
+            } else {
+                hw::write32(t.address, static_cast<std::uint32_t>(v));
+            }
+        } else hw::write32(t.address, static_cast<std::uint32_t>(v));
         return;
     }
     unmapped("write", a);

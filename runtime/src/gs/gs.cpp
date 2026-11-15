@@ -20,6 +20,7 @@
 #include <functional>
 #include <mutex>
 #include <cstdio>
+#include <map>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -675,6 +676,11 @@ void vblank() {
 
 }
 
+struct RegLog { std::uint32_t reg; std::uint64_t value; int path; };
+RegLog g_reg_ring[256];
+std::uint32_t g_reg_pos = 0;
+int g_cur_path = -1;
+void set_trace_path(int p) { g_cur_path = p; }
 void kick(bool draw) {
     State &s = g_state;
     const std::uint32_t prim = static_cast<std::uint32_t>(s.prim) & 7u;
@@ -683,12 +689,110 @@ void kick(bool draw) {
     if (draw) {
         // PS2_GS_NULL=1: no software drawing (CPU timing measurements only; pictures are empty).
         static const bool null_gs = std::getenv("PS2_GS_NULL") != nullptr;
+        const std::uint64_t px_before = raster::g_pixels_written;
         if (cpu_raster() && !null_gs) raster::draw(s, s.queue, needed);
+        // PS2_TRACE_DRAWORDER=<frame>: runs of consecutive primitives with the same texture/test state in draw
+        // order, with the pixels they wrote and their screen bounding box (diagnosis).
+        static const std::uint64_t do_frame = [] { const char *e = std::getenv("PS2_TRACE_DRAWORDER"); return e ? std::strtoull(e, nullptr, 10) : 0ull; }();
+        if (do_frame && frame_count() == do_frame) {
+            const std::uint64_t pm = s.prmodecont & 1u ? s.prim : s.prmode;
+            const Context &cx = s.ctx[(pm >> 9) & 1u];
+            struct Run { std::uint64_t tex0, test, alpha, prim; std::uint64_t prims, px; int x0, y0, x1, y1; std::uint32_t z0, z1; int path; };
+            static Run run{};
+            static std::uint64_t runs = 0;
+            const std::uint64_t pr = (s.prim & 7u) | (pm & 0x7F0u);
+            auto flush = [&] {
+                if (run.prims && runs < 20000)
+                    std::fprintf(stderr, "[draworder] path %d %4llu prim %03llX tex0 %016llX test %05llX alpha %010llX : %6llu prims %8llu px box %d,%d-%d,%d z %06X-%06X\n",
+                                 run.path, (unsigned long long)runs, (unsigned long long)run.prim, (unsigned long long)run.tex0, (unsigned long long)(run.test & 0x7FFFF),
+                                 (unsigned long long)(run.alpha & 0xFFFFFFFFFFull), (unsigned long long)run.prims, (unsigned long long)run.px,
+                                 run.x0, run.y0, run.x1, run.y1, run.z0, run.z1);
+                ++runs;
+            };
+            if (!(run.prims && run.tex0 == cx.tex0 && run.test == cx.test && run.alpha == cx.alpha && run.prim == pr && run.path == g_cur_path)) {
+                flush();
+                run = Run{cx.tex0, cx.test, cx.alpha, pr, 0, 0, 1 << 30, 1 << 30, -(1 << 30), -(1 << 30), 0xFFFFFFFFu, 0, g_cur_path};
+            }
+            ++run.prims;
+            run.px += raster::g_pixels_written - px_before;
+            static int big_dumped = 0;
+            if (raster::g_pixels_written - px_before > 100000 && big_dumped < 4) {
+                ++big_dumped;
+                const std::uint64_t t0 = cx.tex0;
+                const unsigned tbp = unsigned(t0 & 0x3FFF), tbw = unsigned((t0 >> 14) & 0x3F), psm = unsigned((t0 >> 20) & 0x3F);
+                const unsigned csa = unsigned((t0 >> 56) & 0x1F), cbp = unsigned((t0 >> 37) & 0x3FFF);
+                std::fprintf(stderr, "[bigdraw] prim %03llX tex0 %016llX tbp %05X tbw %u psm %02X cbp %05X csa %u texclut %llX rgbaq %016llX uv0 %X,%X uv1 %X,%X st0 %f,%f q %f\n",
+                             (unsigned long long)pr, (unsigned long long)t0, tbp, tbw, psm, cbp, csa, (unsigned long long)s.texclut,
+                             (unsigned long long)s.rgbaq, s.queue[0].u, s.queue[0].v, s.queue[1].u, s.queue[1].v, s.queue[0].s, s.queue[0].t, s.queue[0].q);
+                std::fprintf(stderr, "[bigdraw]   clut cache:");
+                for (unsigned i = 0; i < 16; ++i) std::fprintf(stderr, " %08X", s.clut[(csa * 16 + i) & 511u]);
+                std::fprintf(stderr, "\n[bigdraw]   clut vram :");
+                for (unsigned i = 0; i < 16; ++i) std::fprintf(stderr, " %08X", read_pixel(0, cbp, 1, i & 7u, i >> 3));
+                std::fprintf(stderr, "\n");
+                for (std::uint32_t k = 0; k < 256; ++k) {
+                    const RegLog &r = g_reg_ring[(g_reg_pos + k) & 255u];
+                    if (r.reg >= 0x40 && r.reg != 0x50 && r.reg != 0x51 && r.reg != 0x52 && r.reg != 0x53)
+                        std::fprintf(stderr, "[bigdraw]   reg %02X = %016llX (path %d) [%u back]\n", r.reg, (unsigned long long)r.value, r.path, 256 - k);
+                }
+                for (unsigned y = 0; y < 128; y += 32) {
+                    std::fprintf(stderr, "[bigdraw]   tex row %3u:", y);
+                    for (unsigned x = 0; x < 32; ++x) std::fprintf(stderr, " %X", read_pixel(psm, tbp, tbw, x, y));
+                    std::fprintf(stderr, "\n");
+                }
+            }
+            const int ox = static_cast<int>(cx.xyoffset & 0xFFFF), oy = static_cast<int>((cx.xyoffset >> 32) & 0xFFFF);
+            for (int k = 0; k < needed; ++k) {
+                const int vx = (static_cast<int>(s.queue[k].x) - ox) / 16, vy = (static_cast<int>(s.queue[k].y) - oy) / 16;
+                run.x0 = std::min(run.x0, vx); run.y0 = std::min(run.y0, vy); run.x1 = std::max(run.x1, vx); run.y1 = std::max(run.y1, vy);
+                run.z0 = std::min(run.z0, s.queue[k].z); run.z1 = std::max(run.z1, s.queue[k].z);
+            }
+        }
 #ifdef PS2_GPU
         if (gpu_on()) gpu::draw(s, s.queue, needed);
 #endif
         capture::prim(s, needed);
         ++g_primitives;
+        // PS2_TRACE_DRAWSTATE=<frame>: histogram of the draw state (texture, blend, tests, target) of
+        // every primitive in that frame, printed when the next frame starts (diagnosis).
+        static const std::uint64_t ds_frame = [] { const char *e = std::getenv("PS2_TRACE_DRAWSTATE"); return e ? std::strtoull(e, nullptr, 10) : 0ull; }();
+        if (ds_frame) {
+            static std::map<std::string, std::uint64_t> hist;
+            static bool printed = false;
+            const std::uint64_t f = frame_count();
+            if (f == ds_frame) {
+                const std::uint64_t p = s.prmodecont & 1u ? s.prim : s.prmode;
+                const Context &c = s.ctx[(p >> 9) & 1u];
+                const std::uint64_t t0 = c.tex0;
+                char key[512];
+                std::snprintf(key, sizeof key,
+                              "prim %u tme %u fge %u abe %u | tbp %05X tbw %u psm %02X tw %u th %u tcc %u tfx %u cbp %05X cpsm %X | alpha %010llX test %05llX fba %u | fbp %03X fpsm %02X fbmsk %08X | zbp %03X zmsk %u texa %llX",
+                              prim, unsigned((p >> 4) & 1), unsigned((p >> 5) & 1), unsigned((p >> 6) & 1),
+                              unsigned(t0 & 0x3FFF), unsigned((t0 >> 14) & 0x3F), unsigned((t0 >> 20) & 0x3F), unsigned((t0 >> 26) & 0xF),
+                              unsigned((t0 >> 30) & 0xF), unsigned((t0 >> 34) & 1), unsigned((t0 >> 35) & 3), unsigned((t0 >> 37) & 0x3FFF),
+                              unsigned((t0 >> 51) & 0xF), (unsigned long long)(c.alpha & 0xFFFFFFFFFFull), (unsigned long long)(c.test & 0x7FFFF),
+                              unsigned(c.fba & 1), unsigned(c.frame & 0x1FF), unsigned((c.frame >> 24) & 0x3F), unsigned(c.frame >> 32),
+                              unsigned(c.zbuf & 0x1FF), unsigned((c.zbuf >> 32) & 1), (unsigned long long)s.texa);
+                const Vertex &v0 = s.queue[0];
+                char extra[160];
+                char extra2[200];
+                std::snprintf(extra2, sizeof extra2, " | ctxt %u xyoff %04X,%04X scissor %03X-%03X,%03X-%03X zpsm %X",
+                              unsigned((p >> 9) & 1), unsigned((c.xyoffset & 0xFFFF) >> 4), unsigned(((c.xyoffset >> 32) & 0xFFFF) >> 4),
+                              unsigned(c.scissor & 0x7FF), unsigned((c.scissor >> 16) & 0x7FF), unsigned((c.scissor >> 32) & 0x7FF),
+                              unsigned((c.scissor >> 48) & 0x7FF), unsigned((c.zbuf >> 24) & 0xF));
+                std::strncat(key, extra2, sizeof key - std::strlen(key) - 1);
+                std::snprintf(extra, sizeof extra, " | v0 rgba %02X%02X%02X%02X f %02X xy %04X,%04X z %06X", v0.r, v0.g, v0.b, v0.a, v0.f,
+                              v0.x >> 4, v0.y >> 4, v0.z >> 8);
+                static const bool verts = std::getenv("PS2_TRACE_DRAWSTATE_V") != nullptr;
+                if (verts) std::strncat(key, extra, sizeof key - std::strlen(key) - 1);
+                ++hist[key];
+            } else if (f > ds_frame && !printed) {
+                printed = true;
+                std::vector<std::pair<std::uint64_t, std::string>> v;
+                for (auto &[k, n] : hist) v.emplace_back(n, k);
+                std::sort(v.rbegin(), v.rend());
+                for (auto &[n, k] : v) std::fprintf(stderr, "[drawstate] %8llu  %s\n", (unsigned long long)n, k.c_str());
+            }
+        }
     }
     switch (prim) {
     case 2:
@@ -741,6 +845,7 @@ void write(std::uint32_t reg, std::uint64_t value) {
         static std::uint64_t n = 0, start = std::strtoull(seq, nullptr, 10);
         if (++n >= start && n < start + 100000) std::fprintf(stderr, "[gs] w %02X %016llX\n", reg, static_cast<unsigned long long>(value));
     }
+    g_reg_ring[g_reg_pos++ & 255u] = {reg, value, g_cur_path};
     switch (reg) {
     case 0x00:
         s.prim = value;
@@ -1459,6 +1564,33 @@ void dump_region(const char *spec) {
 
 void stats() {
     if (const char *spec = std::getenv("PS2_DUMP_VRAM")) dump_region(spec);
+    // PS2_DUMP_CLUT=cbp,cbp,... (hex): the 16-entry PSMCT32 CLUTs (8x2 at CBP) at the end of the run (diagnosis).
+    if (const char *spec = std::getenv("PS2_DUMP_CLUT")) {
+#ifdef PS2_GPU
+        if (gpu_on() && !cpu_raster()) gpu::download(g_memory);
+#endif
+        std::string list(spec);
+        std::size_t at = 0;
+        while (at < list.size()) {
+            const std::size_t comma = list.find(',', at);
+            const unsigned cbp = static_cast<unsigned>(std::strtoul(list.substr(at, comma - at).c_str(), nullptr, 16));
+            std::fprintf(stderr, "[clut] cbp %05X:", cbp);
+            for (unsigned i = 0; i < 16; ++i) std::fprintf(stderr, " %08X", read_pixel(0, cbp, 1, i & 7u, i >> 3));
+            std::fprintf(stderr, "\n");
+            if (comma == std::string::npos) break;
+            at = comma + 1;
+        }
+    }
+    // PS2_DUMP_TEX=tbp,tbw,psm (hex,dec,hex): first 64 texels of row 0..3 (diagnosis).
+    if (const char *spec = std::getenv("PS2_DUMP_TEX")) {
+        unsigned tbp = 0, tbw = 0, psm = 0;
+        if (std::sscanf(spec, "%x,%u,%x", &tbp, &tbw, &psm) == 3)
+            for (unsigned y = 0; y < 4; ++y) {
+                std::fprintf(stderr, "[tex] %05X row %u:", tbp, y * 16);
+                for (unsigned x = 0; x < 32; ++x) std::fprintf(stderr, " %X", read_pixel(psm, tbp, tbw, x * 4, y * 16));
+                std::fprintf(stderr, "\n");
+            }
+    }
 #ifdef PS2_GPU
     gpu::stats();
 #endif
