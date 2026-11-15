@@ -886,6 +886,10 @@ bool start_game(const fs::path &files) {
     // interpreter: 1.6 M calls checked under qemu, 0 differ). Quest headless 1500 boot frames: ~5.5 ms/frame
     // less. config.txt PS2_VU0_JIT=0 = exact interpreter, =check = both with a comparison in log.txt.
     setenv("PS2_VU0_JIT", "1", 0);
+    // Eye image = the Fukami app's (640x3 by 224x6 rounded up to 1920x1440). The curved screen's height
+    // follows the eye image's aspect (arc * h / w): with the headset's recommended near-square size
+    // (~2184x2288) the 5.76 m screen stood about 6 m tall instead of 4.3 m (owner 2026-11-15).
+    setenv("RRV_VR_EYE", "1920x1440", 0);
 #else
     setenv("RRV_PCSX2_GS_ASPECT", "stretch", 0);
     // GT4 profile of the bridge (PCSX2 GameDB fixes for GT4, field-mode upscaling); scale 2 =
