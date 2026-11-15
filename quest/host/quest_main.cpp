@@ -892,11 +892,12 @@ bool start_game(const fs::path &files) {
     setenv("RRV_VR_EYE", "1920x1440", 0);
     // Ridge Racer V's frame (2026-11-15): (1) byte stores to DMAC registers change only their byte lanes
     // (the game starts its fromSPR copies with "sb 1(D8_CHCR)"; lost, the GIF chain sent stale packets:
-    // garbage textures); (2) a VIF1 DMA starts a moment after its kick, so the GIF (PATH3) list the game
-    // kicks right after it - the frame clear and EE-built geometry - is drawn first, as on a real PS2
-    // (started at once, the clear for the same buffer painted the whole scene sky blue).
+    // garbage textures); (2) the GIF order of a real PS2: VIF1's leading DIRECT (sky clear) goes first, but
+    // its VU1 output (XGKICK) waits until the GIF DMA kicked right after it - frame clear + EE-built cars - has
+    // gone through. Run back to back here, the clear painted over the whole VU1 scene (sky-blue picture,
+    // 0.0.8); delaying all of VIF1 instead (0.0.9) let its sky clear wipe the cars (invisible cars).
     setenv("PS2_SUBIO_RMW", "1", 0);
-    setenv("PS2_VIF1_DELAY", "20000", 0);
+    setenv("PS2_GIF_PATH3_FIRST", "1", 0);
 #else
     setenv("RRV_PCSX2_GS_ASPECT", "stretch", 0);
     // GT4 profile of the bridge (PCSX2 GameDB fixes for GT4, field-mode upscaling); scale 2 =

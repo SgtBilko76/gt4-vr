@@ -121,6 +121,7 @@ void finish(int ch) {
     if (trace && ch <= 4) std::fprintf(stderr, "[dma] ch%d done chcr 0x%08X tadr 0x%08X madr 0x%08X\n", ch, c.chcr, c.tadr, c.madr);
     c.chcr &= ~0x100u;
     if (ch == 1) gif::vif1_idle();
+    if (ch == 2) gif::defer_note(1);
     hw::dmac_raise(static_cast<unsigned>(ch));
     if (ch == 8 && g_mfifo_waiting && (g_ch[1].chcr & 0x100u) && !g_ch[1].paused) {
         g_mfifo_waiting = false;
@@ -327,6 +328,7 @@ void run_chain(int ch) {
 }
 
 void start_now(int ch) {
+    if (ch == 1) gif::defer_note(0);
     Channel &c = g_ch[ch];
     c.paused = false;
     c.tag_end = c.qwc && chain_ends_after_current(c);

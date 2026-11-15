@@ -203,6 +203,7 @@ void apply_patches(bool boot) {
 }
 
 void vblank() {
+    gif::defer_note(2);
     ++g_frames;
     time_frames();
     apply_presses();
@@ -623,6 +624,7 @@ void run_vu_thread() {
             case gs::queue::kVif1Write: vif::write(1, h.arg0, h.arg1); break;
             case gs::queue::kGif: gif::transfer(static_cast<int>(h.arg0), payload, h.arg1); break;
             case gs::queue::kPath3Idle: gif::vif1_idle(); break;
+            case gs::queue::kGifDefer: gif::defer_note(static_cast<int>(h.arg0)); break;
             case gs::queue::kGifReset:
                 gif::drop_held();
                 gs::queue::render().post(gs::queue::kGifReset, h.arg0, h.arg1, payload, h.bytes);

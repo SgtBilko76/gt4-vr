@@ -23,6 +23,10 @@ void write(std::uint32_t a, std::uint32_t v);
 void set_path3_masked(bool masked);
 // Forgets PATH3 data held back by the mask, on the thread that holds it
 void drop_held();
+// PS2_GIF_PATH3_FIRST=1: VIF1's own GIF output (PATH1/PATH2) from its first XGKICK on waits until the PATH3
+// (GIF DMA) transfer that follows the VIF1 kick has gone through. what: 0 = VIF1 DMA kicked, 1 = GIF DMA
+// finished, 2 = vblank (let everything out).
+void defer_note(int what);
 // VIF1 has run out of work (its DMA ended), so an unmasked PATH3 has the GIF to itself
 void vif1_idle();
 

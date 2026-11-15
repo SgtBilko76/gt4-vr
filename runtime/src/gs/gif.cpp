@@ -291,7 +291,34 @@ void path3_counts(const char *why) {
                  (unsigned long long)g_in3, (unsigned long long)g_out3, g_held.data.size() / 16, (unsigned long long)g_dropped3,
                  (unsigned long long)g_drops, g_held.masked ? 1 : 0, g_held.mid_packet ? 1 : 0);
 }
+namespace {
+struct Deferred { int path; std::vector<std::uint8_t> data; };
+std::vector<Deferred> g_def;
+bool g_armed = false, g_deferring = false;
+bool defer_on() { static const bool on = [] { const char *e = std::getenv("PS2_GIF_PATH3_FIRST"); return e && e[0] == '1'; }(); return on; }
+}
+void transfer_now(int path, const std::uint8_t *data, std::uint32_t qwc);
+void defer_flush() {
+    std::vector<Deferred> d;
+    d.swap(g_def);
+    g_deferring = false;
+    for (const Deferred &x : d) transfer_now(x.path, x.data.data(), static_cast<std::uint32_t>(x.data.size() / 16));
+}
+void defer_note(int what) {
+    if (!defer_on()) return;
+    if (!hold_here()) {
+        gs::queue::vu().post(gs::queue::kGifDefer, static_cast<std::uint32_t>(what), 0, nullptr, 0);
+        return;
+    }
+    switch (what) {
+    case 0: defer_flush(); g_armed = true; break;
+    case 1: if (g_armed || g_deferring) { defer_flush(); g_armed = false; } break;
+    default: defer_flush(); g_armed = false; break;
+    }
+}
+
 void drop_held() {
+    if (!g_def.empty()) defer_flush();
     if (!g_held.data.empty() || g_held.mid_packet) {
         g_dropped3 += g_held.data.size() / 16; ++g_drops;
         static int shown = 0;
@@ -328,6 +355,17 @@ void render(int path, const std::uint8_t *data, std::uint32_t qwc) {
 }
 
 void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
+    if (defer_on() && hold_here() && (path == 1 || path == 2)) {
+        if (path == 1 && g_armed) g_deferring = true;
+        if (g_deferring) {
+            g_def.push_back({path, std::vector<std::uint8_t>(data, data + static_cast<std::size_t>(qwc) * 16)});
+            return;
+        }
+    }
+    transfer_now(path, data, qwc);
+}
+
+void transfer_now(int path, const std::uint8_t *data, std::uint32_t qwc) {
     Held &h = g_held;
     if (path == 3) g_in3 += qwc;
     static const bool no_hold = [] { const char *e = std::getenv("PS2_GIF_NOHOLD"); return e && e[0] == '1'; }();  // diagnosis

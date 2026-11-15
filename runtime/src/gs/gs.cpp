@@ -697,21 +697,21 @@ void kick(bool draw) {
         if (do_frame && frame_count() == do_frame) {
             const std::uint64_t pm = s.prmodecont & 1u ? s.prim : s.prmode;
             const Context &cx = s.ctx[(pm >> 9) & 1u];
-            struct Run { std::uint64_t tex0, test, alpha, prim; std::uint64_t prims, px; int x0, y0, x1, y1; std::uint32_t z0, z1; int path; };
+            struct Run { std::uint64_t tex0, test, alpha, prim; std::uint64_t prims, px; int x0, y0, x1, y1; std::uint32_t z0, z1; int path; unsigned fbp; };
             static Run run{};
             static std::uint64_t runs = 0;
             const std::uint64_t pr = (s.prim & 7u) | (pm & 0x7F0u);
             auto flush = [&] {
                 if (run.prims && runs < 20000)
-                    std::fprintf(stderr, "[draworder] path %d %4llu prim %03llX tex0 %016llX test %05llX alpha %010llX : %6llu prims %8llu px box %d,%d-%d,%d z %06X-%06X\n",
-                                 run.path, (unsigned long long)runs, (unsigned long long)run.prim, (unsigned long long)run.tex0, (unsigned long long)(run.test & 0x7FFFF),
+                    std::fprintf(stderr, "[draworder] path %d fbp %03X %4llu prim %03llX tex0 %016llX test %05llX alpha %010llX : %6llu prims %8llu px box %d,%d-%d,%d z %06X-%06X\n",
+                                 run.path, run.fbp, (unsigned long long)runs, (unsigned long long)run.prim, (unsigned long long)run.tex0, (unsigned long long)(run.test & 0x7FFFF),
                                  (unsigned long long)(run.alpha & 0xFFFFFFFFFFull), (unsigned long long)run.prims, (unsigned long long)run.px,
                                  run.x0, run.y0, run.x1, run.y1, run.z0, run.z1);
                 ++runs;
             };
-            if (!(run.prims && run.tex0 == cx.tex0 && run.test == cx.test && run.alpha == cx.alpha && run.prim == pr && run.path == g_cur_path)) {
+            if (!(run.prims && run.tex0 == cx.tex0 && run.test == cx.test && run.alpha == cx.alpha && run.prim == pr && run.path == g_cur_path && run.fbp == unsigned(cx.frame & 0x1FF))) {
                 flush();
-                run = Run{cx.tex0, cx.test, cx.alpha, pr, 0, 0, 1 << 30, 1 << 30, -(1 << 30), -(1 << 30), 0xFFFFFFFFu, 0, g_cur_path};
+                run = Run{cx.tex0, cx.test, cx.alpha, pr, 0, 0, 1 << 30, 1 << 30, -(1 << 30), -(1 << 30), 0xFFFFFFFFu, 0, g_cur_path, unsigned(cx.frame & 0x1FF)};
             }
             ++run.prims;
             run.px += raster::g_pixels_written - px_before;
