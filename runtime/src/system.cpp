@@ -220,6 +220,9 @@ void vblank() {
     kernel::on_vblank_start();
     if (g_options.max_frames && g_frames >= g_options.max_frames) halt("frame limit reached");
     if (g_options.save_state_frame && g_frames == g_options.save_state_frame) g_state_request = true;
+    // PS2_SAVE_STATE_EVERY=N (ps2run, long PC runs): also save every N frames to the --save-state file.
+    static const std::uint64_t save_every = [] { const char *e = std::getenv("PS2_SAVE_STATE_EVERY"); return e ? std::strtoull(e, nullptr, 10) : 0ull; }();
+    if (save_every && !g_options.save_state_path.empty() && g_frames % save_every == 0) g_state_request = true;
     schedule(hw::kEventVblank, now() + frame_cycles(), vblank);
 }
 

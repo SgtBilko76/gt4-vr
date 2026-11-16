@@ -5,6 +5,7 @@
 #include "../quest/host/gt4_results.h"
 #endif
 #include "ps2/system.hpp"
+#include "../quest/host/rr5_enhance.h"
 
 #ifdef PS2_WINDOW
 #include "window.hpp"
@@ -125,6 +126,8 @@ int main(int argc, char **argv) {
         };
     }
     if (std::getenv("PS2_RR5_LZCHECK")) { void rr5_install_lzcheck(); rr5_install_lzcheck(); }
+    rr5::enhance::installWidescreen(); // RRV_RR5_WIDESCREEN=16:9 (off without it)
+    if (std::getenv("PS2_RR5_RACEVIEW")) rr5::enhance::installRaceView(nullptr, nullptr); // + PS2_RR5_TEST_* pose
 #ifdef PS2_GT4_CAMERA
     if (std::getenv("PS2_GT4_SCENELOG")) gt4::camera::installSceneDetector(); // retail scene probe test
     // ps2run: test pose from PS2_GT4_TEST_* only; PS2_GT4_RETAIL=1 = the retail v2.00 hook addresses.

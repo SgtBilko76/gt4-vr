@@ -20,6 +20,7 @@
 #include "quest_host.h"
 #include "rrv_pcsx2_gs_bridge.h"
 #include "gt4_camera.h"
+#include "rr5_enhance.h"
 #include "gt4_settings.h"
 #include "online_panel.h"
 #include "ps2/net.hpp"
@@ -162,6 +163,15 @@ constexpr float kFovMargin = 1.08f;
 // Owner 2026-11-06 (Spec II head-view VR): 80 - sharper than 90 / 110 (one game picture spread over
 // fewer degrees), the black rim around it is fine for him.
 constexpr float kImmersiveFovDeg = 90.0f;
+// RR5 (the Fukami app's VR view, owner-verified there: horizon and nodding OK): 90 deg wide, 45 deg up,
+// 40 deg down. As a symmetric tan with the window shift: tanY = (1.0 + 0.839) / 2, shift = (0.839 - 1.0) / 2
+// (the frame covers tan -(tanY + shift) below .. tanY - shift above).
+constexpr float kRr5TanX = 1.0f, kRr5TanY = 0.9195f, kRr5ShiftTan = -0.0805f;
+// RR5 never draws the lowest ~5 % rows of its picture (stale VRAM: a light strip at the bottom of the VR view;
+// the Fukami app covered it with black, owner 2026-11-07 "einfach nur schwarz"). The projection layer leaves
+// those rows out and its lower edge moves up by the same tan, so below the picture stays black.
+// Live: debug.gt4vr.vrcut (fraction of the picture height, 0 = off).
+constexpr float kVrCutFraction = GT4VR_RR5 ? 0.05f : 0.0f;
 // Render scale in the head-tracked VR view only (owner 2026-11-08: distant objects soft in VR; the curved
 // screen keeps its 3x4). Live: debug.gt4vr.vrscalex / vrscaley (0 = keep the curved screen's value).
 // Switching drops PCSX2's cached render targets, so the first frame after a switch can lack effects.
@@ -202,7 +212,8 @@ constexpr float kScreenVerticalOffsetM = 0.0f; // owner 2026-11-06 GT4 Spec II H
 #ifndef GT4VR_CAMERA_HOOKS
 #define GT4VR_CAMERA_HOOKS 1
 #endif
-constexpr bool kVrModeAllowed = GT4VR_CAMERA_HOOKS != 0;
+// RR5: the race view hooks of quest/host/rr5_enhance.cpp (no GT4 camera hooks in that build).
+constexpr bool kVrModeAllowed = GT4VR_CAMERA_HOOKS != 0 || GT4VR_RR5;
 std::atomic<bool> g_vr_allowed{kVrModeAllowed}; // live: debug.gt4vr.vrallow
 // The player is racing (race scene drawn, driving camera active): the only time the VR view can be
 // switched on (owner 2026-11-07: menus, intros and replays always on the curved 3D screen).
@@ -1192,7 +1203,7 @@ private:
         // things per mode (GT intro 0 / race 1, license driving 0 / result 1). The active camera
         // class can: on-board while driving, designer cameras in intros / replays, a finish camera
         // after the line (gt4_camera.cpp record_scene).
-        const std::uint64_t race_builds = gt4::camera::sceneBuilds();
+        const std::uint64_t race_builds = GT4VR_RR5 ? rr5::enhance::raceBuilds() : gt4::camera::sceneBuilds();
         if (race_builds != m_race_builds)
         {
             m_race_builds = race_builds;
@@ -1200,7 +1211,9 @@ private:
         }
         else if (m_race_idle < 1000)
             ++m_race_idle;
-        const bool driving = m_race_idle < 3 && scene_now.mode == 0 && !scene_now.windowed && scene_now.driver_camera;
+        // RR5: driving-view camera builds of a race in its driving phases (rr5_enhance.cpp).
+        const bool driving = GT4VR_RR5 ? m_race_idle < 3
+                                       : m_race_idle < 3 && scene_now.mode == 0 && !scene_now.windowed && scene_now.driver_camera;
         g_racing.store(driving, std::memory_order_relaxed);
         m_immersive_enabled = ReadFloatProperty("debug.gt4vr.immersive", 1.0f) != 0.0f && !gt4::quest::curvedView() &&
                               (driving || ReadFloatProperty("debug.gt4vr.vrreplay", 0.0f) != 0.0f);
@@ -1227,10 +1240,11 @@ private:
         {
             const float fov_deg = ReadFloatProperty("debug.gt4vr.fov", kImmersiveFovDeg);
             const float cap = fov_deg > 30.0f ? std::tan(fov_deg * 0.5f * 0.0174533f) : 0.0f;
-            m_vtan_cap = ReadFloatProperty("debug.gt4vr.vtan", cap);
-            m_htan_cap = ReadFloatProperty("debug.gt4vr.htan", cap);
+            m_vtan_cap = ReadFloatProperty("debug.gt4vr.vtan", GT4VR_RR5 ? kRr5TanY : cap);
+            m_htan_cap = ReadFloatProperty("debug.gt4vr.htan", GT4VR_RR5 ? kRr5TanX : cap);
         }
-        m_view_shift = std::clamp(ReadFloatProperty("debug.gt4vr.vshift", kViewShiftTan), -0.6f, 0.6f);
+        m_view_shift = std::clamp(ReadFloatProperty("debug.gt4vr.vshift", GT4VR_RR5 ? kRr5ShiftTan : kViewShiftTan), -0.6f, 0.6f);
+        m_vr_cut = std::clamp(ReadFloatProperty("debug.gt4vr.vrcut", kVrCutFraction), 0.0f, 0.3f);
         // VR HUD panel distance (live debug.gt4vr.huddist, metres; the panel keeps its size, so farther
         // = smaller, owner rule for distance changes).
         const float hud_dist = std::clamp(ReadFloatProperty("debug.gt4vr.huddist", kHudDistanceM), 0.5f, 10.0f);
@@ -1577,8 +1591,9 @@ private:
         float x = m_base_scale_x, y = m_base_scale_y;
         if (immersive)
         {
-            const float vx = ReadFloatProperty("debug.gt4vr.vrscalex", kVrScaleX);
-            const float vy = ReadFloatProperty("debug.gt4vr.vrscaley", kVrScaleY);
+            // RR5 keeps its 3x6 in the VR view (0 = the curved screen's value).
+            const float vx = ReadFloatProperty("debug.gt4vr.vrscalex", GT4VR_RR5 ? 0.0f : kVrScaleX);
+            const float vy = ReadFloatProperty("debug.gt4vr.vrscaley", GT4VR_RR5 ? 0.0f : kVrScaleY);
             if (vx > 0.0f)
                 x = std::clamp(vx, 1.0f, 8.0f);
             if (vy > 0.0f)
@@ -1638,6 +1653,15 @@ private:
             m_set_hud_layer = reinterpret_cast<SetHudLayerFn>(dlsym(image, "rrv_pcsx2_gs_bridge_android_set_hud_layer"));
             if (m_set_hud_layer)
                 m_set_hud_layer(0, kHudRowsPx); // the eyes stay above the strip from the first frame on
+            // RR5 draws its 3D straight into the displayed buffer (no GT4-style composite): the HUD is split
+            // off at its first draw whose vertices all lie on the far 2D plane (Z >= 0xFFFE28, the bridge's
+            // HudScale zmin) - the Fukami app's rule. 0 = GT4's composite rule.
+            if (GT4VR_RR5)
+                if (auto split = reinterpret_cast<void (*)(std::uint32_t)>(dlsym(image, "rrv_pcsx2_gs_bridge_android_set_hud_split_z")))
+                {
+                    split(0xFFFE28u);
+                    XR_LOG("race HUD layer: split at Z >= 0xFFFE28 (RR5)");
+                }
             else
                 XR_LOG("bridge has no HUD layer: the eyes fill the whole surface");
             m_set_depth_scale = reinterpret_cast<SetDepthScaleFn>(dlsym(image, "rrv_pcsx2_gs_bridge_android_set_stereo_depth_scale"));
@@ -1806,7 +1830,13 @@ private:
                 // rendered for, at the game's (symmetric) field of view.
                 // The window is moved down by m_view_shift (off-axis, same shift the camera used).
                 const float ax = std::atan(fov.tanHalfX);
-                const float up = std::atan(fov.tanHalfY - m_view_shift), down = -std::atan(fov.tanHalfY + m_view_shift);
+                // Rows left out at the picture's bottom (m_vr_cut): the lower edge moves up by that share of the
+                // picture's tan range (rows are linear in tan). The GS draws upside down in flip mode 2, so
+                // the bottom rows are the first ones there.
+                const float tan_top = fov.tanHalfY - m_view_shift, tan_bottom = fov.tanHalfY + m_view_shift;
+                const int32_t cut_rows = m_vr_quads ? 0 : static_cast<int32_t>(std::lround(m_vr_cut * static_cast<float>(m_eye_h)));
+                const float cut_tan = static_cast<float>(cut_rows) / static_cast<float>(m_eye_h) * (tan_top + tan_bottom);
+                const float up = std::atan(tan_top), down = -std::atan(tan_bottom - cut_tan);
                 if (m_vr_quads)
                 {
                     // Pico: its compositor showed the projection layer black (owner's tester 2026-11-10)
@@ -1841,8 +1871,8 @@ private:
                     view.pose = shown->eyes[eye];
                     view.fov = {-ax, ax, up, down};
                     view.subImage.swapchain = m_screen_swapchain;
-                    view.subImage.imageRect.offset = {static_cast<int32_t>(eye) * m_eye_w, EyeRowOffset()};
-                    view.subImage.imageRect.extent = {m_eye_w, m_eye_h};
+                    view.subImage.imageRect.offset = {static_cast<int32_t>(eye) * m_eye_w, EyeRowOffset() + (m_gs_flip ? cut_rows : 0)};
+                    view.subImage.imageRect.extent = {m_eye_w, m_eye_h - cut_rows};
                     view.subImage.imageArrayIndex = 0;
                 }
                 if (m_flip_mode == 1)
@@ -2402,6 +2432,7 @@ private:
     float m_fov_margin = kFovMargin;
     float m_vtan_cap = 0.0f, m_htan_cap = 0.0f;
     float m_view_shift = kViewShiftTan;
+    float m_vr_cut = kVrCutFraction;
     float m_hud_dist_m = kHudDistanceM;
     float m_hud_half_width = kHudHalfWidth;
     SetHudVrFn m_set_hud_vr = nullptr;

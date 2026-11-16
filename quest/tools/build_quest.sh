@@ -37,7 +37,7 @@ variant() {
         LIBNAME=gt4vr_specii; SRC=gt4s ;;
   # Ridge Racer V (USA, SLUS-20002) without game code: the user's own ISO in /sdcard/RR5VR, program
   # SLUS_200.02 checked (PCSX2 CRC 06AD9CA0); none of GT4's hooks, the bridge's RR5 profile.
-  rr5)  VARIANT=(-DGT4VR_DATA_DIR=/sdcard/RR5VR -DGT4VR_OLD_DATA_DIR= "-DGT4VR_TITLE=Ridge Racer V VR"
+  rr5)  VARIANT=(-DGT4VR_DATA_DIR=${RR5_DATA_DIR:-/sdcard/RR5VR} -DGT4VR_OLD_DATA_DIR=${RR5_OLD_DATA_DIR:-} "-DGT4VR_TITLE=Ridge Racer V VR"
                  -DGT4VR_NET_PRODUCT=SLUS20002 -DGT4VR_CAMERA_HOOKS=OFF -DGT4VR_ONLINE=OFF -DGT4VR_RELAY=OFF
                  -DGT4VR_ELF_CRC=06AD9CA0 "-DGT4VR_DISC_NAME=Ridge Racer V (USA)" -DGT4VR_RR5=ON
                  -DGT4VR_LIB_NAME=gt4vr_specii)
@@ -56,7 +56,11 @@ case "$GAME" in
   gt4s)  GAMES=(gt4s); APP_ID=online.portroyale.gt4vr; APP_LABEL="GT4 Spec II VR"; LAUNCHER=specii ;;
   gt4r)  GAMES=(gt4r); APP_ID=online.portroyale.gt4hd; APP_LABEL="GT4 Online VR"; LAUNCHER=online ;;
   # Test app beside the Fukami RR5 app (com.bilko.rr5vr): own package, data in /sdcard/RR5VR.
-  rr5)   GAMES=(rr5); APP_ID=com.bilko.rr5vr.nogen; APP_LABEL="Ridge Racer V VR (test)"; LAUNCHER=specii ;;
+  # Release (owner 2026-11-16: replaces the Fukami app as an update, same signing key):
+  #   GAME=rr5 APP_ID=com.bilko.rr5vr RR5_DATA_DIR=/sdcard/RidgeRacerV RR5_OLD_DATA_DIR=/sdcard/RR5VR
+  #   VERSION_NAME=0.2.0 VERSION_CODE=20  (versionCode above the Fukami app's 2; disc.iso / memcard.ps2
+  #   are taken from /sdcard/RR5VR when the new folder has none).
+  rr5)   GAMES=(rr5); APP_ID=${APP_ID:-com.bilko.rr5vr.nogen}; APP_LABEL="Ridge Racer V VR"; LAUNCHER=specii; APP_ICON=ic_launcher_rr5 ;;
   *) echo "unknown GAME=$GAME (gt4vr, gt4s, gt4r, rr5)" >&2; exit 2 ;;
 esac
 BRIDGE_BUILD=${BRIDGE_BUILD:-$HOME/Projekte/fukami-wt-bridge/build-android-bridge}
@@ -150,7 +154,7 @@ ls -la "$STAGE/jniLibs/arm64-v8a"
 [ "${1:-}" = "--no-apk" ] && exit 0
 cd "$ROOT/quest/android"
 [ -f local.properties ] || echo "sdk.dir=$HOME/workspace/android-sdk" > local.properties
-JAVA_HOME=$(ls -d "$HOME"/tools/jdk-17* | head -1) ./gradlew --no-daemon -q --offline assembleRelease -PgtAppId="$APP_ID" -PgtAppLabel="$APP_LABEL" -PgtLauncher="$LAUNCHER" \
+JAVA_HOME=$(ls -d "$HOME"/tools/jdk-17* | head -1) ./gradlew --no-daemon -q --offline assembleRelease -PgtAppId="$APP_ID" -PgtAppLabel="$APP_LABEL" -PgtLauncher="$LAUNCHER" ${APP_ICON:+-PgtAppIcon="$APP_ICON"} \
   -PgtVersionName="${VERSION_NAME:-0.3.1-beta}" -PgtVersionCode="${VERSION_CODE:-10}"
 mkdir -p "$ROOT/build/apk"
 SUFFIX=""

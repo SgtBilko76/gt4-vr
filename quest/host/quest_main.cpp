@@ -51,6 +51,7 @@
 void register_generated_code();
 
 #include "gt4_camera.h"
+#include "rr5_enhance.h"
 #include "gt4_lan.h"
 #include "gt4_display.h"
 #include "gt4_settings.h"
@@ -646,6 +647,8 @@ std::string find_user_iso() {
         if (ext == ".iso" && e.is_regular_file(ec)) found.push_back(e.path().string());
     }
     std::sort(found.begin(), found.end());
+    // Update of an older build with another data folder (Ridge Racer V: the test app's /sdcard/RR5VR).
+    if (found.empty() && !kOldDataDir.empty() && readable(kOldDataDir + "/disc.iso")) return kOldDataDir + "/disc.iso";
     return found.empty() ? fixed : found.front();
 }
 
@@ -857,9 +860,26 @@ bool start_game(const fs::path &files) {
 #if GT4VR_RR5
     // Ridge Racer V: no RRV_PCSX2_GS_GAME = the bridge's RR5 profile (its GameDB fixes, field skipping on,
     // which RR5 needs). Picture defaults of the Fukami RR5 app (owner-tuned): 3x wide / 6x tall, 16x
-    // anisotropic, FXAA, bilinear textures, PS2 sprite filter, no mipmaps. 4:3 until a widescreen patch
-    // exists (the Fukami app widens the game's own projection; here the game still renders 4:3).
-    setenv("RRV_PCSX2_GS_ASPECT", "4:3", 0);
+    // anisotropic, FXAA, bilinear textures, PS2 sprite filter, no mipmaps.
+    // Real widescreen as in the Fukami app (its release default 16:9, hud = race): the game's camera renders
+    // a wider view (quest/host/rr5_enhance.cpp), the picture is shown at 16:9 inside the 4:3 eye image (same
+    // screen width, black above and below), and in races the HUD keeps its 4:3 proportions (bridge HudScale,
+    // (4/3)/(16/9) = 0.75). config.txt RRV_RR5_WIDESCREEN=0 + RRV_PCSX2_GS_ASPECT=4:3 = stock 4:3.
+    setenv("RRV_RR5_WIDESCREEN", "16:9", 0);
+    {
+        const char *ws = std::getenv("RRV_RR5_WIDESCREEN");
+        const bool wide = ws && ws[0] && std::strcmp(ws, "0") != 0 && std::strcmp(ws, "4:3") != 0;
+        const bool ratio_ok = wide && (std::strcmp(ws, "16:10") == 0 || std::strcmp(ws, "21:9") == 0);
+        const char *ratio = !wide ? "4:3" : ratio_ok ? ws : "16:9";
+        setenv("RRV_PCSX2_GS_ASPECT", ratio, 0);
+        if (wide) {
+            const float a = std::strcmp(ratio, "16:10") == 0 ? 1.6f : std::strcmp(ratio, "21:9") == 0 ? 21.0f / 9.0f : 16.0f / 9.0f;
+            char scale[32];
+            std::snprintf(scale, sizeof scale, "%.6f", (4.0f / 3.0f) / a);
+            setenv("RRV_PCSX2_GS_HUD_SCALE", scale, 0);
+            setenv("RRV_PCSX2_GS_HUD_MODE", "race", 0);
+        }
+    }
     // Full-frame mode as in the Fukami app (RRV_GS_RENDER_MODE=full): the bridge's RR5 hardware profile and
     // RRV_PCSX2_GS_FULL_SCALE only apply there. Field mode drew RR5's intro / title effects as coloured noise
     // with a magenta bar, at native resolution (2026-11-13). config.txt PS2_PCSX2_RENDER_MODE=field = old.
@@ -1046,6 +1066,10 @@ bool start_game(const fs::path &files) {
     ps2::set_audio_sink(queue_audio);
     register_generated_code();
     register_generated_vu();
+    if (GT4VR_RR5 && rr5::enhance::installWidescreen()) logf("[quest] RR5 widescreen %s", getenv("RRV_RR5_WIDESCREEN"));
+    // RR5 VR race view (both stick clicks while racing, as in the Fukami app): the game camera turned by the head
+    // with the headset's field of view (rr5_enhance.cpp). config.txt PS2_RR5_RACEVIEW=0 = off.
+    if (GT4VR_RR5 && config_string("PS2_RR5_RACEVIEW", "1") != "0") rr5::enhance::installRaceView(quest_head, gt4::quest::noteHeadTrackedFrame);
     const bool retail_program = std::strcmp(GT4VR_NET_PRODUCT, "SCUS97328") == 0;
     // 480p progressive at start and after videos (owner 2026-11-08: far sharper in VR; GT4 itself starts
     // interlaced every time). config.txt PS2_GT4_480P=0 = GT4's own behaviour.
