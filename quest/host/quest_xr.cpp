@@ -744,7 +744,7 @@ private:
         XrInstanceCreateInfo create_info{XR_TYPE_INSTANCE_CREATE_INFO};
         create_info.next = &android_info;
         #ifndef GT4VR_TITLE
-#define GT4VR_TITLE "GT4 VR"
+#define GT4VR_TITLE "Ridge Racer V VR"
 #endif
         std::strncpy(create_info.applicationInfo.applicationName, GT4VR_TITLE, XR_MAX_APPLICATION_NAME_SIZE - 1);
         create_info.applicationInfo.applicationVersion = 1;
